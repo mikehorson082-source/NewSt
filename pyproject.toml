@@ -1,0 +1,41 @@
+[project]
+name = "ml-ds-01"
+version = "0.1.0"
+description = "ML/AI помощник для алготрейдинга на MOEX"
+readme = "AGENTS.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    "polars>=1.0",
+    "pyarrow>=16.0",
+    "duckdb>=1.0",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "scipy>=1.11",
+    "scikit-learn>=1.4",
+    "python-dotenv>=1.0",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+    "tenacity>=8.2",
+    "tqdm>=4.66",
+    "akshare>=1.18.94",
+    "t-tech-investments>=1.49.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "ipykernel>=6.29",
+]
+ml = [
+    "lightgbm>=4.3",
+    "catboost>=1.2",
+]
+
+[[tool.uv.index]]
+url = "https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple"
+
