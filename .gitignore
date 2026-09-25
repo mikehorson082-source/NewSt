@@ -1,3 +1,13 @@
-/.DS_Store
-/.env
-/.venv
+# Environments & Secrets
+.env
+.venv/
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Heavy Data
+data/raw/algopack/
