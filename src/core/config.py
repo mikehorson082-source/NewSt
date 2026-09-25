@@ -73,6 +73,18 @@ class Paths:
         return self.raw / "futures_daily"
 
     @property
+    def raw_futoi(self) -> Path:
+        return self.raw / "futoi"
+
+    @property
+    def raw_futoi_5min(self) -> Path:
+        return self.raw_futoi / "5min"
+
+    @property
+    def raw_futoi_daily(self) -> Path:
+        return self.raw_futoi / "daily"
+
+    @property
     def clean(self) -> Path:
         return self.root / "clean"
 
