@@ -93,5 +93,9 @@ class Paths:
         return self.root / "manual"
 
     @property
+    def reference(self) -> Path:
+        return self.root / "reference"
+
+    @property
     def reports(self) -> Path:
         return self.root / "reports"

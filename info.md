@@ -7,4 +7,9 @@
 Загрузка / докачка пятиминутных futoi по фьючерсам:
 uv run python src/data/download_futoi.py --update
 
+Загрузка / докачка справочников:
+uv run python src/data/download_reference.py --update
+
+
+
 
