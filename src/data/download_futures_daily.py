@@ -1,8 +1,7 @@
 """Загрузка и инкрементальное обновление дневных итогов торгов по фьючерсам с MOEX ISS.
 
 Собирает полные исторические данные (OHLC, SETTLEPRICE, OPENPOSITION, VOLUME, VALUE, NUMTRADES)
-для всех контрактов из data/raw/futures/ и расширенного каталога ликвидных активов
-(Какао, Евро, EUR/USD, Мини-МИКС, Платина, Палладий, Озон, Яндекс, Т-Банк).
+для всех контрактов из data/raw/futures/ и централизованного реестра ASSETS (core).
 
 Поддерживает:
   - Пропуск уже скачанных контрактов (resume).
@@ -29,6 +28,7 @@ import polars as pl
 import requests
 
 from src.core.config import (
+    ASSETS,
     DEFAULT_ENGINE,
     DEFAULT_MARKET,
     ISS_BASE_URL,
@@ -70,27 +70,6 @@ SCHEMA_OVERRIDES = {
     "ASSETCODE": pl.Utf8,
 }
 
-# Каталог дополнительных ликвидных инструментов Мосбиржи
-MONTHS_QUARTERLY = ["H", "M", "U", "Z"]
-YEARS_STD = [1, 2, 3, 4, 5, 6, 7]  # 2021-2027
-
-ADDITIONAL_LIQUID_ASSETS: dict[str, list[str]] = {
-    "cocoa": [
-        "CCZ4", "CCH5", "CCK5", "CCN5", "CCU5", "CCZ5",
-        "CCH6", "CCJ6", "CCM6", "CCQ6", "CCU6", "CCV6", "CCX6", "CCZ6",
-        "CCG7", "CCH7",
-    ],
-    "euro": [f"Eu{m}{y}" for y in YEARS_STD for m in MONTHS_QUARTERLY],
-    "eurusd": [f"ED{m}{y}" for y in YEARS_STD for m in MONTHS_QUARTERLY],
-    "perpetual": ["EURRUBF"],
-    "mix_mini": [f"MM{m}{y}" for y in YEARS_STD for m in MONTHS_QUARTERLY],
-    "platinum": [f"PT{m}{y}" for y in YEARS_STD for m in MONTHS_QUARTERLY],
-    "palladium": [f"PD{m}{y}" for y in YEARS_STD for m in MONTHS_QUARTERLY],
-    "ozon": [f"ON{m}{y}" for y in [4, 5, 6, 7] for m in MONTHS_QUARTERLY],
-    "yandex": [f"YD{m}{y}" for y in [4, 5, 6, 7] for m in MONTHS_QUARTERLY],
-    "tbank": [f"TI{m}{y}" for y in [3, 4, 5, 6, 7] for m in MONTHS_QUARTERLY],
-}
-
 
 def fetch_contract_history(
     secid: str,
@@ -108,7 +87,7 @@ def fetch_contract_history(
 
     while True:
         params: dict[str, Any] = {"start": start, "iss.meta": "off"}
-        if from_date:
+        if from_date is not None:
             params["from"] = str(from_date)
 
         data = None
@@ -193,16 +172,23 @@ def process_single_contract(
             try:
                 df_existing = pl.read_parquet(target_file)
                 if len(df_existing) > 0 and "TRADEDATE" in df_existing.columns:
-                    max_date = df_existing["TRADEDATE"].max()
+                    raw_max_date = df_existing["TRADEDATE"].max()
+                    if isinstance(raw_max_date, date):
+                        max_date: date = raw_max_date
+                    elif isinstance(raw_max_date, str):
+                        max_date = date.fromisoformat(raw_max_date)
+                    else:
+                        max_date = date.today()
+
                     # Если контракт завершился с обнулением ОИ более 30 дней назад — он экспирирован
                     last_oi = df_existing.filter(pl.col("OPENPOSITION").is_not_null())["OPENPOSITION"].tail(1)
                     if len(last_oi) > 0 and last_oi.item() == 0 and (date.today() - max_date).days > 30:
                         return {"secid": secid, "asset": asset, "status": "expired", "rows": len(df_existing)}
 
                     # Запрос новых торговых дней
-                    next_date = max_date + timedelta(days=1)
+                    next_date: date = max_date + timedelta(days=1)
                     if next_date <= date.today():
-                        new_rows = fetch_contract_history(secid, from_date=next_date)
+                        new_rows = fetch_contract_history(secid, from_date=str(next_date))
                         if new_rows:
                             df_new = _cast_and_clean_df(new_rows)
                             df_combined = (
@@ -248,7 +234,7 @@ def process_single_contract(
 
 
 def discover_contracts_to_download(source_dir: Path) -> dict[str, list[str]]:
-    """Находит все инструменты по папкам в data/raw/futures + дополняет каталогом ликвидных."""
+    """Находит все инструменты по папкам в data/raw/futures + дополняет из централизованного реестра ASSETS."""
     contracts: dict[str, set[str]] = {}
 
     # 1. Из локальной папки data/raw/futures
@@ -259,9 +245,9 @@ def discover_contracts_to_download(source_dir: Path) -> dict[str, list[str]]:
                 if tickers:
                     contracts.setdefault(asset_dir.name, set()).update(tickers)
 
-    # 2. Добавляем дополнительный каталог ликвидных активов
-    for asset, tickers in ADDITIONAL_LIQUID_ASSETS.items():
-        contracts.setdefault(asset, set()).update(tickers)
+    # 2. Из централизованного реестра ASSETS
+    for asset_name, spec in ASSETS.items():
+        contracts.setdefault(asset_name, set()).update(spec.generate_tickers())
 
     return {k: sorted(v) for k, v in sorted(contracts.items())}
 
