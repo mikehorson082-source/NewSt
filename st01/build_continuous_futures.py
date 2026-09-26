@@ -1,10 +1,16 @@
 """Строит непрерывные 15-минутные ряды фьючерсов для стратегии st01.
 
 Правило роллирования:
-1. Решение на календарный день (MSK) принимается по предыдущему дню с данными.
+1. Решение на календарный день (MSK) принимается по завершенным дням с данными
+   строго до этого дня; сам день решения не используется.
 2. Сравниваются текущий контракт и ближайший следующий контракт.
-3. Переход выполняется, когда вчерашний объем следующего контракта стал больше.
-4. Обязательный переход за 7 календарных дней до LSTTRADE из справочника MOEX.
+3. Переход выполняется, когда средний дневной объем следующего контракта за
+   окно последних завершенных дней с данными (по умолчанию 3) стал больше
+   среднего объема текущего. Усреднение убирает ложные однодневные пересечения,
+   особенно в коротких сессиях выходного дня.
+4. Если сигнал по объему не возник, переход с начала LSTTRADE (запас 0 дней).
+   Старый контракт в последний день обращения не выбирается. Это ограничение
+   дневного исследовательского ряда, а не модель исполнения переноса позиции.
 5. Поправка берется по общей минуте вчерашних торгов. Возврат запрещен.
 
 date — календарная дата MSK, НЕ биржевая дата торговой сессии.
@@ -62,8 +68,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--roll-days-before-last-trade",
         type=int,
-        default=7,
-        help="Минимальный запас календарных дней до LSTTRADE (по умолчанию 7).",
+        default=0,
+        help="Запас календарных дней до LSTTRADE. По умолчанию 0: переход "
+        "с начала последнего дня обращения, если объем не дал сигнал раньше.",
+    )
+    parser.add_argument(
+        "--volume-window-days",
+        type=int,
+        default=3,
+        help="Окно завершенных дней с данными для сравнения объемов (по умолчанию 3).",
     )
     parser.add_argument(
         "--completed-through",
@@ -318,12 +331,27 @@ def build_selection(
     from_date: date,
     metadata: dict[str, dict[str, date]],
     paths: dict[str, Path],
-    roll_days: int = 7,
+    roll_days: int = 0,
+    volume_window_days: int = 3,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Строит выбранный контракт на каждый день и журнал переходов."""
-    if roll_days < 1:
-        raise ValueError("Запас до LSTTRADE должен быть положительным")
+    if roll_days < 0:
+        raise ValueError("Запас до LSTTRADE не может быть отрицательным")
+    if volume_window_days < 1:
+        raise ValueError("Окно усреднения объема должно быть положительным")
     all_rows = rows_by_date(daily)
+    ordered_dates = sorted(all_rows)
+    date_positions = {day: index for index, day in enumerate(ordered_dates)}
+
+    def window_average_volume(contract: str, days: list[date]) -> float:
+        if not days:
+            return 0.0
+        total = sum(
+            float(all_rows[day].get(contract, {}).get("daily_volume") or 0)
+            for day in days
+        )
+        return total / len(days)
+
     dates = sorted(day for day in all_rows if day >= from_date)
     if not dates:
         raise ValueError(f"{asset}: нет данных начиная с {from_date}")
@@ -367,10 +395,10 @@ def build_selection(
         yesterday = dates[index - 1]
         today_rows = all_rows[today]
         yesterday_rows = all_rows[yesterday]
-        if today >= metadata[current]["LSTTRADE"]:
+        if yesterday >= metadata[current]["LSTTRADE"]:
             raise ValueError(
-                f"{asset} {today}: не удалось перенести {current} до LSTTRADE; "
-                "проверьте пробелы данных или увеличьте запас дней"
+                f"{asset} {today}: текущий {current} уже достиг LSTTRADE "
+                f"в день решения {yesterday}; проверьте справочник и данные"
             )
         reason = "keep_current"
         next_contract = nearest_later_contract(
@@ -381,21 +409,28 @@ def build_selection(
         )
 
         roll_to: str | None = None
-        if metadata[current]["LSTTRADE"] <= today + timedelta(days=roll_days):
+        deadline_reached = metadata[current]["LSTTRADE"] <= today + timedelta(
+            days=roll_days
+        )
+        window_dates = ordered_dates[
+            max(0, date_positions[today] - volume_window_days) : date_positions[today]
+        ]
+        current_average: float | None = None
+        next_average: float | None = None
+        if next_contract is not None:
+            current_average = window_average_volume(current, window_dates)
+            next_average = window_average_volume(next_contract, window_dates)
+            if next_average > current_average:
+                roll_to = next_contract
+                reason = "next_avg_volume_exceeded_current"
+
+        if roll_to is None and deadline_reached:
             if next_contract is None:
                 raise ValueError(
                     f"{asset} {today}: срок перехода, но нет следующего контракта"
                 )
             roll_to = next_contract
             reason = "last_trade_deadline"
-        elif next_contract is not None:
-            current_volume = float(
-                yesterday_rows.get(current, {}).get("daily_volume") or 0
-            )
-            next_volume = float(yesterday_rows[next_contract]["daily_volume"] or 0)
-            if next_volume > current_volume:
-                roll_to = next_contract
-                reason = "next_volume_exceeded_current"
 
         if roll_to is not None:
             old_row = yesterday_rows.get(current)
@@ -425,6 +460,13 @@ def build_selection(
                     "to_contract": roll_to,
                     "old_volume": old_row["daily_volume"],
                     "new_volume": new_row["daily_volume"],
+                    "old_avg_volume": (
+                        current_average if current_average is not None else 0.0
+                    ),
+                    "new_avg_volume": (
+                        next_average if next_average is not None else 0.0
+                    ),
+                    "volume_window_days": volume_window_days,
                     "old_close": old_close,
                     "new_close": new_close,
                     "adjustment_timestamp": adjustment_timestamp,
@@ -433,6 +475,8 @@ def build_selection(
                     "adjustment_delta": adjustment_delta,
                     "cumulative_adjustment": current_adjustment,
                     "reason": reason,
+                    "deadline_reached": deadline_reached,
+                    "roll_days_before_last_trade": roll_days,
                 }
             )
             current = roll_to
@@ -648,6 +692,11 @@ def validate_result(
     ]
     if any(right < left for left, right in pairwise(maturities)):
         raise ValueError(f"{asset}: обнаружен возврат к более ранней экспирации")
+    if any(
+        expiry <= day
+        for expiry, day in zip(maturities, selection.get_column("date").to_list())
+    ):
+        raise ValueError(f"{asset}: контракт выбран в день LSTTRADE или позже")
     if selection.filter(pl.col("decision_date") >= pl.col("date")).height:
         raise ValueError(f"{asset}: решение использует незавершенный день")
     if selection.join(bars.select("date").unique(), on="date", how="anti").height:
@@ -668,8 +717,10 @@ def require_derived_path(path: Path) -> Path:
 
 def main() -> None:
     args = parse_args()
-    if args.roll_days_before_last_trade < 1:
-        raise ValueError("Запас до LSTTRADE должен быть не меньше одного дня")
+    if args.roll_days_before_last_trade < 0:
+        raise ValueError("Запас до LSTTRADE не может быть отрицательным")
+    if args.volume_window_days < 1:
+        raise ValueError("Окно усреднения объема должно быть положительным")
     if len(args.assets) != len(set(args.assets)):
         raise ValueError("Повторные --assets запрещены")
     output_dir = require_derived_path(args.output_dir)
@@ -713,6 +764,7 @@ def main() -> None:
             metadata,
             paths,
             args.roll_days_before_last_trade,
+            args.volume_window_days,
         )
         minutes = load_selected_minutes(asset, paths, selection, date_map)
         bars = resample_15_minutes(minutes)
@@ -721,6 +773,12 @@ def main() -> None:
         all_selections.append(selection)
         if not rolls.is_empty():
             all_rolls.append(rolls)
+            volume_rolls = rolls.filter(
+                pl.col("reason") == "next_avg_volume_exceeded_current"
+            ).height
+            print(
+                f"{asset}: переходов по объему {volume_rolls}, по дедлайну {rolls.height - volume_rolls}"
+            )
             stale = rolls.filter(pl.col("adjustment_is_stale"))
             if stale.height:
                 print(
@@ -753,6 +811,9 @@ def main() -> None:
                 "to_contract": pl.String,
                 "old_volume": pl.Int64,
                 "new_volume": pl.Int64,
+                "old_avg_volume": pl.Float64,
+                "new_avg_volume": pl.Float64,
+                "volume_window_days": pl.Int64,
                 "old_close": pl.Float64,
                 "new_close": pl.Float64,
                 "adjustment_timestamp": pl.Datetime,
@@ -761,6 +822,8 @@ def main() -> None:
                 "adjustment_delta": pl.Float64,
                 "cumulative_adjustment": pl.Float64,
                 "reason": pl.String,
+                "deadline_reached": pl.Boolean,
+                "roll_days_before_last_trade": pl.Int64,
             }
         )
     )

@@ -135,7 +135,9 @@ def test_missing_selected_contract_does_not_trigger_future_based_fallback():
         build_selection("TEST", daily, date(2026, 9, 10), metadata(), {})
 
 
-def test_deadline_rolls_even_when_old_contract_has_more_volume(tmp_path):
+def test_explicit_seven_day_buffer_rolls_even_when_old_contract_has_more_volume(
+    tmp_path,
+):
     daily = market(
         {
             9: {"OLD": 100, "NEW": 10},
@@ -149,16 +151,120 @@ def test_deadline_rolls_even_when_old_contract_has_more_volume(tmp_path):
         date(2026, 9, 10),
         metadata(date(2026, 9, 18)),
         prices(tmp_path),
+        roll_days=7,
     )
     assert selected["contract"].to_list() == ["OLD", "NEW"]
     assert rolls["reason"][0] == "last_trade_deadline"
     assert rolls["adjustment_delta"][0] == -10.0
 
 
-def test_volume_roll_uses_yesterday_not_today(tmp_path):
+def test_default_keeps_liquid_front_during_last_week():
     daily = market(
         {
             9: {"OLD": 100, "NEW": 10},
+            10: {"OLD": 100, "NEW": 10},
+            11: {"OLD": 100, "NEW": 10},
+        }
+    )
+    selected, rolls = build_selection(
+        "TEST", daily, date(2026, 9, 10), metadata(date(2026, 9, 18)), {}
+    )
+    assert selected["contract"].to_list() == ["OLD", "OLD"]
+    assert rolls.is_empty()
+
+
+@pytest.mark.parametrize(
+    "old_volume,new_volume,reason",
+    [
+        (100, 10, "last_trade_deadline"),
+        (100, 100, "last_trade_deadline"),
+        (10, 100, "next_avg_volume_exceeded_current"),
+    ],
+)
+def test_last_trade_day_and_volume_priority(tmp_path, old_volume, new_volume, reason):
+    daily = market(
+        {
+            9: {"OLD": 100, "NEW": 50},
+            10: {"OLD": old_volume, "NEW": new_volume},
+            11: {"NEW": 10},
+        }
+    )
+    selected, rolls = build_selection(
+        "TEST", daily, date(2026, 9, 10), metadata(date(2026, 9, 11)), prices(tmp_path)
+    )
+    assert selected["contract"].to_list() == ["OLD", "NEW"]
+    assert rolls["reason"][0] == reason
+    assert rolls["deadline_reached"][0] is True
+    assert rolls["roll_days_before_last_trade"][0] == 0
+
+
+def test_last_trade_deadline_requires_candidate_known_yesterday():
+    daily = market({9: {"OLD": 100}, 10: {"OLD": 100}, 11: {"NEW": 1000}})
+    with pytest.raises(ValueError, match="нет следующего контракта"):
+        build_selection(
+            "TEST", daily, date(2026, 9, 10), metadata(date(2026, 9, 11)), {}
+        )
+
+
+def test_equal_volume_does_not_roll_before_deadline():
+    daily = market(
+        {
+            9: {"OLD": 100, "NEW": 10},
+            10: {"OLD": 100, "NEW": 100},
+            11: {"OLD": 100, "NEW": 10},
+        }
+    )
+    selected, rolls = build_selection("TEST", daily, date(2026, 9, 10), metadata(), {})
+    assert selected["contract"].to_list() == ["OLD", "OLD"]
+    assert rolls.is_empty()
+
+
+def test_cny_september_2022_volume_signal_is_not_masked_by_buffer(tmp_path):
+    # Объемы дня решения из raw CRU2/CRZ2 за 2022-09-07.
+    daily = pl.DataFrame(
+        [
+            {
+                "asset": "CNYRUB",
+                "date": day,
+                "contract": contract,
+                "daily_volume": volume,
+            }
+            for day, values in [
+                (date(2022, 9, 6), {"CRU2": 100, "CRZ2": 10}),
+                (date(2022, 9, 7), {"CRU2": 176838, "CRZ2": 202371}),
+                (date(2022, 9, 8), {"CRU2": 100, "CRZ2": 10}),
+            ]
+            for contract, volume in values.items()
+        ]
+    )
+    paths = {
+        contract: tmp_path / f"{contract}.parquet" for contract in ("CRU2", "CRZ2")
+    }
+    for contract, close in [("CRU2", 8.77), ("CRZ2", 9.0)]:
+        pl.DataFrame(
+            {"timestamp": [datetime(2022, 9, 7, 23, 47)], "close": [close]}
+        ).write_parquet(paths[contract])
+    selected, rolls = build_selection(
+        "CNYRUB",
+        daily,
+        date(2022, 9, 7),
+        {
+            "CRU2": {"LSTTRADE": date(2022, 9, 15)},
+            "CRZ2": {"LSTTRADE": date(2022, 12, 15)},
+        },
+        paths,
+    )
+    assert selected["contract"].to_list() == ["CRU2", "CRZ2"]
+    assert rolls["roll_date"][0] == date(2022, 9, 8)
+    assert rolls["reason"][0] == "next_avg_volume_exceeded_current"
+    assert rolls["volume_window_days"][0] == 3
+    assert rolls["deadline_reached"][0] is False
+
+
+def test_volume_roll_uses_completed_days_not_today(tmp_path):
+    daily = market(
+        {
+            9: {"OLD": 100, "NEW": 100},
             10: {"OLD": 10, "NEW": 100},
             11: {"OLD": 1000, "NEW": 1},
         }
@@ -171,7 +277,37 @@ def test_volume_roll_uses_yesterday_not_today(tmp_path):
         prices(tmp_path),
     )
     assert selected["contract"].to_list() == ["OLD", "NEW"]
-    assert rolls["reason"][0] == "next_volume_exceeded_current"
+    assert rolls["reason"][0] == "next_avg_volume_exceeded_current"
+
+
+@pytest.mark.parametrize(
+    "window,expected_roll",
+    [(3, False), (1, True)],
+)
+def test_volume_window_smooths_single_day_flip(tmp_path, window, expected_roll):
+    daily = market(
+        {
+            9: {"OLD": 1_000_000, "NEW": 100_000},
+            10: {"OLD": 10_000, "NEW": 20_000},
+            11: {"OLD": 900_000, "NEW": 100_000},
+        }
+    )
+    selected, rolls = build_selection(
+        "TEST",
+        daily,
+        date(2026, 9, 10),
+        metadata(),
+        prices(tmp_path),
+        volume_window_days=window,
+    )
+    if expected_roll:
+        assert selected["contract"].to_list() == ["OLD", "NEW"]
+        assert rolls.height == 1
+        assert rolls["reason"][0] == "next_avg_volume_exceeded_current"
+        assert rolls["new_avg_volume"][0] == 20_000.0
+    else:
+        assert selected["contract"].to_list() == ["OLD", "OLD"]
+        assert rolls.is_empty()
 
 
 def test_initial_selection_requires_warmup():
