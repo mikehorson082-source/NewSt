@@ -10,6 +10,8 @@ uv run python src/data/download_futoi.py --update
 Загрузка / докачка справочников:
 uv run python src/data/download_reference.py --update
 
+Склейка всех фьючерсов в непрерывные серии:
+uv run python src/data/build_continuous_futures.py
 
 
 

@@ -1,4 +1,4 @@
-"""Регрессионные проверки. Запуск пользователем: uv run pytest st01/test_build_continuous_futures.py"""
+"""Регрессионные проверки. Запуск пользователем: uv run pytest src/data/test_build_continuous_futures.py"""
 
 # raw содержит naive timestamp MSK; фикстуры воспроизводят эту схему намеренно.
 # ruff: noqa: DTZ001
@@ -9,14 +9,18 @@ from datetime import date, datetime
 import polars as pl
 import pytest
 
-from st01.build_continuous_futures import (
+from data.build_continuous_futures import (
     add_etf_nav,
     assign_trading_dates,
+    available_assets,
     build_selection,
     load_contract_metadata,
     parse_contract_dates,
+    registry_name,
     require_derived_path,
     resample_15_minutes,
+    select_ready_assets,
+    select_requested_assets,
     synchronized_closes,
 )
 
@@ -318,6 +322,15 @@ def test_initial_selection_requires_warmup():
         )
 
 
+def test_initial_warmup_uses_first_day_when_no_prior_history():
+    daily = market({10: {"OLD": 100, "NEW": 10}, 11: {"OLD": 100, "NEW": 10}})
+    selected, rolls = build_selection("TEST", daily, date(2026, 9, 10), metadata(), {})
+    assert selected["date"].to_list() == [date(2026, 9, 11)]
+    assert selected["contract"].to_list() == ["OLD"]
+    assert selected["decision_date"][0] == date(2026, 9, 10)
+    assert rolls.is_empty()
+
+
 def test_synchronized_price_uses_common_minute(tmp_path):
     paths = prices(tmp_path)
     pl.DataFrame(
@@ -417,10 +430,19 @@ def test_returns_do_not_use_adjustment_or_cross_roll():
 
 
 def test_output_path_cannot_target_raw():
-    from st01.build_continuous_futures import RAW_DIR
+    from data.build_continuous_futures import RAW_DIR
 
-    with pytest.raises(ValueError, match="внутри st01"):
+    with pytest.raises(ValueError, match="только для чтения"):
         require_derived_path(RAW_DIR)
+
+
+def test_output_path_outside_data_and_reference_are_rejected(tmp_path):
+    from data.build_continuous_futures import REFERENCE_DIR
+
+    with pytest.raises(ValueError, match="внутри data"):
+        require_derived_path(tmp_path)
+    with pytest.raises(ValueError, match="только для чтения"):
+        require_derived_path(REFERENCE_DIR)
 
 
 def test_etf_nav_roll_uses_close_over_open_and_charges_cost():
@@ -473,3 +495,56 @@ def test_etf_nav_rejects_invalid_cost():
     )
     with pytest.raises(ValueError, match="Издержка перехода"):
         add_etf_nav(bars, roll_cost_bps=-1.0)
+
+
+def test_registry_alias_and_name_resolve_to_same_directory():
+    assert registry_name("MXI") == "mix_mini"
+    assert registry_name("mix_mini") == "mix_mini"
+    assert registry_name("brent") == "brent"
+    assert registry_name("rts") == "rts"
+
+
+def test_registry_rejects_unknown_and_perpetual():
+    with pytest.raises(ValueError, match="Неизвестный актив"):
+        registry_name("no_such_asset")
+    with pytest.raises(ValueError, match="вечный"):
+        registry_name("perpetual")
+
+
+def test_available_assets_has_plan_markets_and_no_perpetual():
+    names = available_assets()
+    assert "perpetual" not in names
+    assert {"MXI", "CNYRUB", "BRENT", "GOLD"} <= set(names)
+    assert {"brent", "rts", "mix_mini"} <= set(names)
+
+
+def test_select_ready_assets_skips_missing_raw_and_reference(tmp_path):
+    (tmp_path / "brent").mkdir()
+    (tmp_path / "brent" / "BRM2.parquet").write_bytes(b"")
+    (tmp_path / "gold").mkdir()
+    (tmp_path / "gold" / "GDM2.parquet").write_bytes(b"")
+    candidates = {"BRENT": "brent", "GOLD": "gold", "MXI": "mix_mini"}
+    ready, skipped = select_ready_assets(candidates, {"BRM2"}, raw_dir=tmp_path)
+    assert ready == {"BRENT": "brent"}
+    assert {label for label, _ in skipped} == {"GOLD", "MXI"}
+
+
+def test_select_requested_assets_all_is_default_scope():
+    requested, process_all = select_requested_assets(["all"])
+    assert process_all is True
+    assert "perpetual" not in requested
+    assert {"brent", "rts", "mix_mini"} <= set(requested)
+
+
+def test_select_requested_assets_plan_is_four_markets():
+    requested, process_all = select_requested_assets(["plan"])
+    assert process_all is False
+    assert requested == ["MXI", "CNYRUB", "BRENT", "GOLD"]
+
+
+def test_select_requested_assets_explicit_and_conflicts():
+    assert select_requested_assets(["MXI", "brent"]) == (["MXI", "brent"], False)
+    with pytest.raises(ValueError, match="отдельно"):
+        select_requested_assets(["all", "MXI"])
+    with pytest.raises(ValueError, match="Повторные"):
+        select_requested_assets(["MXI", "MXI"])

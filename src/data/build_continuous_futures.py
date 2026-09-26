@@ -1,4 +1,4 @@
-"""Строит непрерывные 15-минутные ряды фьючерсов для стратегии st01.
+"""Строит непрерывные 15-минутные ряды фьючерсов (общий слой данных).
 
 Правило роллирования:
 1. Решение на календарный день (MSK) принимается по завершенным дням с данными
@@ -24,7 +24,10 @@ open/high/low/close — реальные цены выбранного конт�
 Последний день raw по умолчанию исключается как потенциально незавершенный.
 
 Скрипт только читает data/raw и data/reference/futures_contracts.parquet.
-Сетевых запросов нет. Результаты сохраняются в st01/data/continuous_15m_v2.
+Сетевых запросов нет. Результаты сохраняются в data/continuous_15m.
+Список рынков берётся из реестра src/core/instruments.py. По умолчанию
+(all) склеиваются все готовые рынки; --assets plan — четыре рынка плана
+(MXI/CNYRUB/BRENT/GOLD), их ярлыки — псевдонимы имён реестра.
 """
 
 from __future__ import annotations
@@ -39,17 +42,92 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+from core.instruments import ASSETS, Cadence
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW_DIR = PROJECT_ROOT / "data" / "raw" / "futures"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "st01" / "data" / "continuous_15m_v2"
+REFERENCE_DIR = PROJECT_ROOT / "data" / "reference"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "continuous_15m"
 DEFAULT_FROM_DATE = date(2022, 5, 1)
 
-ASSET_DIRECTORIES = {
+PLAN_ASSETS = ["MXI", "CNYRUB", "BRENT", "GOLD"]
+DEFAULT_ASSETS = ["all"]
+ASSET_ALIASES = {
     "MXI": "mix_mini",
     "CNYRUB": "cnyrub",
     "BRENT": "brent",
     "GOLD": "gold",
 }
+
+
+def select_requested_assets(assets: list[str]) -> tuple[list[str], bool]:
+    """Разворачивает all/plan: возвращает (список рынков, признак all).
+
+    По умолчанию запускаются все готовые рынки реестра (all). Значение plan
+    оставляет только четыре рынка плана; явный список имён/ярлыков — как есть.
+    """
+    if len(assets) != len(set(assets)):
+        raise ValueError("Повторные --assets запрещены")
+    if ({"all", "plan"} & set(assets)) and len(assets) > 1:
+        raise ValueError("all и plan указываются отдельно, без других рынков")
+    if assets == ["all"]:
+        registry = sorted(
+            name for name, spec in ASSETS.items() if spec.cadence != Cadence.PERPETUAL
+        )
+        return registry, True
+    if assets == ["plan"]:
+        return list(PLAN_ASSETS), False
+    return list(assets), False
+
+
+def registry_name(asset: str) -> str:
+    """Имя актива в реестре src/core/instruments.py по ярлыку или имени."""
+    name = ASSET_ALIASES.get(asset, asset)
+    if name not in ASSETS:
+        available = ", ".join(available_assets())
+        raise ValueError(f"Неизвестный актив {asset}. Доступные: {available}")
+    if ASSETS[name].cadence == Cadence.PERPETUAL:
+        raise ValueError(f"{asset}: вечный фьючерс не склеивается")
+    return name
+
+
+def available_assets() -> list[str]:
+    """Ярлыки плана и все имена реестра, кроме вечных фьючерсов."""
+    registry = [
+        name for name, spec in ASSETS.items() if spec.cadence != Cadence.PERPETUAL
+    ]
+    return sorted(set(ASSET_ALIASES) | set(registry))
+
+
+def select_ready_assets(
+    candidates: dict[str, str],
+    reference: set[str],
+    raw_dir: Path = RAW_DIR,
+) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """Оставляет рынки с raw-данными и полным покрытием справочника."""
+    ready: dict[str, str] = {}
+    skipped: list[tuple[str, str]] = []
+    for label, name in candidates.items():
+        directory = raw_dir / name
+        files = sorted(directory.glob("*.parquet")) if directory.is_dir() else []
+        if not files:
+            skipped.append((label, "нет raw-файлов"))
+            continue
+        missing = [path.stem for path in files if path.stem not in reference]
+        if missing:
+            skipped.append((label, f"нет в справочнике: {len(missing)}"))
+            continue
+        ready[label] = name
+    return ready, skipped
+
+
+def reference_tickers(path: Path) -> set[str]:
+    """Тикеры контрактов из локального справочника (только чтение)."""
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Нет справочника {path}. Сначала загрузите futures_contracts.parquet."
+        )
+    return set(pl.read_parquet(path, columns=["ticker"])["ticker"].to_list())
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,9 +137,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--assets",
         nargs="+",
-        choices=sorted(ASSET_DIRECTORIES),
-        default=list(ASSET_DIRECTORIES),
-        help="Рынки для обработки.",
+        default=DEFAULT_ASSETS,
+        metavar="ASSET",
+        help="По умолчанию all — все готовые рынки реестра. Явно: имена реестра "
+        "(brent, rts, ...), ярлыки MXI/CNYRUB/BRENT/GOLD или plan — только "
+        "четыре рынка плана.",
     )
     parser.add_argument(
         "--from-date",
@@ -97,7 +177,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--metadata-file",
         type=Path,
-        default=PROJECT_ROOT / "data" / "reference" / "futures_contracts.parquet",
+        default=REFERENCE_DIR / "futures_contracts.parquet",
         help="Локальный Parquet-справочник контрактов (только чтение).",
     )
     parser.add_argument(
@@ -367,22 +447,30 @@ def build_selection(
         raise ValueError(f"{asset}: нет данных начиная с {from_date}")
 
     prior_dates = sorted(day for day in all_rows if day < dates[0])
-    if not prior_dates:
-        raise ValueError(
-            f"{asset}: нужен завершенный день до {dates[0]} для инициализации"
-        )
-    initial_decision = prior_dates[-1]
+    if prior_dates:
+        initial_decision = prior_dates[-1]
+        series_dates = dates
+    else:
+        if len(dates) < 2:
+            raise ValueError(
+                f"{asset}: слишком короткая история для инициализации с {dates[0]}"
+            )
+        initial_decision = dates[0]
+        series_dates = dates[1:]
+
     initial_rows = {
         contract: row
         for contract, row in all_rows[initial_decision].items()
-        if metadata[contract]["LSTTRADE"] > dates[0] + timedelta(days=roll_days)
+        if metadata[contract]["LSTTRADE"] > series_dates[0] + timedelta(days=roll_days)
         and row["daily_volume"] > 0
     }
     if not initial_rows:
         raise ValueError(f"{asset}: нет подходящего начального контракта")
     current = choose_initial_contract(initial_rows, metadata)
-    if current not in all_rows[dates[0]]:
-        raise ValueError(f"{asset}: выбранный заранее {current} отсутствует {dates[0]}")
+    if current not in all_rows[series_dates[0]]:
+        raise ValueError(
+            f"{asset}: выбранный заранее {current} отсутствует {series_dates[0]}"
+        )
     current_adjustment = 0.0
     selection: list[dict[str, Any]] = []
     rolls: list[dict[str, Any]] = []
@@ -390,19 +478,19 @@ def build_selection(
     selection.append(
         {
             "asset": asset,
-            "date": dates[0],
+            "date": series_dates[0],
             "contract": current,
             "selection_reason": "initial_previous_volume",
             "decision_date": initial_decision,
-            "daily_volume": all_rows[dates[0]][current]["daily_volume"],
+            "daily_volume": all_rows[series_dates[0]][current]["daily_volume"],
             "price_adjustment": current_adjustment,
             "is_roll_day": False,
         }
     )
 
-    for index in range(1, len(dates)):
-        today = dates[index]
-        yesterday = dates[index - 1]
+    for index in range(1, len(series_dates)):
+        today = series_dates[index]
+        yesterday = series_dates[index - 1]
         today_rows = all_rows[today]
         yesterday_rows = all_rows[yesterday]
         if yesterday >= metadata[current]["LSTTRADE"]:
@@ -758,10 +846,14 @@ def validate_result(
 
 
 def require_derived_path(path: Path) -> Path:
-    """Любые записи разрешены только внутри st01, никогда в raw."""
+    """Записи разрешены только внутри data, но не в raw и не в reference."""
     resolved = path.resolve()
-    if not resolved.is_relative_to(PROJECT_ROOT / "st01"):
-        raise ValueError(f"Путь записи должен находиться внутри st01: {resolved}")
+    if not resolved.is_relative_to(PROJECT_ROOT / "data"):
+        raise ValueError(f"Путь записи должен находиться внутри data: {resolved}")
+    if resolved.is_relative_to(RAW_DIR.parent) or resolved.is_relative_to(
+        REFERENCE_DIR
+    ):
+        raise ValueError(f"raw и reference доступны только для чтения: {resolved}")
     return resolved
 
 
@@ -780,50 +872,76 @@ def main() -> None:
     today_msk = datetime.now(ZoneInfo("Europe/Moscow")).date()
     if args.completed_through and args.completed_through >= today_msk:
         raise ValueError("--completed-through должен быть раньше текущего дня MSK")
+
+    requested, process_all = select_requested_assets(args.assets)
+    candidates = {asset: registry_name(asset) for asset in requested}
+    if len(set(candidates.values())) != len(candidates):
+        raise ValueError("В --assets повторяются рынки")
+    if process_all:
+        candidates, skipped = select_ready_assets(
+            candidates, reference_tickers(metadata_path)
+        )
+        for label, reason in skipped:
+            print(f"{label}: пропущен ({reason})")
+    if not candidates:
+        raise ValueError("Нет рынков, готовых к склейке")
+
     contracts = [
         path.stem
-        for asset in args.assets
-        for path in (RAW_DIR / ASSET_DIRECTORIES[asset]).glob("*.parquet")
+        for name in candidates.values()
+        for path in (RAW_DIR / name).glob("*.parquet")
     ]
     metadata = load_contract_metadata(contracts, metadata_path)
     print(f"Локальный справочник: {metadata_path}, контрактов: {len(metadata)}")
+    print(f"Рынки: {', '.join(candidates)}")
 
     all_bars: list[pl.DataFrame] = []
     all_selections: list[pl.DataFrame] = []
     all_rolls: list[pl.DataFrame] = []
+    processed: list[str] = []
 
-    for asset in args.assets:
+    failures: list[tuple[str, str]] = []
+    for asset, name in candidates.items():
         print(f"{asset}: чтение контрактов")
-        daily, paths, date_map = load_daily_market(
-            asset,
-            RAW_DIR / ASSET_DIRECTORIES[asset],
-        )
-        last_raw_date = daily["date"].max()
-        completed_through = args.completed_through or min(
-            last_raw_date - timedelta(days=1),
-            today_msk - timedelta(days=1),
-        )
-        if completed_through > last_raw_date:
-            raise ValueError(
-                f"{asset}: данные заканчиваются раньше --completed-through"
+        try:
+            daily, paths, date_map = load_daily_market(
+                asset,
+                RAW_DIR / name,
             )
-        daily = daily.filter(pl.col("date") <= completed_through)
-        print(f"{asset}: календарные дни MSK, данные по {completed_through}")
-        selection, rolls = build_selection(
-            asset,
-            daily,
-            args.from_date,
-            metadata,
-            paths,
-            args.roll_days_before_last_trade,
-            args.volume_window_days,
-        )
-        minutes = load_selected_minutes(asset, paths, selection, date_map)
-        bars = resample_15_minutes(minutes)
-        bars = add_etf_nav(bars, args.roll_cost_bps)
-        validate_result(asset, bars, selection, metadata)
+            last_raw_date = daily["date"].max()
+            completed_through = args.completed_through or min(
+                last_raw_date - timedelta(days=1),
+                today_msk - timedelta(days=1),
+            )
+            if completed_through > last_raw_date:
+                raise ValueError(
+                    f"{asset}: данные заканчиваются раньше --completed-through"
+                )
+            daily = daily.filter(pl.col("date") <= completed_through)
+            print(f"{asset}: календарные дни MSK, данные по {completed_through}")
+            selection, rolls = build_selection(
+                asset,
+                daily,
+                args.from_date,
+                metadata,
+                paths,
+                args.roll_days_before_last_trade,
+                args.volume_window_days,
+            )
+            minutes = load_selected_minutes(asset, paths, selection, date_map)
+            bars = resample_15_minutes(minutes)
+            bars = add_etf_nav(bars, args.roll_cost_bps)
+            validate_result(asset, bars, selection, metadata)
+        except (ValueError, FileNotFoundError) as error:
+            if not process_all:
+                raise
+            failures.append((asset, str(error)))
+            print(f"{asset}: ошибка, пропущен ({error})")
+            continue
+
         all_bars.append(bars)
         all_selections.append(selection)
+        processed.append(asset)
         if not rolls.is_empty():
             all_rolls.append(rolls)
             volume_rolls = rolls.filter(
@@ -850,6 +968,14 @@ def main() -> None:
             f"{asset}: {bars.height:,} баров, "
             f"{selection.height:,} дней, {rolls.height} переходов, "
             f"NAV {bars['nav'][-1]:.4f}"
+        )
+
+    if not all_bars:
+        raise ValueError("Ни один рынок не удалось обработать")
+    if failures:
+        print(
+            f"\nПропущено рынков: {len(failures)} — "
+            + "; ".join(f"{asset}: {reason}" for asset, reason in failures)
         )
 
     combined_bars = pl.concat(all_bars, how="vertical_relaxed").sort(
@@ -891,7 +1017,7 @@ def main() -> None:
     # До этого места все рынки должны пройти проверки. Запись отдельных рынков
     # внутри цикла оставляла смешанные результаты при ошибке следующего рынка.
     output_dir.mkdir(parents=True, exist_ok=True)
-    for asset, bars in zip(args.assets, all_bars):
+    for asset, bars in zip(processed, all_bars):
         bars.write_parquet(
             output_dir / f"{asset.lower()}_15m.parquet", compression="zstd"
         )

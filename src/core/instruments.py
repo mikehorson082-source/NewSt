@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 
 
 class Sector(str, Enum):
@@ -155,7 +154,7 @@ ASSETS: dict[str, AssetSpec] = {
     "copper": AssetSpec(
         name="copper",
         short_name="Медь",
-        asset_code="CE",
+        asset_code="COPPER",
         ticker_prefix="CE",
         sector=Sector.COMMODITY,
         cadence=Cadence.QUARTERLY,
@@ -221,7 +220,7 @@ ASSETS: dict[str, AssetSpec] = {
     "yandex": AssetSpec(
         name="yandex",
         short_name="Яндекс",
-        asset_code="YD",
+        asset_code="YDEX",
         ticker_prefix="YD",
         sector=Sector.EQUITY,
         cadence=Cadence.QUARTERLY,
@@ -237,7 +236,7 @@ ASSETS: dict[str, AssetSpec] = {
     "tbank": AssetSpec(
         name="tbank",
         short_name="Т-Банк",
-        asset_code="TCS",
+        asset_code="TCSI",
         ticker_prefix="TI",
         sector=Sector.EQUITY,
         cadence=Cadence.QUARTERLY,

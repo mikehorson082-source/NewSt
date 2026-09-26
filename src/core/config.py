@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.core.instruments import (
+from .instruments import (
     ASSETS,
     AssetSpec,
     Cadence,
