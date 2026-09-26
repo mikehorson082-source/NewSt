@@ -107,13 +107,14 @@ def select_ready_assets(
     """Оставляет рынки с raw-данными и полным покрытием справочника."""
     ready: dict[str, str] = {}
     skipped: list[tuple[str, str]] = []
+    ref_upper = {t.upper() for t in reference}
     for label, name in candidates.items():
         directory = raw_dir / name
         files = sorted(directory.glob("*.parquet")) if directory.is_dir() else []
         if not files:
             skipped.append((label, "нет raw-файлов"))
             continue
-        missing = [path.stem for path in files if path.stem not in reference]
+        missing = [path.stem for path in files if path.stem.upper() not in ref_upper]
         if missing:
             skipped.append((label, f"нет в справочнике: {len(missing)}"))
             continue
@@ -237,21 +238,24 @@ def load_contract_metadata(
             f"{path}: отсутствуют столбцы {', '.join(sorted(missing_columns))}"
         )
     requested = set(contracts)
-    matched = reference.filter(pl.col("ticker").is_in(sorted(requested)))
-    missing = requested - set(matched["ticker"].to_list())
-    if missing:
-        raise ValueError(
-            f"{path}: нет контрактов {', '.join(sorted(missing))}. Дополните локальный справочник."
-        )
-    duplicates = matched.group_by("ticker").len().filter(pl.col("len") > 1)
+    duplicates = reference.group_by("ticker").len().filter(pl.col("len") > 1)
     if duplicates.height:
         raise ValueError(
             f"{path}: неоднозначные записи контрактов {', '.join(sorted(duplicates['ticker'].to_list()))}"
         )
+    ref_by_upper: dict[str, dict[str, Any]] = {
+        str(row["ticker"]).upper(): row for row in reference.iter_rows(named=True)
+    }
+    missing = [c for c in sorted(requested) if c.upper() not in ref_by_upper]
+    if missing:
+        raise ValueError(
+            f"{path}: нет контрактов {', '.join(sorted(missing))}. Дополните локальный справочник."
+        )
     result: dict[str, dict[str, date]] = {}
-    for row in matched.iter_rows(named=True):
-        result[row["ticker"]] = parse_contract_dates(
-            row["ticker"],
+    for contract in sorted(requested):
+        row = ref_by_upper[contract.upper()]
+        result[contract] = parse_contract_dates(
+            contract,
             {
                 "LSTTRADE": row["last_trade_date"],
                 "FRSTTRADE": row.get("first_trade_date"),
@@ -628,6 +632,10 @@ def load_selected_minutes(
             pl.lit(contract).alias("contract"),
             pl.col("timestamp").dt.date().alias("calendar_date"),
         )
+        contract_dates = selection.filter(pl.col("contract") == contract)[
+            "date"
+        ].to_list()
+        frame = frame.filter(pl.col("calendar_date").is_in(contract_dates))
         price_columns = ["open", "high", "low", "close"]
         if (
             frame["timestamp"].null_count()

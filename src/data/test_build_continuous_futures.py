@@ -548,3 +548,23 @@ def test_select_requested_assets_explicit_and_conflicts():
         select_requested_assets(["all", "MXI"])
     with pytest.raises(ValueError, match="Повторные"):
         select_requested_assets(["MXI", "MXI"])
+
+
+def test_select_ready_assets_case_insensitive(tmp_path):
+    (tmp_path / "si").mkdir()
+    (tmp_path / "si" / "SiZ7.parquet").write_bytes(b"")
+    candidates = {"SI": "si"}
+    ready, skipped = select_ready_assets(candidates, {"SIZ7"}, raw_dir=tmp_path)
+    assert ready == {"SI": "si"}
+    assert skipped == []
+
+
+def test_load_contract_metadata_case_insensitive(tmp_path):
+    path = tmp_path / "metadata.parquet"
+    pl.DataFrame(
+        {"ticker": ["SIZ7"], "last_trade_date": [date(2027, 12, 16)]}
+    ).write_parquet(path)
+    res = load_contract_metadata(["SiZ7"], path)
+    assert "SiZ7" in res
+    assert res["SiZ7"] == {"LSTTRADE": date(2027, 12, 16)}
+
