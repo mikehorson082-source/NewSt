@@ -14,6 +14,7 @@ from data.build_continuous_futures import (
     assign_trading_dates,
     available_assets,
     build_selection,
+    effective_start_date,
     load_contract_metadata,
     parse_contract_dates,
     registry_name,
@@ -502,6 +503,12 @@ def test_registry_alias_and_name_resolve_to_same_directory():
     assert registry_name("mix_mini") == "mix_mini"
     assert registry_name("brent") == "brent"
     assert registry_name("rts") == "rts"
+
+
+def test_effective_start_date_respects_structural_gap_floor():
+    assert effective_start_date("tbank", date(2022, 5, 1)) == date(2024, 3, 21)
+    assert effective_start_date("brent", date(2022, 5, 1)) == date(2022, 5, 1)
+    assert effective_start_date("tbank", date(2025, 1, 1)) == date(2025, 1, 1)
 
 
 def test_registry_rejects_unknown_and_perpetual():

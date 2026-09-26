@@ -22,6 +22,9 @@ open/high/low/close — реальные цены выбранного конт�
 аддитивный ряд для изменений в пунктах. log_return считается по реальным ценам
 и отсутствует на первом баре и на переходах. Это не доходность капитала.
 Последний день raw по умолчанию исключается как потенциально незавершенный.
+Старт рынка может быть позже --from-date: структурный разрыв истории
+(continuous_from в реестре) нельзя перешагнуть склейкой, ряд начинается
+после него.
 
 Скрипт только читает data/raw и data/reference/futures_contracts.parquet.
 Сетевых запросов нет. Результаты сохраняются в data/continuous_15m.
@@ -91,6 +94,19 @@ def registry_name(asset: str) -> str:
     return name
 
 
+def effective_start_date(asset: str, from_date: date) -> date:
+    """Старт ряда не раньше structural-границы реестра.
+
+    Если у рынка была пауза торгов, контракты до и после нее не имеют общих
+    минут, и склейка невозможна. continuous_from задает первый день, с
+    которого ряд строится; --from-date может сдвинуть старт только позже.
+    """
+    continuous_from = ASSETS[asset].continuous_from
+    if continuous_from is not None and continuous_from > from_date:
+        return continuous_from
+    return from_date
+
+
 def available_assets() -> list[str]:
     """Ярлыки плана и все имена реестра, кроме вечных фьючерсов."""
     registry = [
@@ -148,7 +164,8 @@ def parse_args() -> argparse.Namespace:
         "--from-date",
         type=date.fromisoformat,
         default=DEFAULT_FROM_DATE,
-        help="Начало ряда в формате YYYY-MM-DD.",
+        help="Начало ряда в формате YYYY-MM-DD. Для рынков со структурным "
+        "разрывом истории реестр сдвигает старт позже.",
     )
     parser.add_argument(
         "--roll-days-before-last-trade",
@@ -926,11 +943,20 @@ def main() -> None:
                     f"{asset}: данные заканчиваются раньше --completed-through"
                 )
             daily = daily.filter(pl.col("date") <= completed_through)
-            print(f"{asset}: календарные дни MSK, данные по {completed_through}")
+            start_date = effective_start_date(name, args.from_date)
+            if start_date != args.from_date:
+                print(
+                    f"{asset}: старт сдвинут с {args.from_date} до {start_date} "
+                    "(continuous_from реестра)"
+                )
+            print(
+                f"{asset}: календарные дни MSK, данные по {completed_through}, "
+                f"старт {start_date}"
+            )
             selection, rolls = build_selection(
                 asset,
                 daily,
-                args.from_date,
+                start_date,
                 metadata,
                 paths,
                 args.roll_days_before_last_trade,

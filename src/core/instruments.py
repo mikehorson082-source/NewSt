@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from enum import Enum
 
 
@@ -43,6 +44,11 @@ class AssetSpec:
     sector: Sector  # Сектор рынка
     cadence: Cadence  # Ежемесячный или квартальный
     fixed_tickers: list[str] = field(default_factory=list)  # Для вечных фьючерсов
+    # Дополнительные исторические префиксы кодов контрактов при смене тикера биржей
+    extra_prefixes: list[str] = field(default_factory=list)
+    # Нижняя граница непрерывного ряда после структурного разрыва истории
+    # (например, пауза торгов). Склейка начинается не раньше этой даты.
+    continuous_from: date | None = None
 
     def generate_tickers(self, years: list[int] | None = None) -> list[str]:
         """Генерирует список стандартных биржевых кодов контрактов для заданных годов."""
@@ -53,7 +59,8 @@ class AssetSpec:
             years = [1, 2, 3, 4, 5, 6, 7]  # 2021-2027
 
         months = MONTH_CODES_ALL if self.cadence == Cadence.MONTHLY else MONTH_CODES_QUARTERLY
-        return [f"{self.ticker_prefix}{m}{y}" for y in years for m in months]
+        prefixes = ([self.ticker_prefix] if self.ticker_prefix else []) + list(self.extra_prefixes)
+        return [f"{p}{m}{y}" for p in prefixes for y in years for m in months]
 
 
 # =====================================================================
@@ -236,10 +243,14 @@ ASSETS: dict[str, AssetSpec] = {
     "tbank": AssetSpec(
         name="tbank",
         short_name="Т-Банк",
-        asset_code="TCSI",
-        ticker_prefix="TI",
+        asset_code="T",
+        ticker_prefix="TB",
+        extra_prefixes=["TI"],
         sector=Sector.EQUITY,
         cadence=Cadence.QUARTERLY,
+        # Пауза торгов с 15.02.2024 по 19.03.2024 (редомициляция). TIH4
+        # завершился 14.02, TIM4/TIU4 стартовали 20.03 без общих минут.
+        continuous_from=date(2024, 3, 21),
     ),
     # ------------------ Зарубежные бенчмарки ------------------
     "spy": AssetSpec(

@@ -642,12 +642,18 @@ def fetch_futures_contracts(
     for asset_name, spec in ASSETS.items():
         if spec.ticker_prefix:
             prefix_to_asset[spec.ticker_prefix.upper()] = asset_name
+        for p in getattr(spec, "extra_prefixes", []):
+            prefix_to_asset[p.upper()] = asset_name
         if spec.asset_code:
             assetcode_to_asset[spec.asset_code.upper()] = asset_name
         for fixed in spec.fixed_tickers:
             ticker_to_asset[fixed.upper()] = asset_name
         for ticker in spec.generate_tickers():
             ticker_to_asset.setdefault(ticker.upper(), asset_name)
+
+    # Исторические алиасы базовых активов (например, TCSI -> tbank после переименования в T)
+    assetcode_to_asset["TCSI"] = "tbank"
+    assetcode_to_asset["T"] = "tbank"
 
     raw_futures_dir = Paths().raw_futures_min
     if raw_futures_dir.exists():
