@@ -1,0 +1,4 @@
+asset,history_start,history_end,trading_days,median_minutes_day,p10_minutes_day,median_contracts_day,p10_contracts_day,median_turnover_rub_day,p10_turnover_rub_day,days_under_100_minutes,days_under_500_minutes,dominant_contracts,missing_observed_market_days
+IMOEXF,2023-11-14,2026-09-25,819,834.0,350.0,335605.0,7512.0,0.0,0.0,2,186,1,389
+MIX,2022-05-04,2026-09-25,1208,801.5,515.0,56438.5,10167.0,0.0,0.0,0,95,19,0
+MXI,2022-05-04,2026-09-25,1208,819.0,511.0,102949.0,21402.0,0.0,0.0,0,103,19,0
