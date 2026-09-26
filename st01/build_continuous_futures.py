@@ -12,6 +12,10 @@
    Старый контракт в последний день обращения не выбирается. Это ограничение
    дневного исследовательского ряда, а не модель исполнения переноса позиции.
 5. Поправка берется по общей минуте вчерашних торгов. Возврат запрещен.
+6. NAV (ETF Trick) — доходность самофинансируемой позиции: внутри контракта
+   close/prev_close, на первом баре нового контракта close/open, на переходе
+   вычитается roll_cost_bps. NAV служит для признаков и таргетов, реальные
+   цены — для исполнения. Разрыв базиса в NAV не попадает.
 
 date — календарная дата MSK, НЕ биржевая дата торговой сессии.
 open/high/low/close — реальные цены выбранного контракта; *_adjusted —
@@ -77,6 +81,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="Окно завершенных дней с данными для сравнения объемов (по умолчанию 3).",
+    )
+    parser.add_argument(
+        "--roll-cost-bps",
+        type=float,
+        default=0.0,
+        help="Издержка одного перехода в б.п. NAV (закрыть старый + открыть новый).",
     )
     parser.add_argument(
         "--completed-through",
@@ -469,6 +479,7 @@ def build_selection(
                     "volume_window_days": volume_window_days,
                     "old_close": old_close,
                     "new_close": new_close,
+                    "gap_pct": (new_close / old_close - 1.0) * 100.0,
                     "adjustment_timestamp": adjustment_timestamp,
                     "adjustment_age_minutes": adjustment_age_minutes,
                     "adjustment_is_stale": adjustment_age_minutes > 15,
@@ -662,6 +673,35 @@ def resample_15_minutes(minutes: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def add_etf_nav(bars: pl.DataFrame, roll_cost_bps: float = 0.0) -> pl.DataFrame:
+    """NAV по ETF Trick: carry и разрыв ролла не искажают доходность.
+
+    Применяется к ряду одного рынка. Внутри контракта множитель
+    close/prev_close. На первом баре нового контракта — close/open того же
+    бара, поэтому разрыв между контрактами в NAV не попадает. На каждом
+    переходе дополнительно вычитается roll_cost_bps. Первый бар ряда задает
+    NAV = 1.
+    """
+    if not 0.0 <= roll_cost_bps < 10_000.0:
+        raise ValueError("Издержка перехода должна быть в диапазоне [0, 10000) б.п.")
+    ordered = bars.sort("timestamp").with_row_index("_row", offset=1)
+    delta = (
+        pl.when(pl.col("_row") == 1)
+        .then(0.0)
+        .when(pl.col("is_first_bar_after_roll"))
+        .then(pl.col("close") / pl.col("open") - 1.0)
+        .otherwise(pl.col("close") / pl.col("close").shift(1) - 1.0)
+    )
+    cost_factor = (
+        pl.when(pl.col("is_first_bar_after_roll"))
+        .then(1.0 - roll_cost_bps / 10_000.0)
+        .otherwise(1.0)
+    )
+    return ordered.with_columns(
+        (cost_factor * (1.0 + delta)).cum_prod().alias("nav")
+    ).drop("_row")
+
+
 def validate_result(
     asset: str,
     bars: pl.DataFrame,
@@ -706,6 +746,16 @@ def validate_result(
     ).height:
         raise ValueError(f"{asset}: доходность пересекает смену контракта")
 
+    invalid_nav = bars.select(
+        (
+            pl.col("nav").is_null() | ~pl.col("nav").is_finite() | (pl.col("nav") <= 0)
+        ).sum()
+    ).item()
+    if invalid_nav:
+        raise ValueError(f"{asset}: найдено {invalid_nav} некорректных значений NAV")
+    if bars["nav"][0] != 1.0:
+        raise ValueError(f"{asset}: NAV должен начинаться с 1.0")
+
 
 def require_derived_path(path: Path) -> Path:
     """Любые записи разрешены только внутри st01, никогда в raw."""
@@ -721,6 +771,8 @@ def main() -> None:
         raise ValueError("Запас до LSTTRADE не может быть отрицательным")
     if args.volume_window_days < 1:
         raise ValueError("Окно усреднения объема должно быть положительным")
+    if not 0.0 <= args.roll_cost_bps < 10_000.0:
+        raise ValueError("Издержка перехода должна быть в диапазоне [0, 10000) б.п.")
     if len(args.assets) != len(set(args.assets)):
         raise ValueError("Повторные --assets запрещены")
     output_dir = require_derived_path(args.output_dir)
@@ -768,6 +820,7 @@ def main() -> None:
         )
         minutes = load_selected_minutes(asset, paths, selection, date_map)
         bars = resample_15_minutes(minutes)
+        bars = add_etf_nav(bars, args.roll_cost_bps)
         validate_result(asset, bars, selection, metadata)
         all_bars.append(bars)
         all_selections.append(selection)
@@ -778,6 +831,11 @@ def main() -> None:
             ).height
             print(
                 f"{asset}: переходов по объему {volume_rolls}, по дедлайну {rolls.height - volume_rolls}"
+            )
+            gap_abs = rolls["gap_pct"].abs()
+            print(
+                f"{asset}: разрыв на переходах ср. {gap_abs.mean():.2f}%, "
+                f"макс {gap_abs.max():.2f}% — в NAV не попадает"
             )
             stale = rolls.filter(pl.col("adjustment_is_stale"))
             if stale.height:
@@ -790,7 +848,8 @@ def main() -> None:
 
         print(
             f"{asset}: {bars.height:,} баров, "
-            f"{selection.height:,} дней, {rolls.height} переходов"
+            f"{selection.height:,} дней, {rolls.height} переходов, "
+            f"NAV {bars['nav'][-1]:.4f}"
         )
 
     combined_bars = pl.concat(all_bars, how="vertical_relaxed").sort(
@@ -816,6 +875,7 @@ def main() -> None:
                 "volume_window_days": pl.Int64,
                 "old_close": pl.Float64,
                 "new_close": pl.Float64,
+                "gap_pct": pl.Float64,
                 "adjustment_timestamp": pl.Datetime,
                 "adjustment_age_minutes": pl.Float64,
                 "adjustment_is_stale": pl.Boolean,

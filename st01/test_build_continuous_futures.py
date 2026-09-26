@@ -10,6 +10,7 @@ import polars as pl
 import pytest
 
 from st01.build_continuous_futures import (
+    add_etf_nav,
     assign_trading_dates,
     build_selection,
     load_contract_metadata,
@@ -420,3 +421,55 @@ def test_output_path_cannot_target_raw():
 
     with pytest.raises(ValueError, match="внутри st01"):
         require_derived_path(RAW_DIR)
+
+
+def test_etf_nav_roll_uses_close_over_open_and_charges_cost():
+    bars = pl.DataFrame(
+        {
+            "timestamp": [
+                datetime(2026, 9, 10, 10, 0),
+                datetime(2026, 9, 10, 10, 15),
+                datetime(2026, 9, 10, 10, 30),
+                datetime(2026, 9, 10, 10, 45),
+            ],
+            "contract": ["OLD", "OLD", "NEW", "NEW"],
+            "open": [100.0, 101.0, 200.0, 212.0],
+            "close": [101.0, 102.0, 210.0, 213.0],
+            "is_first_bar_after_roll": [False, False, True, False],
+        }
+    )
+    nav = add_etf_nav(bars, roll_cost_bps=10.0)["nav"].to_list()
+    step2 = 102.0 / 101.0
+    step3 = step2 * (1.0 - 10.0 / 10_000.0) * (210.0 / 200.0)
+    step4 = step3 * (213.0 / 210.0)
+    assert nav == pytest.approx([1.0, step2, step3, step4])
+
+
+def test_etf_nav_does_not_see_the_basis_gap_on_roll():
+    bars = pl.DataFrame(
+        {
+            "timestamp": [
+                datetime(2026, 9, 10, 10, 0),
+                datetime(2026, 9, 10, 10, 15),
+            ],
+            "contract": ["OLD", "NEW"],
+            "open": [100.0, 150.0],
+            "close": [101.0, 150.0],
+            "is_first_bar_after_roll": [False, True],
+        }
+    )
+    assert add_etf_nav(bars)["nav"].to_list() == pytest.approx([1.0, 1.0])
+
+
+def test_etf_nav_rejects_invalid_cost():
+    bars = pl.DataFrame(
+        {
+            "timestamp": [datetime(2026, 9, 10, 10, 0)],
+            "contract": ["OLD"],
+            "open": [100.0],
+            "close": [101.0],
+            "is_first_bar_after_roll": [False],
+        }
+    )
+    with pytest.raises(ValueError, match="Издержка перехода"):
+        add_etf_nav(bars, roll_cost_bps=-1.0)
