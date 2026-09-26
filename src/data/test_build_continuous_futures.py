@@ -99,6 +99,7 @@ def market(volumes):
                 "date": date(2026, 9, day),
                 "contract": contract,
                 "daily_volume": volume,
+                "daily_turnover": volume * 100.0,
                 "first_open": 100.0,
                 "last_close": 100.0,
                 "trading_minutes": 1,
@@ -184,7 +185,7 @@ def test_default_keeps_liquid_front_during_last_week():
     [
         (100, 10, "last_trade_deadline"),
         (100, 100, "last_trade_deadline"),
-        (10, 100, "next_avg_volume_exceeded_current"),
+        (10, 100, "next_avg_turnover_exceeded_current"),
     ],
 )
 def test_last_trade_day_and_volume_priority(tmp_path, old_volume, new_volume, reason):
@@ -227,6 +228,7 @@ def test_equal_volume_does_not_roll_before_deadline():
 
 def test_cny_september_2022_volume_signal_is_not_masked_by_buffer(tmp_path):
     # Объемы дня решения из raw CRU2/CRZ2 за 2022-09-07.
+    closes = {"CRU2": 8.77, "CRZ2": 9.0}
     daily = pl.DataFrame(
         [
             {
@@ -234,6 +236,7 @@ def test_cny_september_2022_volume_signal_is_not_masked_by_buffer(tmp_path):
                 "date": day,
                 "contract": contract,
                 "daily_volume": volume,
+                "daily_turnover": volume * closes[contract],
             }
             for day, values in [
                 (date(2022, 9, 6), {"CRU2": 100, "CRZ2": 10}),
@@ -262,7 +265,7 @@ def test_cny_september_2022_volume_signal_is_not_masked_by_buffer(tmp_path):
     )
     assert selected["contract"].to_list() == ["CRU2", "CRZ2"]
     assert rolls["roll_date"][0] == date(2022, 9, 8)
-    assert rolls["reason"][0] == "next_avg_volume_exceeded_current"
+    assert rolls["reason"][0] == "next_avg_turnover_exceeded_current"
     assert rolls["volume_window_days"][0] == 3
     assert rolls["deadline_reached"][0] is False
 
@@ -283,7 +286,7 @@ def test_volume_roll_uses_completed_days_not_today(tmp_path):
         prices(tmp_path),
     )
     assert selected["contract"].to_list() == ["OLD", "NEW"]
-    assert rolls["reason"][0] == "next_avg_volume_exceeded_current"
+    assert rolls["reason"][0] == "next_avg_turnover_exceeded_current"
 
 
 @pytest.mark.parametrize(
@@ -309,11 +312,48 @@ def test_volume_window_smooths_single_day_flip(tmp_path, window, expected_roll):
     if expected_roll:
         assert selected["contract"].to_list() == ["OLD", "NEW"]
         assert rolls.height == 1
-        assert rolls["reason"][0] == "next_avg_volume_exceeded_current"
+        assert rolls["reason"][0] == "next_avg_turnover_exceeded_current"
         assert rolls["new_avg_volume"][0] == 20_000.0
     else:
         assert selected["contract"].to_list() == ["OLD", "OLD"]
         assert rolls.is_empty()
+
+
+def test_roll_decision_uses_turnover_across_lot_change(tmp_path):
+    """После смены лота (10 акций на 1) контрактов у нового больше,
+    но денег меньше: сигнал по обороту не должен переключать ряд раньше
+    дедлайна, в отличие от сравнения по числу контрактов."""
+    rows = []
+    for day in (9, 10, 11):
+        rows.append(
+            {
+                "asset": "TEST",
+                "date": date(2026, 9, day),
+                "contract": "OLD",
+                "daily_volume": 1_000,
+                "daily_turnover": 100_000.0,
+            }
+        )
+        rows.append(
+            {
+                "asset": "TEST",
+                "date": date(2026, 9, day),
+                "contract": "NEW",
+                "daily_volume": 5_000,
+                "daily_turnover": 50_000.0,
+            }
+        )
+    selected, rolls = build_selection(
+        "TEST",
+        pl.DataFrame(rows),
+        date(2026, 9, 10),
+        metadata(date(2026, 9, 11)),
+        prices(tmp_path),
+    )
+    assert selected["contract"].to_list() == ["OLD", "NEW"]
+    assert rolls["reason"][0] == "last_trade_deadline"
+    assert rolls["old_avg_turnover"][0] == 100_000.0
+    assert rolls["new_avg_turnover"][0] == 50_000.0
 
 
 def test_initial_selection_requires_warmup():
@@ -428,6 +468,7 @@ def test_returns_do_not_use_adjustment_or_cross_roll():
     assert bars["log_return"][3] == pytest.approx(math.log(212 / 210))
     assert bars["is_first_bar_after_roll"].to_list() == [False, False, True, False]
     assert bars["has_all_15_minutes"].to_list() == [False] * 4
+    assert bars["turnover"].to_list() == [200.0, 202.0, 420.0, 424.0]
 
 
 def test_output_path_cannot_target_raw():
@@ -574,4 +615,3 @@ def test_load_contract_metadata_case_insensitive(tmp_path):
     res = load_contract_metadata(["SiZ7"], path)
     assert "SiZ7" in res
     assert res["SiZ7"] == {"LSTTRADE": date(2027, 12, 16)}
-

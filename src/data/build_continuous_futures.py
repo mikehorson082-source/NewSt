@@ -4,11 +4,14 @@
 1. Решение на календарный день (MSK) принимается по завершенным дням с данными
    строго до этого дня; сам день решения не используется.
 2. Сравниваются текущий контракт и ближайший следующий контракт.
-3. Переход выполняется, когда средний дневной объем следующего контракта за
+3. Переход выполняется, когда средний дневной оборот следующего контракта за
    окно последних завершенных дней с данными (по умолчанию 3) стал больше
-   среднего объема текущего. Усреднение убирает ложные однодневные пересечения,
-   особенно в коротких сессиях выходного дня.
-4. Если сигнал по объему не возник, переход с начала LSTTRADE (запас 0 дней).
+   среднего оборота текущего. Сравнивается оборот в рублях (объем контрактов
+   умножается на цену), потому что число контрактов несравнимо между сериями с
+   разным размером лота (например, смена TCSI с 10 акций на T с 1 акцией).
+   Усреднение убирает ложные однодневные пересечения, особенно в коротких
+   сессиях выходного дня.
+4. Если сигнал по обороту не возник, переход с начала LSTTRADE (запас 0 дней).
    Старый контракт в последний день обращения не выбирается. Это ограничение
    дневного исследовательского ряда, а не модель исполнения переноса позиции.
 5. Поправка берется по общей минуте вчерашних торгов. Возврат запрещен.
@@ -21,6 +24,9 @@ date — календарная дата MSK, НЕ биржевая дата т�
 open/high/low/close — реальные цены выбранного контракта; *_adjusted —
 аддитивный ряд для изменений в пунктах. log_return считается по реальным ценам
 и отсутствует на первом баре и на переходах. Это не доходность капитала.
+volume — контракты выбранного контракта (несравним при смене размера лота);
+turnover — приблизительный рублевый оборот бара (volume × close), он сравним
+между сериями; value из ISS для фьючерсов всегда нулевой и не используется.
 Последний день raw по умолчанию исключается как потенциально незавершенный.
 Старт рынка может быть позже --from-date: структурный разрыв истории
 (continuous_from в реестре) нельзя перешагнуть склейкой, ряд начинается
@@ -178,7 +184,7 @@ def parse_args() -> argparse.Namespace:
         "--volume-window-days",
         type=int,
         default=3,
-        help="Окно завершенных дней с данными для сравнения объемов (по умолчанию 3).",
+        help="Окно завершенных дней с данными для сравнения оборота (по умолчанию 3).",
     )
     parser.add_argument(
         "--roll-cost-bps",
@@ -308,6 +314,7 @@ def aggregate_daily(path: Path, asset: str) -> pl.DataFrame:
             pl.col("open").first().alias("first_open"),
             pl.col("close").last().alias("last_close"),
             pl.col("volume").sum().alias("daily_volume"),
+            (pl.col("volume") * pl.col("close")).sum().alias("daily_turnover"),
             pl.len().alias("trading_minutes"),
         )
         .with_columns(
@@ -321,6 +328,7 @@ def aggregate_daily(path: Path, asset: str) -> pl.DataFrame:
             "first_open",
             "last_close",
             "daily_volume",
+            "daily_turnover",
             "trading_minutes",
         )
     )
@@ -341,6 +349,7 @@ def assign_trading_dates(daily: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFram
             pl.col("first_open").first().alias("first_open"),
             pl.col("last_close").last().alias("last_close"),
             pl.col("daily_volume").sum().alias("daily_volume"),
+            pl.col("daily_turnover").sum().alias("daily_turnover"),
             pl.col("trading_minutes").sum().alias("trading_minutes"),
         )
         .sort("date", "contract")
@@ -379,7 +388,7 @@ def choose_initial_contract(
     return max(
         rows,
         key=lambda contract: (
-            float(rows[contract]["daily_volume"] or 0),
+            float(rows[contract]["daily_turnover"] or 0),
             -metadata[contract]["LSTTRADE"].toordinal(),
         ),
     )
@@ -454,14 +463,19 @@ def build_selection(
     ordered_dates = sorted(all_rows)
     date_positions = {day: index for index, day in enumerate(ordered_dates)}
 
-    def window_average_volume(contract: str, days: list[date]) -> float:
+    def window_average(contract: str, days: list[date]) -> tuple[float, float]:
+        """Средние объем (в контрактах) и оборот (в рублях) за завершенные дни."""
         if not days:
-            return 0.0
-        total = sum(
+            return 0.0, 0.0
+        volume = sum(
             float(all_rows[day].get(contract, {}).get("daily_volume") or 0)
             for day in days
         )
-        return total / len(days)
+        turnover = sum(
+            float(all_rows[day].get(contract, {}).get("daily_turnover") or 0)
+            for day in days
+        )
+        return volume / len(days), turnover / len(days)
 
     dates = sorted(day for day in all_rows if day >= from_date)
     if not dates:
@@ -501,9 +515,10 @@ def build_selection(
             "asset": asset,
             "date": series_dates[0],
             "contract": current,
-            "selection_reason": "initial_previous_volume",
+            "selection_reason": "initial_previous_turnover",
             "decision_date": initial_decision,
             "daily_volume": all_rows[series_dates[0]][current]["daily_volume"],
+            "daily_turnover": all_rows[series_dates[0]][current]["daily_turnover"],
             "price_adjustment": current_adjustment,
             "is_roll_day": False,
         }
@@ -534,14 +549,20 @@ def build_selection(
         window_dates = ordered_dates[
             max(0, date_positions[today] - volume_window_days) : date_positions[today]
         ]
-        current_average: float | None = None
-        next_average: float | None = None
+        current_avg_volume: float | None = None
+        next_avg_volume: float | None = None
+        current_avg_turnover: float | None = None
+        next_avg_turnover: float | None = None
         if next_contract is not None:
-            current_average = window_average_volume(current, window_dates)
-            next_average = window_average_volume(next_contract, window_dates)
-            if next_average > current_average:
+            current_avg_volume, current_avg_turnover = window_average(
+                current, window_dates
+            )
+            next_avg_volume, next_avg_turnover = window_average(
+                next_contract, window_dates
+            )
+            if next_avg_turnover > current_avg_turnover:
                 roll_to = next_contract
-                reason = "next_avg_volume_exceeded_current"
+                reason = "next_avg_turnover_exceeded_current"
 
         if roll_to is None and deadline_reached:
             if next_contract is None:
@@ -580,10 +601,18 @@ def build_selection(
                     "old_volume": old_row["daily_volume"],
                     "new_volume": new_row["daily_volume"],
                     "old_avg_volume": (
-                        current_average if current_average is not None else 0.0
+                        current_avg_volume if current_avg_volume is not None else 0.0
                     ),
                     "new_avg_volume": (
-                        next_average if next_average is not None else 0.0
+                        next_avg_volume if next_avg_volume is not None else 0.0
+                    ),
+                    "old_avg_turnover": (
+                        current_avg_turnover
+                        if current_avg_turnover is not None
+                        else 0.0
+                    ),
+                    "new_avg_turnover": (
+                        next_avg_turnover if next_avg_turnover is not None else 0.0
                     ),
                     "volume_window_days": volume_window_days,
                     "old_close": old_close,
@@ -612,6 +641,7 @@ def build_selection(
                 "selection_reason": reason,
                 "decision_date": yesterday,
                 "daily_volume": today_rows[current]["daily_volume"],
+                "daily_turnover": today_rows[current]["daily_turnover"],
                 "price_adjustment": current_adjustment,
                 "is_roll_day": roll_to is not None,
             }
@@ -720,6 +750,7 @@ def resample_15_minutes(minutes: pl.DataFrame) -> pl.DataFrame:
             pl.col("close_adjusted").last().alias("close_adjusted"),
             pl.col("volume").sum().alias("volume"),
             pl.col("value").sum().alias("value"),
+            (pl.col("volume") * pl.col("close")).sum().alias("turnover"),
             pl.len().alias("source_minutes"),
             pl.col("timestamp").min().alias("first_source_timestamp"),
             pl.col("timestamp").max().alias("last_source_timestamp"),
@@ -773,6 +804,7 @@ def resample_15_minutes(minutes: pl.DataFrame) -> pl.DataFrame:
             "close_adjusted",
             "volume",
             "value",
+            "turnover",
             "source_minutes",
             "first_source_timestamp",
             "last_source_timestamp",
@@ -978,11 +1010,12 @@ def main() -> None:
         processed.append(asset)
         if not rolls.is_empty():
             all_rolls.append(rolls)
-            volume_rolls = rolls.filter(
-                pl.col("reason") == "next_avg_volume_exceeded_current"
+            turnover_rolls = rolls.filter(
+                pl.col("reason") == "next_avg_turnover_exceeded_current"
             ).height
             print(
-                f"{asset}: переходов по объему {volume_rolls}, по дедлайну {rolls.height - volume_rolls}"
+                f"{asset}: переходов по обороту {turnover_rolls}, "
+                f"по дедлайну {rolls.height - turnover_rolls}"
             )
             gap_abs = rolls["gap_pct"].abs()
             print(
@@ -1032,6 +1065,8 @@ def main() -> None:
                 "new_volume": pl.Int64,
                 "old_avg_volume": pl.Float64,
                 "new_avg_volume": pl.Float64,
+                "old_avg_turnover": pl.Float64,
+                "new_avg_turnover": pl.Float64,
                 "volume_window_days": pl.Int64,
                 "old_close": pl.Float64,
                 "new_close": pl.Float64,
