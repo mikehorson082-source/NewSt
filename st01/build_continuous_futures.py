@@ -1,30 +1,37 @@
 """Строит непрерывные 15-минутные ряды фьючерсов для стратегии st01.
 
 Правило роллирования:
-1. В каждый торговый день решение принимается по объему предыдущего торгового дня.
+1. Решение на календарный день (MSK) принимается по предыдущему дню с данными.
 2. Сравниваются текущий контракт и ближайший следующий контракт.
 3. Переход выполняется, когда вчерашний объем следующего контракта стал больше.
-4. Возврат к более ранней экспирации запрещен.
+4. Обязательный переход за 7 календарных дней до LSTTRADE из справочника MOEX.
+5. Поправка берется по общей минуте вчерашних торгов. Возврат запрещен.
 
-Скрипт только читает data/raw. Результаты сохраняются в st01/data/continuous_15m.
+date — календарная дата MSK, НЕ биржевая дата торговой сессии.
+open/high/low/close — реальные цены выбранного контракта; *_adjusted —
+аддитивный ряд для изменений в пунктах. log_return считается по реальным ценам
+и отсутствует на первом баре и на переходах. Это не доходность капитала.
+Последний день raw по умолчанию исключается как потенциально незавершенный.
+
+Скрипт только читает data/raw и data/reference/futures_contracts.parquet.
+Сетевых запросов нет. Результаты сохраняются в st01/data/continuous_15m_v2.
 """
 
 from __future__ import annotations
 
 import argparse
-from bisect import bisect_left
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
-import re
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RAW_DIR = PROJECT_ROOT / "data" / "raw" / "futures"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "st01" / "data" / "continuous_15m"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "st01" / "data" / "continuous_15m_v2"
 DEFAULT_FROM_DATE = date(2022, 5, 1)
 
 ASSET_DIRECTORIES = {
@@ -32,21 +39,6 @@ ASSET_DIRECTORIES = {
     "CNYRUB": "cnyrub",
     "BRENT": "brent",
     "GOLD": "gold",
-}
-
-MONTH_NUMBER = {
-    "F": 1,
-    "G": 2,
-    "H": 3,
-    "J": 4,
-    "K": 5,
-    "M": 6,
-    "N": 7,
-    "Q": 8,
-    "U": 9,
-    "V": 10,
-    "X": 11,
-    "Z": 12,
 }
 
 
@@ -68,6 +60,24 @@ def parse_args() -> argparse.Namespace:
         help="Начало ряда в формате YYYY-MM-DD.",
     )
     parser.add_argument(
+        "--roll-days-before-last-trade",
+        type=int,
+        default=7,
+        help="Минимальный запас календарных дней до LSTTRADE (по умолчанию 7).",
+    )
+    parser.add_argument(
+        "--completed-through",
+        type=date.fromisoformat,
+        help="Последняя подтвержденно полностью загруженная календарная дата MSK. "
+        "Без параметра последний день каждого рынка исключается.",
+    )
+    parser.add_argument(
+        "--metadata-file",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "reference" / "futures_contracts.parquet",
+        help="Локальный Parquet-справочник контрактов (только чтение).",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
@@ -76,23 +86,98 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def contract_maturity(contract: str) -> tuple[int, int]:
-    """Возвращает (год, месяц) из биржевого кода вида MMZ5, CRH6, BRF4."""
-    match = re.fullmatch(r".*?([FGHJKMNQUVXZ])(\d)", contract.upper())
-    if match is None:
-        raise ValueError(f"Не удалось определить экспирацию контракта {contract}")
-    month_code, year_digit = match.groups()
-    return 2020 + int(year_digit), MONTH_NUMBER[month_code]
+def parse_contract_dates(contract: str, fields: dict[str, Any]) -> dict[str, date]:
+    """LSTTRADE нужен для ролла; FRSTTRADE — необязательная проверка."""
+    result: dict[str, date] = {}
+    for key in ("LSTTRADE", "FRSTTRADE"):
+        value = fields.get(key)
+        if value in (None, ""):
+            if key == "FRSTTRADE":
+                continue
+            raise ValueError(
+                f"{contract}: в справочнике отсутствует обязательное поле LSTTRADE (last_trade_date). "
+                "Дата последней свечи не заменяет дату окончания обращения. "
+                f"Доступные поля: {', '.join(sorted(fields))}"
+            )
+        try:
+            if isinstance(value, datetime):
+                result[key] = value.date()
+            elif isinstance(value, date):
+                result[key] = value
+            else:
+                result[key] = date.fromisoformat(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"{contract}: некорректная дата {key}={value!r}"
+            ) from error
+    if "FRSTTRADE" in result and result["FRSTTRADE"] >= result["LSTTRADE"]:
+        raise ValueError(f"{contract}: некорректные сроки обращения: {result}")
+    return result
+
+
+def load_contract_metadata(
+    contracts: list[str],
+    path: Path,
+) -> dict[str, dict[str, date]]:
+    """Читает только указанный справочник, без сети и скрытых запасных источников.
+
+    Исторические изменения расписания биржей требуют архивных снимков справочника.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Нет справочника {path}. Сначала загрузите futures_contracts.parquet."
+        )
+    reference = pl.read_parquet(path)
+    missing_columns = {"ticker", "last_trade_date"} - set(reference.columns)
+    if missing_columns:
+        raise ValueError(
+            f"{path}: отсутствуют столбцы {', '.join(sorted(missing_columns))}"
+        )
+    requested = set(contracts)
+    matched = reference.filter(pl.col("ticker").is_in(sorted(requested)))
+    missing = requested - set(matched["ticker"].to_list())
+    if missing:
+        raise ValueError(
+            f"{path}: нет контрактов {', '.join(sorted(missing))}. Дополните локальный справочник."
+        )
+    duplicates = matched.group_by("ticker").len().filter(pl.col("len") > 1)
+    if duplicates.height:
+        raise ValueError(
+            f"{path}: неоднозначные записи контрактов {', '.join(sorted(duplicates['ticker'].to_list()))}"
+        )
+    result: dict[str, dict[str, date]] = {}
+    for row in matched.iter_rows(named=True):
+        result[row["ticker"]] = parse_contract_dates(
+            row["ticker"],
+            {
+                "LSTTRADE": row["last_trade_date"],
+                "FRSTTRADE": row.get("first_trade_date"),
+            },
+        )
+    return result
 
 
 def aggregate_daily(path: Path, asset: str) -> pl.DataFrame:
     """Дневная ликвидность и граничные цены одного контракта."""
-    return (
-        pl.read_parquet(
-            path,
-            columns=["timestamp", "open", "close", "volume"],
+    frame = pl.read_parquet(path, columns=["timestamp", "open", "close", "volume"])
+    if frame.is_empty():
+        raise ValueError(f"{path}: пустой исходный файл")
+    if frame["timestamp"].null_count() or frame["timestamp"].n_unique() != frame.height:
+        raise ValueError(f"{path}: пустые или повторные timestamp в raw")
+    invalid = frame.filter(
+        pl.any_horizontal(
+            [
+                pl.col(column).is_null()
+                | ~pl.col(column).is_finite()
+                | (pl.col(column) <= 0)
+                for column in ("open", "close", "volume")
+            ]
         )
-        .sort("timestamp")
+    )
+    if invalid.height:
+        raise ValueError(f"{path}: некорректные данные для решения о переходе")
+    return (
+        frame.sort("timestamp")
         .with_columns(pl.col("timestamp").dt.date().alias("calendar_date"))
         .group_by("calendar_date", maintain_order=True)
         .agg(
@@ -118,28 +203,12 @@ def aggregate_daily(path: Path, asset: str) -> pl.DataFrame:
 
 
 def assign_trading_dates(daily: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Относит выходные сессии к следующему наблюдаемому буднему дню."""
-    calendar_dates = sorted(daily.get_column("calendar_date").unique().to_list())
-    weekday_dates = [day for day in calendar_dates if day.weekday() < 5]
-    if not weekday_dates:
-        raise ValueError("Не удалось построить торговый календарь")
-
-    mapping: list[dict[str, date]] = []
-    for calendar_date in calendar_dates:
-        if calendar_date.weekday() < 5:
-            trading_date = calendar_date
-        else:
-            position = bisect_left(weekday_dates, calendar_date)
-            if position >= len(weekday_dates):
-                # Незавершенную выходную сессию в конце набора нельзя привязать
-                # к еще отсутствующему следующему торговому дню.
-                continue
-            trading_date = weekday_dates[position]
-        mapping.append(
-            {"calendar_date": calendar_date, "date": trading_date}
-        )
-
-    date_map = pl.DataFrame(mapping)
+    """Явная календарная шкала: выходные не переносятся на будущую дату."""
+    date_map = (
+        daily.select("calendar_date")
+        .unique()
+        .with_columns(pl.col("calendar_date").alias("date"))
+    )
     combined = (
         daily.join(date_map, on="calendar_date", how="inner")
         .sort("calendar_date")
@@ -179,13 +248,15 @@ def rows_by_date(daily: pl.DataFrame) -> dict[date, dict[str, dict[str, Any]]]:
     return dict(result)
 
 
-def choose_initial_contract(rows: dict[str, dict[str, Any]]) -> str:
+def choose_initial_contract(
+    rows: dict[str, dict[str, Any]],
+    metadata: dict[str, dict[str, date]],
+) -> str:
     return max(
         rows,
         key=lambda contract: (
             float(rows[contract]["daily_volume"] or 0),
-            -contract_maturity(contract)[0],
-            -contract_maturity(contract)[1],
+            -metadata[contract]["LSTTRADE"].toordinal(),
         ),
     )
 
@@ -193,29 +264,87 @@ def choose_initial_contract(rows: dict[str, dict[str, Any]]) -> str:
 def nearest_later_contract(
     current: str,
     known_yesterday: set[str],
-    available_today: set[str],
+    metadata: dict[str, dict[str, date]],
+    eligible_after: date,
 ) -> str | None:
-    current_maturity = contract_maturity(current)
+    current_maturity = metadata[current]["LSTTRADE"]
     candidates = [
         contract
-        for contract in known_yesterday.intersection(available_today)
-        if contract_maturity(contract) > current_maturity
+        for contract in known_yesterday
+        if metadata[contract]["LSTTRADE"] > max(current_maturity, eligible_after)
     ]
-    return min(candidates, key=contract_maturity) if candidates else None
+    return (
+        min(candidates, key=lambda c: (metadata[c]["LSTTRADE"], c))
+        if candidates
+        else None
+    )
+
+
+def synchronized_closes(
+    old_path: Path,
+    new_path: Path,
+    decision_date: date,
+) -> tuple[float, float, datetime, float]:
+    """Последняя общая минута дня и ее возраст относительно конца данных.
+
+    Редкие сделки не делают синхронную пару несинхронной. Возраст сохраняется
+    для контроля качества, но сам по себе не запрещает построение ряда.
+    Поправка описывает спред в adjustment_timestamp, а не спред закрытия.
+    """
+    frames = []
+    for path in (old_path, new_path):
+        frame = (
+            pl.read_parquet(path, columns=["timestamp", "close"])
+            .filter(pl.col("timestamp").dt.date() == decision_date)
+            .sort("timestamp")
+        )
+        if frame.is_empty() or frame["timestamp"].n_unique() != frame.height:
+            raise ValueError(f"{path.stem}: нет однозначных цен за {decision_date}")
+        frames.append(frame)
+    common = frames[0].join(frames[1], on="timestamp", suffix="_new").sort("timestamp")
+    if common.is_empty():
+        raise ValueError(
+            f"Нет общей минуты {old_path.stem}/{new_path.stem}: {decision_date}"
+        )
+    row = common.row(-1, named=True)
+    latest = max(frame["timestamp"].max() for frame in frames)
+    age_minutes = (latest - row["timestamp"]).total_seconds() / 60
+    return float(row["close"]), float(row["close_new"]), row["timestamp"], age_minutes
 
 
 def build_selection(
     asset: str,
     daily: pl.DataFrame,
     from_date: date,
+    metadata: dict[str, dict[str, date]],
+    paths: dict[str, Path],
+    roll_days: int = 7,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Строит выбранный контракт на каждый день и журнал переходов."""
+    if roll_days < 1:
+        raise ValueError("Запас до LSTTRADE должен быть положительным")
     all_rows = rows_by_date(daily)
     dates = sorted(day for day in all_rows if day >= from_date)
     if not dates:
         raise ValueError(f"{asset}: нет данных начиная с {from_date}")
 
-    current = choose_initial_contract(all_rows[dates[0]])
+    prior_dates = sorted(day for day in all_rows if day < dates[0])
+    if not prior_dates:
+        raise ValueError(
+            f"{asset}: нужен завершенный день до {dates[0]} для инициализации"
+        )
+    initial_decision = prior_dates[-1]
+    initial_rows = {
+        contract: row
+        for contract, row in all_rows[initial_decision].items()
+        if metadata[contract]["LSTTRADE"] > dates[0] + timedelta(days=roll_days)
+        and row["daily_volume"] > 0
+    }
+    if not initial_rows:
+        raise ValueError(f"{asset}: нет подходящего начального контракта")
+    current = choose_initial_contract(initial_rows, metadata)
+    if current not in all_rows[dates[0]]:
+        raise ValueError(f"{asset}: выбранный заранее {current} отсутствует {dates[0]}")
     current_adjustment = 0.0
     selection: list[dict[str, Any]] = []
     rolls: list[dict[str, Any]] = []
@@ -225,8 +354,8 @@ def build_selection(
             "asset": asset,
             "date": dates[0],
             "contract": current,
-            "selection_reason": "initial_max_volume",
-            "decision_date": None,
+            "selection_reason": "initial_previous_volume",
+            "decision_date": initial_decision,
             "daily_volume": all_rows[dates[0]][current]["daily_volume"],
             "price_adjustment": current_adjustment,
             "is_roll_day": False,
@@ -238,27 +367,27 @@ def build_selection(
         yesterday = dates[index - 1]
         today_rows = all_rows[today]
         yesterday_rows = all_rows[yesterday]
+        if today >= metadata[current]["LSTTRADE"]:
+            raise ValueError(
+                f"{asset} {today}: не удалось перенести {current} до LSTTRADE; "
+                "проверьте пробелы данных или увеличьте запас дней"
+            )
         reason = "keep_current"
         next_contract = nearest_later_contract(
             current,
             set(yesterday_rows),
-            set(today_rows),
+            metadata,
+            today + timedelta(days=roll_days),
         )
 
         roll_to: str | None = None
-        if current not in today_rows:
-            later_today = [
-                contract
-                for contract in today_rows
-                if contract_maturity(contract) > contract_maturity(current)
-            ]
-            if not later_today:
+        if metadata[current]["LSTTRADE"] <= today + timedelta(days=roll_days):
+            if next_contract is None:
                 raise ValueError(
-                    f"{asset} {today}: текущий {current} отсутствует, "
-                    "следующий контракт не найден"
+                    f"{asset} {today}: срок перехода, но нет следующего контракта"
                 )
-            roll_to = min(later_today, key=contract_maturity)
-            reason = "current_unavailable"
+            roll_to = next_contract
+            reason = "last_trade_deadline"
         elif next_contract is not None:
             current_volume = float(
                 yesterday_rows.get(current, {}).get("daily_volume") or 0
@@ -277,8 +406,13 @@ def build_selection(
                     f"{current} или {roll_to} за {yesterday}"
                 )
 
-            old_close = float(old_row["last_close"])
-            new_close = float(new_row["last_close"])
+            old_close, new_close, adjustment_timestamp, adjustment_age_minutes = (
+                synchronized_closes(
+                    paths[current],
+                    paths[roll_to],
+                    yesterday,
+                )
+            )
             adjustment_delta = old_close - new_close
             current_adjustment += adjustment_delta
 
@@ -293,6 +427,9 @@ def build_selection(
                     "new_volume": new_row["daily_volume"],
                     "old_close": old_close,
                     "new_close": new_close,
+                    "adjustment_timestamp": adjustment_timestamp,
+                    "adjustment_age_minutes": adjustment_age_minutes,
+                    "adjustment_is_stale": adjustment_age_minutes > 15,
                     "adjustment_delta": adjustment_delta,
                     "cumulative_adjustment": current_adjustment,
                     "reason": reason,
@@ -332,25 +469,44 @@ def load_selected_minutes(
 
     for contract in selected_contracts:
         path = paths[contract]
-        frame = (
-            pl.read_parquet(
-                path,
-                columns=[
-                    "timestamp",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                    "value",
-                ],
-            )
-            .with_columns(
-                pl.lit(asset).alias("asset"),
-                pl.lit(contract).alias("contract"),
-                pl.col("timestamp").dt.date().alias("calendar_date"),
-            )
+        frame = pl.read_parquet(
+            path,
+            columns=[
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "value",
+            ],
+        ).with_columns(
+            pl.lit(asset).alias("asset"),
+            pl.lit(contract).alias("contract"),
+            pl.col("timestamp").dt.date().alias("calendar_date"),
         )
+        price_columns = ["open", "high", "low", "close"]
+        if (
+            frame["timestamp"].null_count()
+            or frame["timestamp"].n_unique() != frame.height
+        ):
+            raise ValueError(f"{contract}: пустые или повторные timestamp в raw")
+        bad = frame.filter(
+            pl.any_horizontal(
+                [
+                    pl.col(column).is_null()
+                    | ~pl.col(column).is_finite()
+                    | (pl.col(column) <= 0)
+                    for column in price_columns
+                ]
+            )
+            | pl.col("volume").is_null()
+            | (pl.col("volume") <= 0)
+            | (pl.col("high") < pl.max_horizontal("open", "close", "low"))
+            | (pl.col("low") > pl.min_horizontal("open", "close", "high"))
+        )
+        if not bad.is_empty():
+            raise ValueError(f"{contract}: некорректные цены/объем в raw: {bad.height}")
         frames.append(frame)
 
     selected_keys = selection.select(
@@ -390,13 +546,15 @@ def resample_15_minutes(minutes: pl.DataFrame) -> pl.DataFrame:
             pl.col("high").max().alias("high_raw"),
             pl.col("low").min().alias("low_raw"),
             pl.col("close").last().alias("close_raw"),
-            pl.col("open_adjusted").first().alias("open"),
-            pl.col("high_adjusted").max().alias("high"),
-            pl.col("low_adjusted").min().alias("low"),
-            pl.col("close_adjusted").last().alias("close"),
+            pl.col("open_adjusted").first().alias("open_adjusted"),
+            pl.col("high_adjusted").max().alias("high_adjusted"),
+            pl.col("low_adjusted").min().alias("low_adjusted"),
+            pl.col("close_adjusted").last().alias("close_adjusted"),
             pl.col("volume").sum().alias("volume"),
             pl.col("value").sum().alias("value"),
             pl.len().alias("source_minutes"),
+            pl.col("timestamp").min().alias("first_source_timestamp"),
+            pl.col("timestamp").max().alias("last_source_timestamp"),
             pl.col("price_adjustment").first().alias("price_adjustment"),
             pl.col("is_roll_day").first().alias("is_roll_day"),
         )
@@ -406,10 +564,27 @@ def resample_15_minutes(minutes: pl.DataFrame) -> pl.DataFrame:
             (
                 pl.col("is_roll_day")
                 & (
-                    pl.col("contract")
-                    != pl.col("contract").shift(1).over("asset")
+                    pl.col("contract") != pl.col("contract").shift(1).over("asset")
                 ).fill_null(False)
-            ).alias("is_first_bar_after_roll")
+            ).alias("is_first_bar_after_roll"),
+            *[
+                pl.col(f"{column}_raw").alias(column)
+                for column in ("open", "high", "low", "close")
+            ],
+            # Отсутствие сделок не обязательно означает неполную загрузку.
+            # Признак описывает только плотность минутных свечей.
+            (pl.col("source_minutes") == 15).alias("has_all_15_minutes"),
+            (pl.col("timestamp") - pl.col("timestamp").shift(1).over("asset"))
+            .dt.total_minutes()
+            .alias("elapsed_minutes"),
+        )
+        .with_columns(
+            pl.when(pl.col("contract") == pl.col("contract").shift(1).over("asset"))
+            .then(
+                (pl.col("close_raw") / pl.col("close_raw").shift(1).over("asset")).log()
+            )
+            .otherwise(None)
+            .alias("log_return"),
         )
         .select(
             "asset",
@@ -424,9 +599,18 @@ def resample_15_minutes(minutes: pl.DataFrame) -> pl.DataFrame:
             "high_raw",
             "low_raw",
             "close_raw",
+            "open_adjusted",
+            "high_adjusted",
+            "low_adjusted",
+            "close_adjusted",
             "volume",
             "value",
             "source_minutes",
+            "first_source_timestamp",
+            "last_source_timestamp",
+            "has_all_15_minutes",
+            "elapsed_minutes",
+            "log_return",
             "price_adjustment",
             "is_roll_day",
             "is_first_bar_after_roll",
@@ -434,7 +618,12 @@ def resample_15_minutes(minutes: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def validate_result(asset: str, bars: pl.DataFrame, selection: pl.DataFrame) -> None:
+def validate_result(
+    asset: str,
+    bars: pl.DataFrame,
+    selection: pl.DataFrame,
+    metadata: dict[str, dict[str, date]],
+) -> None:
     if bars.is_empty():
         raise ValueError(f"{asset}: итоговый ряд пуст")
 
@@ -454,17 +643,47 @@ def validate_result(asset: str, bars: pl.DataFrame, selection: pl.DataFrame) -> 
         raise ValueError(f"{asset}: найдено {invalid_ohlc} некорректных OHLC")
 
     maturities = [
-        contract_maturity(contract)
+        metadata[contract]["LSTTRADE"]
         for contract in selection.get_column("contract").to_list()
     ]
-    if any(right < left for left, right in zip(maturities, maturities[1:])):
+    if any(right < left for left, right in pairwise(maturities)):
         raise ValueError(f"{asset}: обнаружен возврат к более ранней экспирации")
+    if selection.filter(pl.col("decision_date") >= pl.col("date")).height:
+        raise ValueError(f"{asset}: решение использует незавершенный день")
+    if selection.join(bars.select("date").unique(), on="date", how="anti").height:
+        raise ValueError(f"{asset}: выбранный контракт не дал ни одного бара")
+    if bars.filter(
+        pl.col("is_first_bar_after_roll") & pl.col("log_return").is_not_null()
+    ).height:
+        raise ValueError(f"{asset}: доходность пересекает смену контракта")
+
+
+def require_derived_path(path: Path) -> Path:
+    """Любые записи разрешены только внутри st01, никогда в raw."""
+    resolved = path.resolve()
+    if not resolved.is_relative_to(PROJECT_ROOT / "st01"):
+        raise ValueError(f"Путь записи должен находиться внутри st01: {resolved}")
+    return resolved
 
 
 def main() -> None:
     args = parse_args()
-    output_dir = args.output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.roll_days_before_last_trade < 1:
+        raise ValueError("Запас до LSTTRADE должен быть не меньше одного дня")
+    if len(args.assets) != len(set(args.assets)):
+        raise ValueError("Повторные --assets запрещены")
+    output_dir = require_derived_path(args.output_dir)
+    metadata_path = args.metadata_file.resolve()
+    today_msk = datetime.now(ZoneInfo("Europe/Moscow")).date()
+    if args.completed_through and args.completed_through >= today_msk:
+        raise ValueError("--completed-through должен быть раньше текущего дня MSK")
+    contracts = [
+        path.stem
+        for asset in args.assets
+        for path in (RAW_DIR / ASSET_DIRECTORIES[asset]).glob("*.parquet")
+    ]
+    metadata = load_contract_metadata(contracts, metadata_path)
+    print(f"Локальный справочник: {metadata_path}, контрактов: {len(metadata)}")
 
     all_bars: list[pl.DataFrame] = []
     all_selections: list[pl.DataFrame] = []
@@ -476,19 +695,40 @@ def main() -> None:
             asset,
             RAW_DIR / ASSET_DIRECTORIES[asset],
         )
-        selection, rolls = build_selection(asset, daily, args.from_date)
+        last_raw_date = daily["date"].max()
+        completed_through = args.completed_through or min(
+            last_raw_date - timedelta(days=1),
+            today_msk - timedelta(days=1),
+        )
+        if completed_through > last_raw_date:
+            raise ValueError(
+                f"{asset}: данные заканчиваются раньше --completed-through"
+            )
+        daily = daily.filter(pl.col("date") <= completed_through)
+        print(f"{asset}: календарные дни MSK, данные по {completed_through}")
+        selection, rolls = build_selection(
+            asset,
+            daily,
+            args.from_date,
+            metadata,
+            paths,
+            args.roll_days_before_last_trade,
+        )
         minutes = load_selected_minutes(asset, paths, selection, date_map)
         bars = resample_15_minutes(minutes)
-        validate_result(asset, bars, selection)
-
-        bars.write_parquet(
-            output_dir / f"{asset.lower()}_15m.parquet",
-            compression="zstd",
-        )
+        validate_result(asset, bars, selection, metadata)
         all_bars.append(bars)
         all_selections.append(selection)
         if not rolls.is_empty():
             all_rolls.append(rolls)
+            stale = rolls.filter(pl.col("adjustment_is_stale"))
+            if stale.height:
+                print(
+                    f"{asset}: {stale.height} поправок по общей минуте старше 15 минут "
+                    f"относительно конца данных дня; максимум "
+                    f"{stale['adjustment_age_minutes'].max():.0f} мин. "
+                    "Подробности в roll_schedule.csv."
+                )
 
         print(
             f"{asset}: {bars.height:,} баров, "
@@ -504,9 +744,34 @@ def main() -> None:
     combined_rolls = (
         pl.concat(all_rolls, how="vertical_relaxed").sort("roll_date", "asset")
         if all_rolls
-        else pl.DataFrame()
+        else pl.DataFrame(
+            schema={
+                "asset": pl.String,
+                "roll_date": pl.Date,
+                "decision_date": pl.Date,
+                "from_contract": pl.String,
+                "to_contract": pl.String,
+                "old_volume": pl.Int64,
+                "new_volume": pl.Int64,
+                "old_close": pl.Float64,
+                "new_close": pl.Float64,
+                "adjustment_timestamp": pl.Datetime,
+                "adjustment_age_minutes": pl.Float64,
+                "adjustment_is_stale": pl.Boolean,
+                "adjustment_delta": pl.Float64,
+                "cumulative_adjustment": pl.Float64,
+                "reason": pl.String,
+            }
+        )
     )
 
+    # До этого места все рынки должны пройти проверки. Запись отдельных рынков
+    # внутри цикла оставляла смешанные результаты при ошибке следующего рынка.
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for asset, bars in zip(args.assets, all_bars):
+        bars.write_parquet(
+            output_dir / f"{asset.lower()}_15m.parquet", compression="zstd"
+        )
     combined_bars.write_parquet(
         output_dir / "continuous_futures_15m.parquet",
         compression="zstd",

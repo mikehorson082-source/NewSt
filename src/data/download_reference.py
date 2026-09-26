@@ -11,6 +11,7 @@
   8. eia_ng_storage.parquet     — еженедельные запасы природного газа в ПХГ США (EIA Lower 48)
   9. calendar_events.parquet    — календарь событий: заседания ЦБ, налоговые даты (ЕНП 28 числа), экспирации
  10. Корпоративные реестры      — corp_dividends, corp_splits, corp_listing, ru_working_saturdays
+ 11. futures_contracts.parquet  — реестр спецификаций фьючерсов FORTS (активные + архивные)
 
 Поддержка режимов:
   - Первичная загрузка с глубокой историей (с 2020 года):
@@ -46,7 +47,14 @@ from bs4 import BeautifulSoup
 import polars as pl
 import requests
 
-from src.core.config import MAX_RETRIES, REQUEST_DELAY, REQUEST_TIMEOUT, Paths
+from src.core.config import (
+    ASSETS,
+    ISS_BASE_URL,
+    MAX_RETRIES,
+    REQUEST_DELAY,
+    REQUEST_TIMEOUT,
+    Paths,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -597,6 +605,202 @@ def build_calendar_events(from_date: str, till_date: str) -> pl.DataFrame:
 # -----------------------------------------------------------------------------
 # 10. Корпоративные реестры и рабочие субботы
 # -----------------------------------------------------------------------------
+def _parse_iso_date(val: Any) -> date | None:
+    if val is None or val == "" or str(val).lower() == "none":
+        return None
+    try:
+        return date.fromisoformat(str(val)[:10])
+    except (ValueError, TypeError):
+        return None
+
+
+def fetch_futures_contracts(
+    output_path: Path,
+    update: bool = False,
+    max_workers: int = 8,
+) -> pl.DataFrame:
+    """Формирует и обновляет централизованный справочник спецификаций фьючерсов FORTS.
+
+    Использует скиллы moexalgo-market-data и moex-iss:
+      1. moexalgo.Market("FO").tickers("*") — снимок всех активных контрактов FORTS
+         (шаг цены, стоимость шага, лотность, последнее ГО, дата экспирации).
+      2. data/raw/futures/ — обнаружение всех 650+ исторических серий проекта.
+      3. src.core.instruments.ASSETS — реестр активов и префиксов кодов.
+      4. MOEX ISS (securities/{ticker}.json) — паспортные даты FRSTTRADE/LSTTRADE и лотность
+         для завершенных исторических контрактов.
+
+    Режим update:
+      Уже завершенные контракты с известными датами не запрашиваются повторно по сети.
+    """
+    from moexalgo import Market
+
+    # 1. Построение маппинга тикеров и базовых активов
+    ticker_to_asset: dict[str, str] = {}
+    prefix_to_asset: dict[str, str] = {}
+    assetcode_to_asset: dict[str, str] = {}
+
+    for asset_name, spec in ASSETS.items():
+        if spec.ticker_prefix:
+            prefix_to_asset[spec.ticker_prefix.upper()] = asset_name
+        if spec.asset_code:
+            assetcode_to_asset[spec.asset_code.upper()] = asset_name
+        for fixed in spec.fixed_tickers:
+            ticker_to_asset[fixed.upper()] = asset_name
+        for ticker in spec.generate_tickers():
+            ticker_to_asset.setdefault(ticker.upper(), asset_name)
+
+    raw_futures_dir = Paths().raw_futures_min
+    if raw_futures_dir.exists():
+        for asset_dir in raw_futures_dir.iterdir():
+            if asset_dir.is_dir() and not asset_dir.name.startswith("."):
+                asset_name = asset_dir.name
+                for f in asset_dir.glob("*.parquet"):
+                    ticker_to_asset[f.stem.upper()] = asset_name
+
+    # 2. Выгрузка активных контрактов через moexalgo
+    active_map: dict[str, dict[str, Any]] = {}
+    try:
+        fo = Market("FO")
+        active_df = fo.tickers("*")
+        for rec in active_df.to_dict(orient="records"):
+            secid = str(rec.get("ticker", "")).strip().upper()
+            if secid:
+                active_map[secid] = rec
+                if secid not in ticker_to_asset:
+                    pref = secid[:2]
+                    acode = str(rec.get("assetcode", "")).upper()
+                    matched_asset = prefix_to_asset.get(pref) or assetcode_to_asset.get(acode) or acode.lower()
+                    ticker_to_asset[secid] = matched_asset
+        log.info("  ✓ moexalgo: получено %d активных контрактов FORTS", len(active_map))
+    except Exception as exc:
+        log.warning("Не удалось получить срез активных контрактов через moexalgo: %s", exc)
+
+    all_tickers = sorted(set(ticker_to_asset.keys()).union(active_map.keys()))
+    log.info("  Всего контрактов для учета в справочнике: %d", len(all_tickers))
+
+    # 3. Загрузка существующего кэша при наличии
+    cached_records: dict[str, dict[str, Any]] = {}
+    if output_path.exists():
+        try:
+            old_df = pl.read_parquet(output_path)
+            for row in old_df.iter_rows(named=True):
+                cached_records[row["ticker"].upper()] = row
+            log.info("  Загружено %d существующих записей из %s", len(cached_records), output_path.name)
+        except Exception as exc:
+            log.warning("Ошибка чтения существующего справочника %s: %s", output_path, exc)
+
+    today = date.today()
+    tickers_to_query: list[str] = []
+
+    for t in all_tickers:
+        if update and t in cached_records:
+            rec = cached_records[t]
+            lst = rec.get("last_trade_date")
+            if lst is not None and lst < today and rec.get("first_trade_date") is not None and rec.get("lot") is not None:
+                continue
+        tickers_to_query.append(t)
+
+    log.info("  Требуется запрос спецификаций MOEX ISS для %d контрактов...", len(tickers_to_query))
+
+    # 4. Запрос спецификаций через MOEX ISS
+    def fetch_desc(secid: str) -> tuple[str, dict[str, Any], int | None]:
+        url = f"{ISS_BASE_URL}/securities/{secid}.json"
+        params = {"iss.only": "description,boards", "iss.meta": "off"}
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    desc_data = payload.get("description", {}).get("data", [])
+                    desc = {row[0]: row[2] for row in desc_data if len(row) >= 3}
+                    decimals = None
+                    boards_data = payload.get("boards", {}).get("data", [])
+                    boards_cols = payload.get("boards", {}).get("columns", [])
+                    for b_row in boards_data:
+                        bd = dict(zip(boards_cols, b_row))
+                        if bd.get("is_primary") == 1 or bd.get("boardid") == "RFUD":
+                            decimals = bd.get("decimals")
+                            break
+                    return secid, desc, decimals
+                elif resp.status_code in (429, 502, 503, 504):
+                    time.sleep(REQUEST_DELAY * (2**attempt))
+                else:
+                    break
+            except Exception:
+                time.sleep(REQUEST_DELAY * (2**attempt))
+        return secid, {}, None
+
+    queried_meta: dict[str, tuple[dict[str, Any], int | None]] = {}
+    if tickers_to_query:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for secid, desc, decimals in pool.map(fetch_desc, tickers_to_query):
+                queried_meta[secid] = (desc, decimals)
+
+    # 5. Сборка итоговых записей
+    final_rows: list[dict[str, Any]] = []
+    for t in all_tickers:
+        act = active_map.get(t, {})
+        desc, decimals = queried_meta.get(t, ({}, None))
+        cached = cached_records.get(t, {})
+
+        name = desc.get("NAME") or desc.get("CONTRACTNAME") or act.get("secname") or cached.get("name") or t
+        short_name = desc.get("SHORTNAME") or act.get("shortname") or cached.get("short_name") or t
+        asset_code = desc.get("ASSETCODE") or act.get("assetcode") or cached.get("asset_code")
+        asset = ticker_to_asset.get(t) or cached.get("asset") or (asset_code.lower() if asset_code else "")
+
+        first_trade = _parse_iso_date(desc.get("FRSTTRADE")) or cached.get("first_trade_date")
+        last_trade = (
+            _parse_iso_date(desc.get("LSTTRADE"))
+            or _parse_iso_date(act.get("lasttradedate"))
+            or cached.get("last_trade_date")
+        )
+        expiration = (
+            _parse_iso_date(desc.get("LSTDELDATE"))
+            or _parse_iso_date(act.get("lastdeldate"))
+            or cached.get("expiration_date")
+        )
+
+        raw_lot = act.get("lotvolume") or desc.get("LOTSIZE") or cached.get("lot") or 1
+        try:
+            lot = int(raw_lot)
+        except (ValueError, TypeError):
+            lot = 1
+
+        min_step = act.get("minstep")
+        step_price = act.get("stepprice")
+        if min_step is None and cached.get("min_price_increment") is not None:
+            min_step = cached.get("min_price_increment")
+        elif min_step is None and decimals is not None:
+            try:
+                dec_int = decimals if isinstance(decimals, int) else int(decimals)
+                min_step = 10.0 ** (-dec_int) if dec_int > 0 else 1.0
+            except (ValueError, TypeError):
+                min_step = 1.0
+
+        if step_price is None and cached.get("min_price_increment_amount") is not None:
+            step_price = cached.get("min_price_increment_amount")
+
+        final_rows.append({
+            "ticker": t,
+            "name": str(name),
+            "short_name": str(short_name),
+            "asset": str(asset),
+            "asset_code": str(asset_code) if asset_code else None,
+            "first_trade_date": first_trade,
+            "last_trade_date": last_trade,
+            "expiration_date": expiration,
+            "lot": lot,
+            "min_price_increment": float(min_step) if min_step is not None else None,
+            "min_price_increment_amount": float(step_price) if step_price is not None else None,
+        })
+
+    result_df = (
+        pl.DataFrame(final_rows)
+        .sort(["asset", "last_trade_date", "ticker"])
+    )
+    return result_df
+
+
 def sync_corporate_and_calendar_files() -> None:
     """Копирует корпоративные действия и рабочие субботы из ml/data/reference при наличии."""
     files = [
@@ -642,7 +846,7 @@ def main() -> None:
         "--only",
         type=str,
         default="all",
-        help="Фильтр загрузки: all или через запятую (cbr,fx,china,usd,spot,indices,benchmarks,eia,calendar)",
+        help="Фильтр загрузки: all или через запятую (cbr,fx,china,usd,spot,indices,benchmarks,eia,calendar,contracts)",
     )
     args = parser.parse_args()
 
@@ -826,6 +1030,16 @@ def main() -> None:
 
     # 10. Корпоративные реестры
     sync_corporate_and_calendar_files()
+
+    # 11. Справочник фьючерсных контрактов FORTS
+    if run_all or "contracts" in only_set or "futures" in only_set:
+        p = REFERENCE_DIR / "futures_contracts.parquet"
+        log.info("11/11. Справочник спецификаций фьючерсов FORTS (futures_contracts.parquet)...")
+        t0 = time.time()
+        df_contracts = fetch_futures_contracts(p, update=args.update)
+        if len(df_contracts) > 0:
+            df_contracts.write_parquet(p, compression="zstd")
+            log.info("  ✓ futures_contracts: %d контрактов сохранено в %s за %.1fс", len(df_contracts), p.name, time.time() - t0)
 
     log.info("✅ Обработка справочных данных завершена!")
 
