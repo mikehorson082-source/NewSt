@@ -104,17 +104,27 @@ def _intrabar_exit(
     stop_adj: float,
     target_adj: float,
 ) -> tuple[float | None, str | None]:
-    """Выход внутри бара: стоп раньше цели; при гэпе фил по открытию."""
+    """Выход внутри бара: гэп проверяется первым, иначе пессимистично стоп раньше цели."""
     if side == LONG:
+        if open_adj <= stop_adj:
+            return open_adj, "stop"
+        if open_adj >= target_adj:
+            return open_adj, "target"
+
         if low_adj <= stop_adj:
-            return min(open_adj, stop_adj), "stop"
+            return stop_adj, "stop"
         if high_adj >= target_adj:
-            return max(open_adj, target_adj), "target"
+            return target_adj, "target"
     else:
+        if open_adj >= stop_adj:
+            return open_adj, "stop"
+        if open_adj <= target_adj:
+            return open_adj, "target"
+
         if high_adj >= stop_adj:
-            return max(open_adj, stop_adj), "stop"
+            return stop_adj, "stop"
         if low_adj <= target_adj:
-            return min(open_adj, target_adj), "target"
+            return target_adj, "target"
     return None, None
 
 
@@ -185,6 +195,9 @@ def simulate_position(
             exit_adj, reason = close_adj, "end"
 
         if exit_adj is not None:
+            assert entry_time is not None
+            assert entry_price is not None
+            assert reason is not None
             exit_fill_adj = fill_price(spec, exit_adj, -side, quantity)
             gross_pnl += side * (exit_fill_adj - mark) * point_value * quantity
             exit_price = exit_fill_adj - adjustment

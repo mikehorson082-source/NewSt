@@ -259,3 +259,47 @@ def test_missing_columns_rejected():
     bars = pl.DataFrame({"timestamp": [datetime(2026, 9, 10)], "open": [100.0]})
     with pytest.raises(ValueError, match="нет столбцов"):
         simulate_position(SPEC, bars, 0, long_signal())
+
+
+def test_long_gap_up_past_target_fills_target_at_open_not_stop():
+    bars = make_bars(
+        [
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            bar(15, 115.0, 120.0, 85.0, 90.0),
+        ]
+    )
+    trade = simulate_position(SPEC, bars, 0, long_signal(stop=90.0, target=110.0))
+    assert trade.exit_reason == "target"
+    assert trade.exit_price == pytest.approx(114.5)
+    assert trade.gross_pnl == pytest.approx(-1.0)
+    assert trade.net_pnl == pytest.approx(-1.0 - 0.023)
+
+
+def test_short_gap_down_past_target_fills_target_at_open_not_stop():
+    bars = make_bars(
+        [
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            bar(15, 85.0, 115.0, 80.0, 110.0),
+        ]
+    )
+    trade = simulate_position(
+        SPEC, bars, 0, Signal(side=SHORT, stop=110.0, target=90.0)
+    )
+    assert trade.exit_reason == "target"
+    assert trade.exit_price == pytest.approx(85.5)
+    assert trade.gross_pnl == pytest.approx(-1.0)
+    assert trade.net_pnl == pytest.approx(-1.0 - 0.017)
+
+
+def test_entry_open_gap_through_stop_exits_on_entry_bar():
+    bars = make_bars(
+        [
+            bar(0, 100.0, 101.0, 99.0, 100.0),
+            bar(15, 90.0, 91.0, 89.0, 90.5),
+        ]
+    )
+    trade = simulate_position(SPEC, bars, 0, long_signal(stop=95.0, target=110.0))
+    assert trade.exit_reason == "stop"
+    assert trade.bars_held == 1
+    assert trade.exit_price == pytest.approx(89.5)
+    assert trade.gross_pnl == pytest.approx(-1.0)
