@@ -1,5 +1,5 @@
 [project]
-name = "ml-ds-01"
+name = "newst"
 version = "0.1.0"
 description = "ML/AI помощник для алготрейдинга на MOEX"
 readme = "AGENTS.md"
@@ -47,8 +47,15 @@ build-backend = "uv_build"
 module-root = "src"
 module-name = ["core", "data", "backtest"]
 
+# Сервер Т-Банка — только для t-tech-investments (её нет на PyPI).
+# explicit = true: остальные пакеты берутся с обычного PyPI.
 [[tool.uv.index]]
+name = "tbank"
 url = "https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple"
+explicit = true
+
+[tool.uv.sources]
+t-tech-investments = { index = "tbank" }
 
 [tool.pyright]
 extraPaths = ["."]
