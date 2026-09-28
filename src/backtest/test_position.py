@@ -171,6 +171,64 @@ def test_roll_transfer_hides_gap_and_charges_cost():
     assert trade.net_pnl == pytest.approx(-1.0221)
 
 
+def test_roll_keeps_overnight_gap_through_stop():
+    # Базис 90 убран поправкой, но за ночь рынок упал на 5 пунктов
+    # (100 -> 95 в adjusted) и выбил стоп 97: убыток гэпа остаётся в P&L.
+    bars = make_bars(
+        [
+            bar(0, 99.5, 100.5, 99.0, 100.0),
+            bar(15, 100.0, 100.5, 99.5, 100.0),
+            bar(30, 5.0, 5.5, 4.0, 5.0, adjustment=90.0, roll=True),
+        ]
+    )
+    trade = simulate_position(SPEC, bars, 0, long_signal(stop=97.0))
+    assert trade.exit_reason == "stop"
+    assert trade.bars_held == 2
+    assert trade.exit_price == pytest.approx(4.5)
+    assert trade.gross_pnl == pytest.approx(-6.0)
+    assert trade.roll_costs == pytest.approx(1.0105)
+
+
+def test_roll_keeps_overnight_gain():
+    bars = make_bars(
+        [
+            bar(0, 99.5, 100.5, 99.0, 100.0),
+            bar(15, 100.0, 100.5, 99.5, 100.0),
+            bar(30, 13.0, 14.5, 12.5, 14.0, adjustment=90.0, roll=True),
+        ]
+    )
+    trade = simulate_position(SPEC, bars, 0, long_signal(max_bars=2))
+    assert trade.exit_reason == "time"
+    assert trade.exit_price == pytest.approx(13.5)
+    assert trade.gross_pnl == pytest.approx(3.0)
+    assert trade.roll_costs == pytest.approx(1.0113)
+
+
+def test_negative_adjusted_prices_do_not_change_result():
+    # Аддитивная поправка может увести adjusted-цены ниже нуля (как у NG).
+    # Результат сделки от уровня поправки не зависит.
+    rows = [
+        (0, 99.0, 101.0, 98.0, 100.0),
+        (15, 101.0, 103.0, 100.0, 102.0),
+        (30, 102.0, 106.0, 101.0, 105.0),
+        (45, 108.0, 111.0, 107.0, 110.0),
+    ]
+    plain = simulate_position(
+        SPEC, make_bars([bar(*row) for row in rows]), 0, long_signal()
+    )
+    shifted = simulate_position(
+        SPEC,
+        make_bars([bar(*row, adjustment=-150.0) for row in rows]),
+        0,
+        long_signal(),
+    )
+    assert shifted.entry_price == pytest.approx(plain.entry_price)
+    assert shifted.exit_price == pytest.approx(plain.exit_price)
+    assert shifted.exit_reason == plain.exit_reason
+    assert shifted.gross_pnl == pytest.approx(plain.gross_pnl)
+    assert shifted.net_pnl == pytest.approx(plain.net_pnl)
+
+
 def test_future_perturbation_does_not_change_result():
     rows = [
         bar(0, 99.0, 101.0, 98.0, 100.0),

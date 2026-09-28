@@ -31,38 +31,43 @@
    * Нефть упала на −1% → NAV умножается на `0.99`.
 
 2. **В день смены контракта (роллирования):**  
-   * Старый контракт вчера закрылся по **100**.
-   * Новый контракт сегодня открылся по **105**, а к концу первой 15-минутки стоил **106**.
-   * **Магия ETF Trick:** Мы полностью **игнорируем разрыв** между вчерашними 100 руб. и утренними 105 руб.!
-   * Мы считаем изменение капитала только *внутри* нового контракта: от цены открытия нового контракта (105) до его закрытия (106):  
-     `Доходность = 106 / 105 - 1 = +0.95%`
+   * Вчера вечером старый контракт закрылся по **100**, а новый в ту же минуту стоил **103**. Разница между контрактами (базис) — **3 рубля**, она запоминается как поправка.
+   * Сегодня утром новый контракт открылся по **105**, а к концу первой 15-минутки стоил **106**.
+   * Скачок 100 → 105 состоит из двух частей: **3 рубля** — базис (деньги просто переложены), **2 рубля** — рынок за ночь действительно вырос.
+   * **Магия ETF Trick:** вчерашнее закрытие пересчитывается в цены нового контракта: `100 + 3 = 103`. С ним и сравнивается сегодняшняя цена:  
+     `Доходность = 106 / 103 - 1 = +2.9%`
    * Дополнительно вычитаем комиссию брокера за перекладывание позиции (параметр `roll_cost_bps`).
-   * Скачок цен на стыке (базис в 5 рублей) вообще **не попадает** в кривую капитала!
+   * Базис (3 рубля) **не попадает** в кривую капитала, а ночное движение рынка (+2 рубля) — попадает, как у реального держателя позиции.
+   * Почему не `106 / 105` (от открытия нового контракта)? Так теряется ночное движение. Пример: у Brent 2 февраля 2026 рынок за выходные упал на 5.3%, а `close / open` показал бы на этом баре почти ноль.
 
 ---
 
 ### Как это реализовано в нашем коде
 
-В функции [`add_etf_nav`](file:///Users/anton/Documents/app/NewSt/src/data/build_continuous_futures.py#L821-L848) в [build_continuous_futures.py](file:///Users/anton/Documents/app/NewSt/src/data/build_continuous_futures.py):
+В функции [`add_etf_nav`](file:///Users/anton/Documents/app/NewSt/src/data/build_continuous_futures.py#L823-L854) в [build_continuous_futures.py](file:///Users/anton/Documents/app/NewSt/src/data/build_continuous_futures.py):
 
 ```python
-# 1. Считаем относительное изменение для каждого бара:
+# 1. База на первом баре после ролла: вчерашнее закрытие старого контракта,
+#    пересчитанное в цены нового через поправку (100 + 3 = 103 в примере выше)
+roll_base = pl.col("close_adjusted").shift(1) - pl.col("price_adjustment")
+
+# 2. Считаем относительное изменение для каждого бара:
 delta = (
     pl.when(pl.col("_row") == 1).then(0.0)  # самый первый бар = старт
-    # На первом баре после ролла: считаем доходность только ВНУТРИ нового контракта (Close / Open)
-    .when(pl.col("is_first_bar_after_roll")).then(pl.col("close") / pl.col("open") - 1.0)
+    # На первом баре после ролла: Close нового контракта к пересчитанной базе
+    .when(pl.col("is_first_bar_after_roll")).then(pl.col("close") / roll_base - 1.0)
     # На обычных барах: стандартный Close к предыдущему Close
     .otherwise(pl.col("close") / pl.col("close").shift(1) - 1.0)
 )
 
-# 2. На стыке контрактов вычитаем комиссию за перекладку:
+# 3. На стыке контрактов вычитаем комиссию за перекладку:
 cost_factor = (
     pl.when(pl.col("is_first_bar_after_roll"))
     .then(1.0 - roll_cost_bps / 10_000.0)
     .otherwise(1.0)
 )
 
-# 3. Накапливаем итоговую кривую капитала кумулятивным произведением:
+# 4. Накапливаем итоговую кривую капитала кумулятивным произведением:
 bars.with_columns((cost_factor * (1.0 + delta)).cum_prod().alias("nav"))
 ```
 
@@ -88,9 +93,9 @@ bars.with_columns((cost_factor * (1.0 + delta)).cum_prod().alias("nav"))
 ### Где и как это зафиксировано в проекте:
 
 1. **В коде склейки фьючерсов:**  
-   В модуле [src/data/build_continuous_futures.py](file:///Users/anton/Documents/app/NewSt/src/data/build_continuous_futures.py#L821-L848) реализована функция [`add_etf_nav`](file:///Users/anton/Documents/app/NewSt/src/data/build_continuous_futures.py#L821):
+   В модуле [src/data/build_continuous_futures.py](file:///Users/anton/Documents/app/NewSt/src/data/build_continuous_futures.py#L823-L854) реализована функция [`add_etf_nav`](file:///Users/anton/Documents/app/NewSt/src/data/build_continuous_futures.py#L823):
    * Внутри одного контракта доходность считается как `close / prev_close - 1`.
-   * На первом баре нового контракта (`is_first_bar_after_roll`) доходность считается строго внутри нового контракта: `close / open - 1`. Разрыв цен (базис) между старым и новым контрактом **не попадает в расчет**.
+   * На первом баре нового контракта (`is_first_bar_after_roll`) доходность считается от вчерашнего закрытия старого контракта, пересчитанного в цены нового через поправку: `close / (close_adjusted[t-1] - price_adjustment) - 1`. Разрыв цен (базис) между старым и новым контрактом **не попадает в расчет**, а движение рынка за ночь — попадает.
    * На стыке вычитается комиссия/издержка перехода `roll_cost_bps`.
    * Итоговый ряд `nav` строится через кумулятивное произведение (`cum_prod`), начиная со значения `1.0`.
 
@@ -98,7 +103,7 @@ bars.with_columns((cost_factor * (1.0 + delta)).cum_prod().alias("nav"))
    * В [st01/Multi-asset_Advisor_plan.md](file:///Users/anton/Documents/app/NewSt/st01/Multi-asset_Advisor_plan.md#L21): прямо зафиксировано: *«Дополнительно строится NAV по ETF Trick... NAV — честная доходность самофинансируемой позиции и база для признаков и таргетов; реальные цены — только для исполнения»*.
    * В [journal.md](file:///Users/anton/Documents/app/NewSt/journal.md#L12-L16): *«ETF Trick для NAV (разрыв на ролле в NAV не попадает), ресемпл минуток в 15 минут»*.
    * В отдельном справочном файле [ETF_Trick.md](file:///Users/anton/Documents/app/NewSt/ETF_Trick.md) подробно расписана вся теория и математика этого метода.
-   * В логике бэктестера [src/backtest/position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py#L7): аналогично учтено отсутствие гэпа экспирации в PnL.
+   * В логике бэктестера [src/backtest/position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py#L7): аналогично базис экспирации в PnL не попадает, а движение рынка за ночь до открытия нового контракта — попадает.
 
 ---
 

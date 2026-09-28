@@ -37,6 +37,16 @@ ml = [
     "catboost>=1.2",
 ]
 
+# Проект ставится в .venv в режиме editable: пакеты из src (core, data, backtest)
+# видны всем скриптам без PYTHONPATH=src.
+[build-system]
+requires = ["uv_build>=0.12.2,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = "src"
+module-name = ["core", "data", "backtest"]
+
 [[tool.uv.index]]
 url = "https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple"
 

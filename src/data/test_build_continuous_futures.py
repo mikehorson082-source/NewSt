@@ -487,42 +487,69 @@ def test_output_path_outside_data_and_reference_are_rejected(tmp_path):
         require_derived_path(REFERENCE_DIR)
 
 
-def test_etf_nav_roll_uses_close_over_open_and_charges_cost():
-    bars = pl.DataFrame(
+def nav_bars(opens, closes, adjustments, rolls):
+    return pl.DataFrame(
         {
             "timestamp": [
-                datetime(2026, 9, 10, 10, 0),
-                datetime(2026, 9, 10, 10, 15),
-                datetime(2026, 9, 10, 10, 30),
-                datetime(2026, 9, 10, 10, 45),
+                datetime(2026, 9, 10, 10, 15 * index) for index in range(len(opens))
             ],
-            "contract": ["OLD", "OLD", "NEW", "NEW"],
-            "open": [100.0, 101.0, 200.0, 212.0],
-            "close": [101.0, 102.0, 210.0, 213.0],
-            "is_first_bar_after_roll": [False, False, True, False],
+            "open": opens,
+            "close": closes,
+            "close_adjusted": [c + a for c, a in zip(closes, adjustments)],
+            "price_adjustment": adjustments,
+            "is_first_bar_after_roll": rolls,
         }
+    )
+
+
+def test_etf_nav_roll_uses_rebased_previous_close_and_charges_cost():
+    # Вчера новый стоил на 100 дороже старого: поправка -100, база 102 + 100.
+    bars = nav_bars(
+        opens=[100.0, 101.0, 200.0, 212.0],
+        closes=[101.0, 102.0, 210.0, 213.0],
+        adjustments=[0.0, 0.0, -100.0, -100.0],
+        rolls=[False, False, True, False],
     )
     nav = add_etf_nav(bars, roll_cost_bps=10.0)["nav"].to_list()
     step2 = 102.0 / 101.0
-    step3 = step2 * (1.0 - 10.0 / 10_000.0) * (210.0 / 200.0)
+    step3 = step2 * (1.0 - 10.0 / 10_000.0) * (210.0 / 202.0)
     step4 = step3 * (213.0 / 210.0)
     assert nav == pytest.approx([1.0, step2, step3, step4])
 
 
 def test_etf_nav_does_not_see_the_basis_gap_on_roll():
-    bars = pl.DataFrame(
-        {
-            "timestamp": [
-                datetime(2026, 9, 10, 10, 0),
-                datetime(2026, 9, 10, 10, 15),
-            ],
-            "contract": ["OLD", "NEW"],
-            "open": [100.0, 150.0],
-            "close": [101.0, 150.0],
-            "is_first_bar_after_roll": [False, True],
-        }
+    # Новый 150 при старом 101: весь разрыв — базис, рынок не двигался.
+    bars = nav_bars(
+        opens=[100.0, 150.0],
+        closes=[101.0, 150.0],
+        adjustments=[0.0, -49.0],
+        rolls=[False, True],
     )
     assert add_etf_nav(bars)["nav"].to_list() == pytest.approx([1.0, 1.0])
+
+
+def test_etf_nav_keeps_overnight_move_on_roll():
+    # Старый вчера 100, новый в ту же минуту 102 (базис 2). Утром новый
+    # открылся 99 и закрыл бар 100: рынок за ночь упал, это -2%, а не
+    # +1% по close/open, которое теряло ночное движение.
+    bars = nav_bars(
+        opens=[100.0, 99.0],
+        closes=[100.0, 100.0],
+        adjustments=[0.0, -2.0],
+        rolls=[False, True],
+    )
+    assert add_etf_nav(bars)["nav"].to_list() == pytest.approx([1.0, 100.0 / 102.0])
+
+
+def test_etf_nav_rejects_non_positive_roll_base():
+    bars = nav_bars(
+        opens=[100.0, 150.0],
+        closes=[100.0, 150.0],
+        adjustments=[0.0, 100.0],
+        rolls=[False, True],
+    )
+    with pytest.raises(ValueError, match="База NAV"):
+        add_etf_nav(bars)
 
 
 def test_etf_nav_rejects_invalid_cost():
