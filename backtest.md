@@ -37,8 +37,7 @@ src/backtest/
 ├── specs.py          # Паспорт инструмента (шаг цены, стоимость пункта, ГО, тарифы)
 ├── costs.py          # Калькулятор издержек (проскальзывание, комиссии, стоимость переноса)
 ├── position.py       # Движок симуляции одной сделки (вход, стоп, тейк, ролл, выход)
-├── test_specs.py     # Тесты спецификаций контрактов
-├── test_costs.py     # Тесты формул издержек
+├── test_costs.py     # Тесты спецификаций и формул издержек
 └── test_position.py  # 23 теста на все жизненные ситуации и краевые случаи
 ```
 
@@ -53,7 +52,7 @@ src/backtest/
 
 Фьючерсы на бирже измеряются не просто в штуках акций. У каждого контракта есть свои правила:
 * Шаг цены (`tick_size`): минимальное изменение цены (например, 0.5 пункта или 1 пункт).
-* Стоимость шага цены (`point_value`): сколько рублей приносит один шаг цены.
+* Стоимость пункта цены (`point_value`): сколько рублей приносит изменение цены на 1 пункт (k).
 * Гарантийное обеспечение (`margin_rate`): какой процент от стоимости контракта биржа блокирует на счете.
 * Комиссии биржи и брокера (`exchange_fee_rate`, `broker_fee_rate`).
 
@@ -224,7 +223,7 @@ Close = 100.0             Open = 100.5               Свечи развиваю
 1. **Тест на проскальзывание и комиссии** ([test_long_target_fills_by_next_open_with_costs](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L52)): проверяет, что при входе и выходе по цели чистая прибыль строго меньше грязной на величину двух комиссий и двух проскальзываний.
 2. **Тест на бар-«вертолёт»** ([test_stop_has_priority_when_stop_and_target_hit_in_one_bar](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L72)): свеча задела и цель 110, и стоп 94 — тест подтверждает, что зафиксирован стоп и убыток.
 3. **Тест на утренний гэп** ([test_gap_through_stop_fills_at_open](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L87)): бар открылся ниже стопа — выход зафиксирован по худшей цене открытия гэпа.
-4. **Тест на невидимость будущего** ([test_future_perturbation_does_not_change_result](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L174)): все цены будущих свечей после закрытия сделки умножаются на 2 — результат закрытой сделки остается неизменным с точностью до копейки.
+4. **Тест на невидимость будущего** ([test_future_perturbation_does_not_change_result](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L232)): все цены будущих свечей после закрытия сделки умножаются на 2 — результат закрытой сделки остается неизменным с точностью до копейки.
 5. **Тест на честный ролл** ([test_roll_transfer_hides_gap_and_charges_cost](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L153)): перенос через контракт с ценовым прыжком на 90 пунктов не добавляет фальшивой прибыли, но корректно списывает затраты на перенос.
 6. **Тест на ночной гэп в день ролла** ([test_roll_keeps_overnight_gap_through_stop](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L174)): базис убран, но ночное падение рынка, выбившее стоп, остается в убытке.
 7. **Тест на отрицательные скорректированные цены** ([test_negative_adjusted_prices_do_not_change_result](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L207)): результат сделки не зависит от уровня поправки, даже если скорректированные цены ниже нуля.
