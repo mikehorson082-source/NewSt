@@ -13,6 +13,8 @@
  10. Корпоративные реестры      — corp_dividends, corp_splits, corp_listing, ru_working_saturdays
  11. futures_contracts.parquet  — реестр спецификаций фьючерсов FORTS (активные + архивные)
  12. margin_rates.parquet       — дневная история минимальных ставок ГО (mr1–mr3) по базовым активам FORTS
+     margin_snapshot.parquet    — снимки текущего ГО всех фьючерсов и коэффициент ГО к mr1 (копятся при каждом запуске)
+ 13. rates_moex_clearing.parquet — курсы клиринга MOEX (USD/RUB): по ним биржа считает стоимость шага долларовых контрактов
 
 Поддержка режимов:
   - Первичная загрузка с глубокой историей (с 2020 года):
@@ -34,6 +36,7 @@ import shutil
 import sys
 import time
 from typing import Any
+from zoneinfo import ZoneInfo
 import xml.etree.ElementTree as ET
 import urllib3
 
@@ -881,6 +884,144 @@ def fetch_margin_rates(starts: dict[str, str], till_date: str) -> pl.DataFrame:
     )
 
 
+def _iss_block(url: str, block: str) -> list[dict[str, Any]]:
+    """Строки одного блока ответа ISS как словари; ошибка запроса — исключение."""
+    resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    payload = resp.json().get(block, {})
+    cols = payload.get("columns", [])
+    return [dict(zip(cols, values)) for values in payload.get("data", [])]
+
+
+def fetch_margin_snapshot(snapshot_date: date) -> pl.DataFrame:
+    """Снимок фактического ГО всех фьючерсов FORTS и его коэффициент к mr1.
+
+    Истории фактического ГО в бесплатном ISS нет, есть только текущее значение.
+    Коэффициент связывает его с историей минимальных ставок:
+      стоимость контракта = расчётная цена × стоимость шага / шаг цены
+      доля ГО             = ГО / стоимость контракта
+      коэффициент         = доля ГО / mr1
+    Пример BRX6: ГО 21.7% от стоимости при mr1 = 18% — коэффициент 1.21.
+    ГО за прошлую дату оценивается как mr1 на ту дату × коэффициент.
+    mr1 берётся из последних опубликованных ставок (rates_date): биржа
+    публикует их заранее, на ближайший торговый день.
+    """
+    securities = _iss_block(
+        f"{ISS_BASE_URL}/engines/futures/markets/forts/securities.json"
+        "?iss.meta=off&iss.only=securities",
+        "securities",
+    )
+    limits = _iss_block(
+        f"{ISS_BASE_URL}/rms/engines/futures/objects/limits.json?iss.meta=off",
+        "limits",
+    )
+    if not securities or not limits:
+        raise ValueError("ISS вернул пустой список контрактов или ставок ГО")
+
+    rates = pl.DataFrame(
+        [
+            {
+                "asset_code": r["assetcode"],
+                "rates_date": date.fromisoformat(r["tradedate"]),
+                "mr1": float(r["mr1"]) if r["mr1"] is not None else None,
+            }
+            for r in limits
+        ]
+    ).unique(subset=["asset_code"], keep="last")
+
+    def number(value: Any) -> float | None:
+        return float(value) if value not in (None, "", 0) else None
+
+    contracts = pl.DataFrame(
+        [
+            {
+                "snapshot_date": snapshot_date,
+                "im_time": datetime.fromisoformat(r["IMTIME"]) if r["IMTIME"] else None,
+                "secid": r["SECID"],
+                "asset_code": r["ASSETCODE"],
+                "last_trade_date": (
+                    date.fromisoformat(r["LASTTRADEDATE"]) if r["LASTTRADEDATE"] else None
+                ),
+                "open_interest": number(r["PREVOPENPOSITION"]),
+                "prev_settle_price": number(r["PREVSETTLEPRICE"]),
+                "min_step": number(r["MINSTEP"]),
+                "step_price": number(r["STEPPRICE"]),
+                "initial_margin": number(r["INITIALMARGIN"]),
+            }
+            for r in securities
+        ],
+        schema_overrides={"im_time": pl.Datetime("us")},
+    )
+    return (
+        contracts.join(rates, on="asset_code", how="left")
+        .with_columns(
+            (
+                pl.col("prev_settle_price") * pl.col("step_price") / pl.col("min_step")
+            ).alias("contract_value")
+        )
+        .with_columns(
+            (pl.col("initial_margin") / pl.col("contract_value")).alias("margin_share")
+        )
+        .with_columns((pl.col("margin_share") / pl.col("mr1")).alias("margin_factor"))
+        .sort(["asset_code", "last_trade_date", "secid"])
+    )
+
+
+# -----------------------------------------------------------------------------
+# 13. Курсы клиринга срочного рынка MOEX (индикативные курсы)
+# -----------------------------------------------------------------------------
+# Пары, по которым биржа пересчитывает стоимость шага цены долларовых контрактов.
+CLEARING_FX_PAIRS = ["USD/RUB"]
+
+
+def fetch_clearing_fx_rates(from_date: str, till_date: str) -> pl.DataFrame:
+    """Курсы, по которым биржа считает стоимость шага валютных контрактов.
+
+    У долларовых контрактов (Brent, золото) рублёвая стоимость пункта
+    = размер контракта × курс клиринга. Курсов два в день: tc — дневной
+    клиринг (14:00), mc — вечерний. fixing_time — когда курс стал известен.
+    Курс ЦБ совпадает с биржевым только с середины 2024 года, в 2022 году
+    расходился в среднем на 1.4%, в отдельные дни до 11.5%.
+    """
+    rows = []
+    for pair in CLEARING_FX_PAIRS:
+        cursor = 0
+        while True:
+            url = (
+                f"{ISS_BASE_URL}/statistics/engines/futures/markets/indicativerates"
+                f"/securities/{pair}.json"
+                f"?from={from_date}&till={till_date}&start={cursor}&iss.meta=off"
+            )
+            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            payload = resp.json()
+            block = payload.get("securities", {})
+            cols = block.get("columns", [])
+            data = block.get("data", [])
+            for values in data:
+                r = dict(zip(cols, values))
+                rows.append({
+                    "date": date.fromisoformat(r["tradedate"]),
+                    "clearing": r["clearing"],
+                    "fixing_time": datetime.fromisoformat(f"{r['tradedate']}T{r['tradetime']}"),
+                    "pair": pair,
+                    "rate": float(r["rate"]),
+                })
+            cursor += len(data)
+            total = payload.get("securities.cursor", {}).get("data", [[0, 0, 0]])[0][1]
+            if not data or cursor >= total:
+                break
+            time.sleep(REQUEST_DELAY)
+
+    if not rows:
+        return pl.DataFrame()
+    return (
+        pl.DataFrame(rows)
+        .unique(subset=["date", "clearing", "pair"])
+        .sort(["pair", "fixing_time"])
+    )
+
+
 def sync_corporate_and_calendar_files() -> None:
     """Копирует корпоративные действия и рабочие субботы из ml/data/reference при наличии."""
     files = [
@@ -926,7 +1067,7 @@ def main() -> None:
         "--only",
         type=str,
         default="all",
-        help="Фильтр загрузки: all или через запятую (cbr,fx,china,usd,spot,indices,benchmarks,eia,calendar,contracts,margins)",
+        help="Фильтр загрузки: all или через запятую (cbr,fx,china,usd,spot,indices,benchmarks,eia,calendar,contracts,margins,clearing_fx)",
     )
     args = parser.parse_args()
 
@@ -1153,6 +1294,60 @@ def main() -> None:
                     )
                 full_df.write_parquet(p, compression="zstd")
                 log.info("  ✓ margin_rates: %d записей за %.1fс", len(full_df), time.time() - t0)
+
+        # Снимок текущего ГО всегда «на сейчас», --till-date на него не влияет.
+        # Снимки копятся: по ним видно, стабилен ли коэффициент ГО к mr1.
+        p = REFERENCE_DIR / "margin_snapshot.parquet"
+        log.info("12/12. Снимок текущего ГО по всем фьючерсам и коэффициент к mr1...")
+        t0 = time.time()
+        try:
+            snap_df = fetch_margin_snapshot(datetime.now(ZoneInfo("Europe/Moscow")).date())
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            log.error("  ✗ margin_snapshot: ошибка загрузки (%s), файл не изменён", exc)
+        else:
+            full_df = snap_df
+            if p.exists():
+                full_df = (
+                    pl.concat([pl.read_parquet(p), snap_df], how="vertical_relaxed")
+                    .unique(subset=["snapshot_date", "secid"], keep="last")
+                    .sort(["snapshot_date", "asset_code", "last_trade_date", "secid"])
+                )
+            full_df.write_parquet(p, compression="zstd")
+            with_factor = snap_df.filter(pl.col("margin_factor").is_not_null()).height
+            log.info(
+                "  ✓ margin_snapshot: %d контрактов (с коэффициентом %d), всего снимков %d, за %.1fс",
+                snap_df.height,
+                with_factor,
+                full_df["snapshot_date"].n_unique(),
+                time.time() - t0,
+            )
+
+    # 13. Курсы клиринга MOEX для стоимости шага долларовых контрактов
+    if run_all or "clearing_fx" in only_set:
+        p = REFERENCE_DIR / "rates_moex_clearing.parquet"
+        from_d = get_update_start_date(p, args.from_date) if args.update else args.from_date
+        if from_d > till_date:
+            log.info("13/13. rates_moex_clearing: актуален, пропускаем.")
+        else:
+            log.info("13/13. Курсы клиринга MOEX %s (с %s по %s)...", ", ".join(CLEARING_FX_PAIRS), from_d, till_date)
+            t0 = time.time()
+            try:
+                new_df = fetch_clearing_fx_rates(from_d, till_date)
+            except (requests.RequestException, ValueError, KeyError) as exc:
+                log.error("  ✗ rates_moex_clearing: ошибка загрузки (%s), файл не изменён", exc)
+            else:
+                if len(new_df) == 0:
+                    log.info("  rates_moex_clearing: новых дней нет, файл не изменён.")
+                else:
+                    full_df = new_df
+                    if p.exists() and args.update:
+                        full_df = (
+                            pl.concat([pl.read_parquet(p), new_df])
+                            .unique(subset=["date", "clearing", "pair"], keep="last")
+                            .sort(["pair", "fixing_time"])
+                        )
+                    full_df.write_parquet(p, compression="zstd")
+                    log.info("  ✓ rates_moex_clearing: %d записей за %.1fс", len(full_df), time.time() - t0)
 
     log.info("✅ Обработка справочных данных завершена!")
 
