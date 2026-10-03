@@ -1,12 +1,17 @@
 """Симуляция одной позиции одного контракта.
 
 Протокол: сигнал считается по закрытию бара `signal_bar`, вход — по открытию
-следующего бара с проскальзыванием. Внутри позиции приоритет у стопа, затем
-цель, затем выход по времени. Если позиция живёт через перенос контракта,
-она переносится по открытию первого бара нового контракта и платит стоимость
-переноса. Разрыв между контрактами (базис) в P&L не попадает — его убирает
-поправка `price_adjustment`, а движение рынка за ночь до открытия нового
-контракта попадает, как у реальной позиции (логика ETF Trick).
+следующего бара с проскальзыванием. Внутри бара сначала проверяется гэп
+открытия за уровнем, затем касание стопа или цели, затем выход по времени.
+Если бар задел и стоп, и цель, порядок касаний берётся из минуток того же
+контракта (`RawMinutes`). Без минуток или при касании обоих уровней в одной
+минутке выход пессимистично по стопу.
+
+Если позиция живёт через перенос контракта, она переносится по открытию
+первого бара нового контракта и платит стоимость переноса. Разрыв между
+контрактами (базис) в P&L не попадает — его убирает поправка
+`price_adjustment`, а движение рынка за ночь до открытия нового контракта
+попадает, как у реальной позиции (логика ETF Trick).
 
 Уровни стопа и цели задаются в реальных ценах бара сигнала. Внутри они
 хранятся в непрерывном (adjusted) пространстве через `price_adjustment`,
@@ -19,10 +24,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 import polars as pl
 
 from backtest.costs import commission, fill_price, roll_cost
+from backtest.minutes import RawMinutes
 from backtest.specs import ContractSpec
 
 LONG = 1
@@ -73,6 +80,12 @@ class ClosedTrade:
     exit_time: datetime
     exit_price: float
     exit_reason: str
+    # Как найден выход: "bar" — хватило 15-минутного бара; "minutes" — бар
+    # задел и стоп, и цель, порядок взят из минуток. Порядок неизвестен,
+    # выход по стопу: "same_minute" — оба уровня в одной минутке,
+    # "no_minutes" — минутки не переданы, "minutes_mismatch" — минутки не
+    # совпали с баром.
+    exit_resolution: str
     bars_held: int
     gross_pnl: float
     commissions: float
@@ -107,7 +120,11 @@ def _intrabar_exit(
     stop_adj: float,
     target_adj: float,
 ) -> tuple[float | None, str | None]:
-    """Выход внутри бара: гэп проверяется первым, иначе пессимистично стоп раньше цели."""
+    """Выход внутри бара: гэп проверяется первым, затем касание уровня.
+
+    Бар, открывшийся между уровнями и задевший оба, симулятор сюда не передаёт:
+    порядок касаний в нём разбирается по минуткам (`_exit_by_minutes`).
+    """
     if side == LONG:
         if open_adj <= stop_adj:
             return open_adj, "stop"
@@ -131,15 +148,90 @@ def _intrabar_exit(
     return None, None
 
 
+def _hits_both_levels(
+    side: int,
+    open_adj: float,
+    high_adj: float,
+    low_adj: float,
+    stop_adj: float,
+    target_adj: float,
+) -> bool:
+    """Бар открылся между уровнями и задел оба: по нему порядок не узнать."""
+    if side == LONG:
+        return (
+            stop_adj < open_adj < target_adj
+            and low_adj <= stop_adj
+            and high_adj >= target_adj
+        )
+    return (
+        target_adj < open_adj < stop_adj
+        and high_adj >= stop_adj
+        and low_adj <= target_adj
+    )
+
+
+def _minutes_match_bar(window: pl.DataFrame, bar: dict[str, Any]) -> bool:
+    """Минутки описывают именно этот бар: те же open, high, low и close."""
+    if window.is_empty():
+        return False
+    return (
+        window["open"][0] == bar["open"]
+        and window["high"].max() == bar["high"]
+        and window["low"].min() == bar["low"]
+        and window["close"][-1] == bar["close"]
+    )
+
+
+def _exit_by_minutes(
+    minutes: RawMinutes | None,
+    bar: dict[str, Any],
+    side: int,
+    stop_adj: float,
+    target_adj: float,
+) -> tuple[float, str, str]:
+    """Бар задел и стоп, и цель: порядок касаний берётся из минуток бара.
+
+    Минутки проходятся тем же правилом, что и бары: гэп открытия минутки за
+    уровнем — выход по её открытию, иначе касание — выход по уровню. Если
+    порядок узнать нельзя, выход пессимистично по стопу.
+    """
+    if minutes is None:
+        return stop_adj, "stop", "no_minutes"
+    window = minutes.bar_minutes(bar["contract"], bar["timestamp"])
+    if not _minutes_match_bar(window, bar):
+        return stop_adj, "stop", "minutes_mismatch"
+
+    adjustment = float(bar["price_adjustment"])
+    for open_, high, low in window.select("open", "high", "low").iter_rows():
+        open_adj = open_ + adjustment
+        high_adj = high + adjustment
+        low_adj = low + adjustment
+        if _hits_both_levels(side, open_adj, high_adj, low_adj, stop_adj, target_adj):
+            return stop_adj, "stop", "same_minute"
+        exit_adj, reason = _intrabar_exit(
+            side, open_adj, high_adj, low_adj, stop_adj, target_adj
+        )
+        if exit_adj is not None and reason is not None:
+            return exit_adj, reason, "minutes"
+    raise AssertionError("Минутки совпали с баром, но не задели ни одного уровня")
+
+
 def simulate_position(
     spec: ContractSpec,
     bars: pl.DataFrame,
     signal_bar: int,
     signal: Signal,
     exit_at_end: bool = True,
+    minutes: RawMinutes | None = None,
 ) -> ClosedTrade:
-    """Прогоняет одну позицию по барам начиная с сигнального бара."""
+    """Прогоняет одну позицию по барам начиная с сигнального бара.
+
+    `minutes` — минутки рынка для баров, задевших и стоп, и цель. Без них
+    такой бар закрывается по стопу.
+    """
     _validate_bars(bars)
+    if minutes is not None and "contract" not in bars.columns:
+        raise ValueError("Для разбора по минуткам в барах нужен столбец contract")
     if not 0 <= signal_bar < bars.height - 1:
         raise ValueError("Сигнал должен иметь следующий бар для входа")
 
@@ -186,9 +278,15 @@ def simulate_position(
                 # а движение рынка за ночь — настоящий P&L позиции.
                 roll_costs += roll_cost(spec, prev_close, float(row["open"]), quantity)
 
-        exit_adj, reason = _intrabar_exit(
-            side, open_adj, high_adj, low_adj, stop_adj, target_adj
-        )
+        resolution = "bar"
+        if _hits_both_levels(side, open_adj, high_adj, low_adj, stop_adj, target_adj):
+            exit_adj, reason, resolution = _exit_by_minutes(
+                minutes, row, side, stop_adj, target_adj
+            )
+        else:
+            exit_adj, reason = _intrabar_exit(
+                side, open_adj, high_adj, low_adj, stop_adj, target_adj
+            )
         if (
             exit_adj is None
             and signal.max_bars is not None
@@ -216,6 +314,7 @@ def simulate_position(
                 exit_time=row["timestamp"],
                 exit_price=exit_price,
                 exit_reason=reason,
+                exit_resolution=resolution,
                 bars_held=bars_held,
                 gross_pnl=gross_pnl,
                 commissions=commissions,

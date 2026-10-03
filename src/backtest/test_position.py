@@ -3,11 +3,14 @@
 # бары в тестах — naive timestamp MSK, как в data/continuous_15m.
 # ruff: noqa: DTZ001
 
+import random
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import polars as pl
 import pytest
 
+from backtest.minutes import RawMinutes
 from backtest.position import LONG, SHORT, Signal, simulate_position
 from backtest.specs import ContractSpec
 
@@ -18,6 +21,7 @@ SPEC = ContractSpec(
     margin_rate=0.12,
     exchange_fee_rate=0.0001,
 )
+START = datetime(2026, 9, 10, 10)
 
 
 def make_bars(rows: list[dict]) -> pl.DataFrame:
@@ -32,9 +36,11 @@ def bar(
     close: float,
     adjustment: float = 0.0,
     roll: bool = False,
+    contract: str = "TSZ6",
 ) -> dict:
     return {
-        "timestamp": datetime(2026, 9, 10, 10) + timedelta(minutes=minute),
+        "timestamp": START + timedelta(minutes=minute),
+        "contract": contract,
         "open": open_,
         "high": high,
         "low": low,
@@ -62,6 +68,7 @@ def test_long_target_fills_by_next_open_with_costs():
     assert trade.entry_price == pytest.approx(101.5)
     assert trade.exit_price == pytest.approx(109.5)
     assert trade.exit_reason == "target"
+    assert trade.exit_resolution == "bar"
     assert trade.bars_held == 3
     assert trade.gross_pnl == pytest.approx(8.0)
     assert trade.commissions == pytest.approx(0.0211)
@@ -69,7 +76,7 @@ def test_long_target_fills_by_next_open_with_costs():
     assert trade.net_pnl == pytest.approx(8.0 - 0.0211)
 
 
-def test_stop_has_priority_when_stop_and_target_hit_in_one_bar():
+def test_stop_has_priority_in_bar_with_both_levels_without_minutes():
     bars = make_bars(
         [
             bar(0, 99.0, 101.0, 98.0, 100.0),
@@ -80,6 +87,7 @@ def test_stop_has_priority_when_stop_and_target_hit_in_one_bar():
     )
     trade = simulate_position(SPEC, bars, 0, long_signal())
     assert trade.exit_reason == "stop"
+    assert trade.exit_resolution == "no_minutes"
     assert trade.exit_price == pytest.approx(94.5)
     assert trade.gross_pnl == pytest.approx(-7.0)
 
@@ -361,3 +369,269 @@ def test_entry_open_gap_through_stop_exits_on_entry_bar():
     assert trade.bars_held == 1
     assert trade.exit_price == pytest.approx(89.5)
     assert trade.gross_pnl == pytest.approx(-1.0)
+
+
+# Бар задел и стоп, и цель: порядок касаний берётся из минуток того же контракта.
+
+
+def write_minutes(
+    directory: Path,
+    contract: str,
+    bar_minute: int,
+    prices: list[tuple[float, float, float, float]],
+) -> RawMinutes:
+    """Минутки одного 15-минутного бара в формате raw: (open, high, low, close)."""
+    start = START + timedelta(minutes=bar_minute)
+    pl.DataFrame(
+        [
+            {
+                "timestamp": start + timedelta(minutes=i),
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+            }
+            for i, (open_, high, low, close) in enumerate(prices)
+        ]
+    ).write_parquet(directory / f"{contract}.parquet")
+    return RawMinutes(directory)
+
+
+def helicopter_bars() -> pl.DataFrame:
+    """Сигнал на 100; бар входа задел и стоп 95, и цель 110."""
+    return make_bars(
+        [
+            bar(0, 99.0, 101.0, 98.0, 100.0),
+            bar(15, 101.0, 111.0, 94.0, 100.0),
+        ]
+    )
+
+
+def test_minutes_show_target_was_first(tmp_path):
+    minutes = write_minutes(
+        tmp_path,
+        "TSZ6",
+        15,
+        [
+            (101.0, 105.0, 100.0, 104.0),
+            (104.0, 111.0, 103.0, 108.0),  # 10:16 — цель 110
+            (108.0, 108.0, 94.0, 96.0),  # 10:17 — стоп 95, уже поздно
+            (96.0, 101.0, 95.5, 100.0),
+        ],
+    )
+    trade = simulate_position(
+        SPEC, helicopter_bars(), 0, long_signal(), minutes=minutes
+    )
+    assert trade.exit_reason == "target"
+    assert trade.exit_resolution == "minutes"
+    assert trade.exit_price == pytest.approx(109.5)
+    assert trade.gross_pnl == pytest.approx(8.0)
+
+
+def test_minutes_show_stop_was_first(tmp_path):
+    minutes = write_minutes(
+        tmp_path,
+        "TSZ6",
+        15,
+        [
+            (101.0, 102.0, 100.0, 100.5),
+            (100.5, 100.5, 94.0, 95.5),  # 10:16 — стоп 95
+            (95.5, 111.0, 95.5, 108.0),  # 10:17 — цель 110, уже поздно
+            (108.0, 108.0, 99.0, 100.0),
+        ],
+    )
+    trade = simulate_position(
+        SPEC, helicopter_bars(), 0, long_signal(), minutes=minutes
+    )
+    assert trade.exit_reason == "stop"
+    assert trade.exit_resolution == "minutes"
+    assert trade.exit_price == pytest.approx(94.5)
+    assert trade.gross_pnl == pytest.approx(-7.0)
+
+
+def test_both_levels_in_one_minute_fall_back_to_stop(tmp_path):
+    minutes = write_minutes(
+        tmp_path,
+        "TSZ6",
+        15,
+        [
+            (101.0, 102.0, 100.0, 101.0),
+            (101.0, 111.0, 94.0, 100.0),  # 10:16 — и стоп, и цель
+        ],
+    )
+    trade = simulate_position(
+        SPEC, helicopter_bars(), 0, long_signal(), minutes=minutes
+    )
+    assert trade.exit_reason == "stop"
+    assert trade.exit_resolution == "same_minute"
+    assert trade.exit_price == pytest.approx(94.5)
+
+
+def test_minutes_not_matching_bar_fall_back_to_stop(tmp_path):
+    # Максимум минуток 109, а у бара 111: минутки описывают не этот бар.
+    minutes = write_minutes(tmp_path, "TSZ6", 15, [(101.0, 109.0, 94.0, 100.0)])
+    trade = simulate_position(
+        SPEC, helicopter_bars(), 0, long_signal(), minutes=minutes
+    )
+    assert trade.exit_reason == "stop"
+    assert trade.exit_resolution == "minutes_mismatch"
+    assert trade.exit_price == pytest.approx(94.5)
+
+
+def test_minute_opening_beyond_stop_exits_at_its_open(tmp_path):
+    # 10:16 открылась на 93, сразу за стопом 95: как и у 15-минутного бара,
+    # выход по цене гэпа, хотя позже в той же минутке цена дошла до цели.
+    bars = make_bars(
+        [
+            bar(0, 99.0, 101.0, 98.0, 100.0),
+            bar(15, 101.0, 111.0, 93.0, 108.0),
+        ]
+    )
+    minutes = write_minutes(
+        tmp_path,
+        "TSZ6",
+        15,
+        [(101.0, 102.0, 100.0, 100.0), (93.0, 111.0, 93.0, 108.0)],
+    )
+    trade = simulate_position(SPEC, bars, 0, long_signal(), minutes=minutes)
+    assert trade.exit_reason == "stop"
+    assert trade.exit_resolution == "minutes"
+    assert trade.exit_price == pytest.approx(92.5)
+    assert trade.gross_pnl == pytest.approx(-9.0)
+
+
+def test_short_minutes_show_target_was_first(tmp_path):
+    bars = make_bars(
+        [
+            bar(0, 99.0, 101.0, 98.0, 100.0),
+            bar(15, 99.0, 106.0, 89.0, 100.0),
+        ]
+    )
+    minutes = write_minutes(
+        tmp_path,
+        "TSZ6",
+        15,
+        [
+            (99.0, 100.0, 95.0, 96.0),
+            (96.0, 96.0, 89.0, 91.0),  # 10:16 — цель 90
+            (91.0, 106.0, 91.0, 104.0),  # 10:17 — стоп 105, уже поздно
+            (104.0, 104.0, 99.0, 100.0),
+        ],
+    )
+    trade = simulate_position(
+        SPEC, bars, 0, Signal(side=SHORT, stop=105.0, target=90.0), minutes=minutes
+    )
+    assert trade.exit_reason == "target"
+    assert trade.exit_resolution == "minutes"
+    assert trade.exit_price == pytest.approx(90.5)
+    assert trade.gross_pnl == pytest.approx(8.0)
+
+
+def test_minutes_after_roll_use_new_contract_and_adjustment(tmp_path):
+    # Новый контракт дешевле на 90: стоп 95 и цель 110 в его ценах — 5 и 20.
+    # Файл минуток есть только у нового контракта TSH7.
+    bars = make_bars(
+        [
+            bar(0, 99.5, 100.5, 99.0, 100.0),
+            bar(15, 100.0, 100.5, 99.5, 100.0),
+            bar(30, 10.0, 21.0, 4.0, 10.0, adjustment=90.0, roll=True, contract="TSH7"),
+        ]
+    )
+    minutes = write_minutes(
+        tmp_path,
+        "TSH7",
+        30,
+        [
+            (10.0, 15.0, 9.0, 14.0),
+            (14.0, 21.0, 13.0, 18.0),  # 10:31 — цель 20
+            (18.0, 18.0, 4.0, 10.0),  # 10:32 — стоп 5, уже поздно
+        ],
+    )
+    trade = simulate_position(SPEC, bars, 0, long_signal(), minutes=minutes)
+    assert trade.exit_reason == "target"
+    assert trade.exit_resolution == "minutes"
+    assert trade.exit_price == pytest.approx(19.5)
+    assert trade.gross_pnl == pytest.approx(9.0)
+    assert trade.roll_costs == pytest.approx(1.011)
+
+
+def test_minutes_are_read_only_for_bars_with_both_levels(tmp_path):
+    # Каталог минуток пуст: бары, задевшие один уровень, минутки не запрашивают.
+    bars = make_bars(
+        [
+            bar(0, 99.0, 101.0, 98.0, 100.0),
+            bar(15, 101.0, 103.0, 100.0, 102.0),
+            bar(30, 108.0, 111.0, 107.0, 110.0),
+        ]
+    )
+    trade = simulate_position(
+        SPEC, bars, 0, long_signal(), minutes=RawMinutes(tmp_path)
+    )
+    assert trade.exit_reason == "target"
+    assert trade.exit_resolution == "bar"
+
+
+def test_missing_minutes_file_is_an_error(tmp_path):
+    with pytest.raises(FileNotFoundError, match="TSZ6"):
+        simulate_position(
+            SPEC, helicopter_bars(), 0, long_signal(), minutes=RawMinutes(tmp_path)
+        )
+
+
+def test_minutes_need_contract_column(tmp_path):
+    bars = helicopter_bars().drop("contract")
+    with pytest.raises(ValueError, match="contract"):
+        simulate_position(SPEC, bars, 0, long_signal(), minutes=RawMinutes(tmp_path))
+
+
+def random_minute_path(rng: random.Random) -> list[tuple[float, float, float, float]]:
+    """15 минуток от цены 100; изредка гэп между минутками."""
+    path = []
+    close = 100.0
+    for minute in range(15):
+        open_ = close
+        if minute > 0 and rng.random() < 0.2:
+            open_ += rng.choice([-2.0, 2.0])
+        close = open_ + rng.choice([-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5])
+        high = max(open_, close) + rng.choice([0.0, 0.5, 1.0, 2.0])
+        low = min(open_, close) - rng.choice([0.0, 0.5, 1.0, 2.0])
+        path.append((open_, high, low, close))
+    return path
+
+
+def test_minute_resolution_matches_full_minute_simulation(tmp_path):
+    # Разбор бара по минуткам должен дать тот же выход, что и прогон
+    # симулятора прямо по минутным свечам. Случайные пути, в которых
+    # 15-минутный бар задел и стоп, и цель (98 и 102 при входе на 100).
+    rng = random.Random(7)
+    resolutions = set()
+    checked = 0
+    while checked < 200:
+        path = random_minute_path(rng)
+        high = max(minute[1] for minute in path)
+        low = min(minute[2] for minute in path)
+        if high < 102.0 or low > 98.0:
+            continue
+        if rng.random() < 0.5:
+            signal = Signal(side=LONG, stop=98.0, target=102.0)
+        else:
+            signal = Signal(side=SHORT, stop=102.0, target=98.0)
+
+        contract = f"TS{checked}"
+        signal_bar = bar(0, 100.0, 100.0, 100.0, 100.0, contract=contract)
+        bar_15m = bar(15, path[0][0], high, low, path[-1][3], contract=contract)
+        minutes = write_minutes(tmp_path, contract, 15, path)
+        by_minutes = simulate_position(
+            SPEC, make_bars([signal_bar, bar_15m]), 0, signal, minutes=minutes
+        )
+        bars_1m = make_bars(
+            [signal_bar] + [bar(15 + i, *prices) for i, prices in enumerate(path)]
+        )
+        reference = simulate_position(SPEC, bars_1m, 0, signal)
+
+        assert by_minutes.exit_reason == reference.exit_reason
+        assert by_minutes.exit_price == pytest.approx(reference.exit_price)
+        assert by_minutes.gross_pnl == pytest.approx(reference.gross_pnl)
+        resolutions.add(by_minutes.exit_resolution)
+        checked += 1
+    assert resolutions == {"minutes", "same_minute"}
