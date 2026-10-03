@@ -25,19 +25,20 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta
 import io
-import json
 import logging
-import os
-from pathlib import Path
+import math
 import shutil
 import sys
 import time
+import xml.etree.ElementTree as ET
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
-import xml.etree.ElementTree as ET
+
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -47,17 +48,17 @@ PROJECT_DIR = Path(__file__).resolve().parents[2]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from bs4 import BeautifulSoup
 import polars as pl
 import requests
+from bs4 import BeautifulSoup
 
 from src.core.config import (
     ASSETS,
     ISS_BASE_URL,
-    Cadence,
     MAX_RETRIES,
     REQUEST_DELAY,
     REQUEST_TIMEOUT,
+    Cadence,
     Paths,
 )
 
@@ -69,6 +70,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 REFERENCE_DIR = Paths().reference
+# Только для разовой копии корпоративных реестров (sync_corporate_and_calendar_files).
 ML_REFERENCE_DIR = Path("/Users/anton/Documents/app/ml/data/reference")
 
 DEFAULT_FROM_DATE = "2020-01-01"
@@ -77,14 +79,34 @@ DEFAULT_FROM_DATE = "2020-01-01"
 # -----------------------------------------------------------------------------
 # Хелпер для докачки (incremental update)
 # -----------------------------------------------------------------------------
-def get_update_start_date(file_path: Path, default_from: str, date_col: str = "date") -> str:
-    """Определяет дату, с которой нужно докачивать данные, если файл уже существует."""
+def get_update_start_date(
+    file_path: Path,
+    default_from: str,
+    date_col: str = "date",
+    key_col: str | None = None,
+    keys: Sequence[str] = (),
+) -> str:
+    """Определяет дату, с которой нужно докачивать данные, если файл уже существует.
+
+    В файле с несколькими рядами (key_col: валюта, тикер, актив) старт берётся
+    по ряду, который отстал сильнее всех. Иначе ряд, не скачавшийся в прошлый
+    раз, остался бы с дырой: остальные ряды уже ушли вперёд. Если какого-то
+    ряда из keys в файле нет совсем, качаем с default_from.
+    """
     if not file_path.exists():
         return default_from
     try:
         df = pl.read_parquet(file_path)
         if len(df) > 0 and date_col in df.columns:
-            max_d = df[date_col].max()
+            if key_col is None:
+                max_d = df[date_col].max()
+            else:
+                last_by_key = dict(
+                    df.group_by(key_col).agg(pl.col(date_col).max()).iter_rows()
+                )
+                if any(key not in last_by_key for key in keys):
+                    return default_from
+                max_d = min(last_by_key[key] for key in keys) if keys else min(last_by_key.values())
             if max_d is not None:
                 # Начинаем со следующего дня после максимальной даты
                 next_d = max_d + timedelta(days=1)
@@ -92,6 +114,55 @@ def get_update_start_date(file_path: Path, default_from: str, date_col: str = "d
     except Exception as exc:
         log.warning("Не удалось прочитать существующий файл %s (%s), качаем с %s", file_path.name, exc, default_from)
     return default_from
+
+
+def refresh_reference_file(
+    label: str,
+    path: Path,
+    fetch: Callable[[str, str], pl.DataFrame],
+    *,
+    from_date: str,
+    till_date: str,
+    update: bool,
+    key_col: str | None = None,
+    keys: Sequence[str] = (),
+    finalize: Callable[[pl.DataFrame], pl.DataFrame] | None = None,
+) -> None:
+    """Скачивает файл справочника или докачивает его, не портя при ошибке.
+
+    - Любая ошибка источника — файл не меняется. Раньше частичный результат
+      записывался: без --update пропадал целый ряд, при --update оставалась дыра.
+    - При докачке новые строки заменяют старые за те же даты.
+    - finalize пересчитывает производные столбцы по всему файлу после слияния.
+    """
+    start = (
+        get_update_start_date(path, from_date, key_col=key_col, keys=keys)
+        if update
+        else from_date
+    )
+    if start > till_date:
+        log.info("%s: актуален, пропускаем.", label)
+        return
+    log.info("%s (с %s по %s)...", label, start, till_date)
+    t0 = time.time()
+    try:
+        new_df = fetch(start, till_date)
+    except Exception as exc:  # noqa: BLE001 — граница: любая ошибка источника
+        log.error("  ✗ %s: ошибка загрузки (%s), файл не изменён", path.name, exc)
+        return
+    if new_df.is_empty():
+        log.info("  %s: новых данных нет, файл не изменён.", path.name)
+        return
+
+    full_df = new_df
+    if update and path.exists():
+        full_df = pl.concat([pl.read_parquet(path), new_df], how="diagonal_relaxed")
+    subset = [key_col, "date"] if key_col else ["date"]
+    full_df = full_df.unique(subset=subset, keep="last", maintain_order=True).sort(subset)
+    if finalize is not None:
+        full_df = finalize(full_df)
+    full_df.write_parquet(path, compression="zstd")
+    log.info("  ✓ %s: %d записей за %.1fс", path.name, len(full_df), time.time() - t0)
 
 
 # -----------------------------------------------------------------------------
@@ -105,6 +176,7 @@ def fetch_cbr_key_rate(from_date: str, till_date: str) -> pl.DataFrame:
 
     headers = {"User-Agent": "Mozilla/5.0"}
     resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     table = soup.find("table", {"class": "data"})
     if not table:
@@ -136,33 +208,33 @@ def fetch_cbr_key_rate(from_date: str, till_date: str) -> pl.DataFrame:
 # -----------------------------------------------------------------------------
 # 2. Официальные курсы валют ЦБ РФ (USD, CNY, EUR)
 # -----------------------------------------------------------------------------
+CBR_CURRENCIES = {
+    "USD": "R01235",
+    "EUR": "R01239",
+    "CNY": "R01375",
+}
+
+
 def fetch_cbr_fx_rates(from_date: str, till_date: str) -> pl.DataFrame:
     """Загружает официальные курсы USD, CNY, EUR через XML-сервис ЦБ РФ."""
-    currencies = {
-        "USD": "R01235",
-        "EUR": "R01239",
-        "CNY": "R01375",
-    }
     d1 = datetime.strptime(from_date, "%Y-%m-%d").strftime("%d/%m/%Y")
     d2 = datetime.strptime(till_date, "%Y-%m-%d").strftime("%d/%m/%Y")
 
     all_rows = []
-    for curr, val_code in currencies.items():
+    for curr, val_code in CBR_CURRENCIES.items():
         url = f"https://www.cbr.ru/scripts/XML_dynamic.asp?date_req1={d1}&date_req2={d2}&VAL_NM_RQ={val_code}"
-        try:
-            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-            root = ET.fromstring(resp.content)
-            for rec in root.findall("Record"):
-                dt_str = rec.attrib.get("Date")
-                val_node = rec.find("Value")
-                nom_node = rec.find("Nominal")
-                if dt_str and val_node is not None and val_node.text:
-                    dt = datetime.strptime(dt_str, "%d.%m.%Y").date()
-                    nominal = float(nom_node.text) if nom_node is not None and nom_node.text else 1.0
-                    rate = float(val_node.text.replace(",", ".")) / nominal
-                    all_rows.append({"date": dt, "currency": curr, "rate": rate})
-        except Exception as exc:
-            log.warning("Ошибка при загрузке курса ЦБ %s: %s", curr, exc)
+        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        for rec in root.findall("Record"):
+            dt_str = rec.attrib.get("Date")
+            val_node = rec.find("Value")
+            nom_node = rec.find("Nominal")
+            if dt_str and val_node is not None and val_node.text:
+                dt = datetime.strptime(dt_str, "%d.%m.%Y").date()
+                nominal = float(nom_node.text) if nom_node is not None and nom_node.text else 1.0
+                rate = float(val_node.text.replace(",", ".")) / nominal
+                all_rows.append({"date": dt, "currency": curr, "rate": rate})
 
     if not all_rows:
         return pl.DataFrame()
@@ -177,6 +249,13 @@ def fetch_cbr_fx_rates(from_date: str, till_date: str) -> pl.DataFrame:
 # -----------------------------------------------------------------------------
 # 3. Ставки Китая: SHIBOR (1Y, 3M) и LPR 1Y
 # -----------------------------------------------------------------------------
+CHINA_SERIES = ["shibor_1y", "shibor_3m", "lpr_1y"]
+
+
+def _is_number(value: Any) -> bool:
+    return value is not None and not (isinstance(value, float) and math.isnan(value))
+
+
 def fetch_china_rates(from_date: str, till_date: str) -> pl.DataFrame:
     """Загружает ставки Китая через библиотеку akshare."""
     import akshare as ak
@@ -184,32 +263,26 @@ def fetch_china_rates(from_date: str, till_date: str) -> pl.DataFrame:
     all_rows = []
 
     # 1. SHIBOR
-    try:
-        shibor_df = ak.macro_china_shibor_all()
-        shibor_df = shibor_df[(shibor_df["日期"] >= from_date) & (shibor_df["日期"] <= till_date)]
-        for _, row in shibor_df.iterrows():
-            d = date.fromisoformat(str(row["日期"])[:10])
-            r_1y = row["1Y-定价"]
-            r_3m = row["3M-定价"]
-            if r_1y is not None and not (isinstance(r_1y, float) and r_1y != r_1y):
-                all_rows.append({"date": d, "series": "shibor_1y", "rate": float(r_1y)})
-            if r_3m is not None and not (isinstance(r_3m, float) and r_3m != r_3m):
-                all_rows.append({"date": d, "series": "shibor_3m", "rate": float(r_3m)})
-    except Exception as exc:
-        log.warning("Ошибка при загрузке SHIBOR через akshare: %s", exc)
+    shibor_df = ak.macro_china_shibor_all()
+    shibor_df = shibor_df[(shibor_df["日期"] >= from_date) & (shibor_df["日期"] <= till_date)]
+    for _, row in shibor_df.iterrows():
+        d = date.fromisoformat(str(row["日期"])[:10])
+        r_1y = row["1Y-定价"]
+        r_3m = row["3M-定价"]
+        if _is_number(r_1y):
+            all_rows.append({"date": d, "series": "shibor_1y", "rate": float(r_1y)})
+        if _is_number(r_3m):
+            all_rows.append({"date": d, "series": "shibor_3m", "rate": float(r_3m)})
 
     # 2. LPR
-    try:
-        lpr_df = ak.macro_china_lpr()
-        for _, row in lpr_df.iterrows():
-            d_str = str(row["TRADE_DATE"])[:10]
-            if d_str < from_date or d_str > till_date:
-                continue
-            r_lpr = row["LPR1Y"]
-            if r_lpr is not None and not (isinstance(r_lpr, float) and r_lpr != r_lpr):
-                all_rows.append({"date": date.fromisoformat(d_str), "series": "lpr_1y", "rate": float(r_lpr)})
-    except Exception as exc:
-        log.warning("Ошибка при загрузке LPR через akshare: %s", exc)
+    lpr_df = ak.macro_china_lpr()
+    for _, row in lpr_df.iterrows():
+        d_str = str(row["TRADE_DATE"])[:10]
+        if d_str < from_date or d_str > till_date:
+            continue
+        r_lpr = row["LPR1Y"]
+        if _is_number(r_lpr):
+            all_rows.append({"date": date.fromisoformat(d_str), "series": "lpr_1y", "rate": float(r_lpr)})
 
     if not all_rows:
         return pl.DataFrame()
@@ -238,28 +311,25 @@ def fetch_usd_sofr(from_date: str, till_date: str) -> pl.DataFrame:
                 rate_val = r.get("percentRate")
                 if dt_str and rate_val is not None:
                     rows.append({"date": date.fromisoformat(dt_str), "rate": float(rate_val)})
-    except Exception as exc:
+    except (requests.RequestException, ValueError) as exc:
         log.warning("New York Fed SOFR недоступен (%s), пробуем FRED...", exc)
 
-    # 2. FRED fallback
+    # 2. FRED — второй официальный источник того же ряда; его ошибка уже не глотается.
     if not rows:
-        try:
-            fred_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SOFR"
-            resp = requests.get(fred_url, timeout=REQUEST_TIMEOUT)
-            if resp.status_code == 200:
-                raw_df = pl.read_csv(io.BytesIO(resp.content), null_values=["."])
-                d_col, v_col = raw_df.columns[0], raw_df.columns[1]
-                df_fred = (
-                    raw_df.filter(pl.col(v_col).is_not_null())
-                    .select([
-                        pl.col(d_col).str.to_date().alias("date"),
-                        pl.col(v_col).cast(pl.Float64).alias("rate"),
-                    ])
-                    .filter((pl.col("date") >= date.fromisoformat(from_date)) & (pl.col("date") <= date.fromisoformat(till_date)))
-                )
-                return df_fred.sort("date")
-        except Exception as exc:
-            log.error("FRED SOFR также недоступен: %s", exc)
+        fred_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SOFR"
+        resp = requests.get(fred_url, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        raw_df = pl.read_csv(io.BytesIO(resp.content), null_values=["."])
+        d_col, v_col = raw_df.columns[0], raw_df.columns[1]
+        df_fred = (
+            raw_df.filter(pl.col(v_col).is_not_null())
+            .select([
+                pl.col(d_col).str.to_date().alias("date"),
+                pl.col(v_col).cast(pl.Float64).alias("rate"),
+            ])
+            .filter((pl.col("date") >= date.fromisoformat(from_date)) & (pl.col("date") <= date.fromisoformat(till_date)))
+        )
+        return df_fred.unique(subset=["date"]).sort("date")
 
     if not rows:
         return pl.DataFrame()
@@ -274,12 +344,14 @@ def fetch_usd_sofr(from_date: str, till_date: str) -> pl.DataFrame:
 # -----------------------------------------------------------------------------
 # 5. Биржевой спот валют (MOEX ISS CETS)
 # -----------------------------------------------------------------------------
+SPOT_TICKERS = ["CNYRUB_TOM", "USD000UTSTOM", "EUR_RUB__TOM"]
+
+
 def fetch_spot_currencies(from_date: str, till_date: str) -> pl.DataFrame:
     """Загружает дневную историю CNYRUB_TOM, USD000UTSTOM и EUR_RUB__TOM с MOEX ISS."""
-    tickers = ["CNYRUB_TOM", "USD000UTSTOM", "EUR_RUB__TOM"]
     all_rows = []
 
-    for secid in tickers:
+    for secid in SPOT_TICKERS:
         cursor = 0
         while True:
             url = (
@@ -287,46 +359,41 @@ def fetch_spot_currencies(from_date: str, till_date: str) -> pl.DataFrame:
                 f"/boards/CETS/securities/{secid}.json"
                 f"?from={from_date}&till={till_date}&start={cursor}&iss.meta=off&iss.only=history"
             )
-            try:
-                resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-                if resp.status_code != 200:
-                    break
-                payload = resp.json()
-                history = payload.get("history", {})
-                cols = history.get("columns", [])
-                data = history.get("data", [])
-                if not data:
-                    break
-
-                i_date = cols.index("TRADEDATE")
-                i_open = cols.index("OPEN")
-                i_high = cols.index("HIGH")
-                i_low = cols.index("LOW")
-                i_close = cols.index("CLOSE")
-                i_wap = cols.index("WAPRICE") if "WAPRICE" in cols else -1
-                i_vol = cols.index("VOLUME") if "VOLUME" in cols else -1
-
-                for r in data:
-                    if r[i_close] is None:
-                        continue
-                    all_rows.append({
-                        "date": date.fromisoformat(r[i_date]),
-                        "secid": secid,
-                        "open": float(r[i_open]) if r[i_open] is not None else None,
-                        "high": float(r[i_high]) if r[i_high] is not None else None,
-                        "low": float(r[i_low]) if r[i_low] is not None else None,
-                        "close": float(r[i_close]),
-                        "waprice": float(r[i_wap]) if i_wap >= 0 and r[i_wap] is not None else None,
-                        "volume": float(r[i_vol]) if i_vol >= 0 and r[i_vol] is not None else 0.0,
-                    })
-
-                cursor += len(data)
-                if len(data) < 100:
-                    break
-                time.sleep(REQUEST_DELAY)
-            except Exception as exc:
-                log.warning("Ошибка запроса спота %s: %s", secid, exc)
+            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            payload = resp.json()
+            history = payload.get("history", {})
+            cols = history.get("columns", [])
+            data = history.get("data", [])
+            if not data:
                 break
+
+            i_date = cols.index("TRADEDATE")
+            i_open = cols.index("OPEN")
+            i_high = cols.index("HIGH")
+            i_low = cols.index("LOW")
+            i_close = cols.index("CLOSE")
+            i_wap = cols.index("WAPRICE") if "WAPRICE" in cols else -1
+            i_vol = cols.index("VOLUME") if "VOLUME" in cols else -1
+
+            for r in data:
+                if r[i_close] is None:
+                    continue
+                all_rows.append({
+                    "date": date.fromisoformat(r[i_date]),
+                    "secid": secid,
+                    "open": float(r[i_open]) if r[i_open] is not None else None,
+                    "high": float(r[i_high]) if r[i_high] is not None else None,
+                    "low": float(r[i_low]) if r[i_low] is not None else None,
+                    "close": float(r[i_close]),
+                    "waprice": float(r[i_wap]) if i_wap >= 0 and r[i_wap] is not None else None,
+                    "volume": float(r[i_vol]) if i_vol >= 0 and r[i_vol] is not None else 0.0,
+                })
+
+            cursor += len(data)
+            if len(data) < 100:
+                break
+            time.sleep(REQUEST_DELAY)
 
     if not all_rows:
         return pl.DataFrame()
@@ -341,15 +408,14 @@ def fetch_spot_currencies(from_date: str, till_date: str) -> pl.DataFrame:
 # -----------------------------------------------------------------------------
 # 6. Фондовые индексы (IMOEX, RTSI)
 # -----------------------------------------------------------------------------
+INDEX_BOARDS = {"IMOEX": "SNDX", "RTSI": "RTSI"}
+
+
 def fetch_indices(from_date: str, till_date: str) -> pl.DataFrame:
     """Загружает дневную историю IMOEX (SNDX) и RTSI (RTSI) с MOEX ISS."""
-    targets = [
-        ("IMOEX", "SNDX"),
-        ("RTSI", "RTSI"),
-    ]
     all_rows = []
 
-    for secid, board in targets:
+    for secid, board in INDEX_BOARDS.items():
         cursor = 0
         while True:
             url = (
@@ -357,46 +423,41 @@ def fetch_indices(from_date: str, till_date: str) -> pl.DataFrame:
                 f"/boards/{board}/securities/{secid}.json"
                 f"?from={from_date}&till={till_date}&start={cursor}&iss.meta=off&iss.only=history"
             )
-            try:
-                resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-                if resp.status_code != 200:
-                    break
-                payload = resp.json()
-                history = payload.get("history", {})
-                cols = history.get("columns", [])
-                data = history.get("data", [])
-                if not data:
-                    break
-
-                i_date = cols.index("TRADEDATE")
-                i_open = cols.index("OPEN")
-                i_high = cols.index("HIGH")
-                i_low = cols.index("LOW")
-                i_close = cols.index("CLOSE")
-                i_vol = cols.index("VOLUME") if "VOLUME" in cols else -1
-                i_val = cols.index("VALUE") if "VALUE" in cols else -1
-
-                for r in data:
-                    if r[i_close] is None:
-                        continue
-                    all_rows.append({
-                        "date": date.fromisoformat(r[i_date]),
-                        "secid": secid,
-                        "open": float(r[i_open]) if r[i_open] is not None else None,
-                        "high": float(r[i_high]) if r[i_high] is not None else None,
-                        "low": float(r[i_low]) if r[i_low] is not None else None,
-                        "close": float(r[i_close]),
-                        "volume": float(r[i_vol]) if i_vol >= 0 and r[i_vol] is not None else 0.0,
-                        "value": float(r[i_val]) if i_val >= 0 and r[i_val] is not None else 0.0,
-                    })
-
-                cursor += len(data)
-                if len(data) < 100:
-                    break
-                time.sleep(REQUEST_DELAY)
-            except Exception as exc:
-                log.warning("Ошибка запроса индекса %s: %s", secid, exc)
+            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            payload = resp.json()
+            history = payload.get("history", {})
+            cols = history.get("columns", [])
+            data = history.get("data", [])
+            if not data:
                 break
+
+            i_date = cols.index("TRADEDATE")
+            i_open = cols.index("OPEN")
+            i_high = cols.index("HIGH")
+            i_low = cols.index("LOW")
+            i_close = cols.index("CLOSE")
+            i_vol = cols.index("VOLUME") if "VOLUME" in cols else -1
+            i_val = cols.index("VALUE") if "VALUE" in cols else -1
+
+            for r in data:
+                if r[i_close] is None:
+                    continue
+                all_rows.append({
+                    "date": date.fromisoformat(r[i_date]),
+                    "secid": secid,
+                    "open": float(r[i_open]) if r[i_open] is not None else None,
+                    "high": float(r[i_high]) if r[i_high] is not None else None,
+                    "low": float(r[i_low]) if r[i_low] is not None else None,
+                    "close": float(r[i_close]),
+                    "volume": float(r[i_vol]) if i_vol >= 0 and r[i_vol] is not None else 0.0,
+                    "value": float(r[i_val]) if i_val >= 0 and r[i_val] is not None else 0.0,
+                })
+
+            cursor += len(data)
+            if len(data) < 100:
+                break
+            time.sleep(REQUEST_DELAY)
 
     if not all_rows:
         return pl.DataFrame()
@@ -411,80 +472,78 @@ def fetch_indices(from_date: str, till_date: str) -> pl.DataFrame:
 # -----------------------------------------------------------------------------
 # 7. Мировые товарные и индексные бенчмарки через akshare
 # -----------------------------------------------------------------------------
+WORLD_BENCHMARKS = {
+    "brent": "OIL",     # Brent Crude Oil (ICE)
+    "ng": "NG",         # Henry Hub Natural Gas (NYMEX)
+    "gold": "GC",       # Gold (COMEX)
+    "silver": "SI",     # Silver (COMEX)
+    "copper": "HG",     # Copper (COMEX)
+    "spy": "ES",        # S&P 500 E-mini (CME)
+    "nasdaq": "NQ",     # Nasdaq 100 E-mini (CME)
+}
+
+
 def fetch_world_benchmarks(from_date: str, till_date: str) -> pl.DataFrame:
-    """Загружает дневные котировки мировых бенчмарков через akshare (с защитой от зависания сети)."""
+    """Загружает дневные котировки мировых бенчмарков через akshare.
+
+    Если хоть один бенчмарк не скачался, бросает исключение: файл не меняется.
+    Дневная доходность ret_1d здесь не считается — её пересчитывает
+    add_benchmark_returns по всему файлу после слияния со старыми данными.
+    """
     import akshare as ak
 
-    benchmarks = {
-        "brent": "OIL",     # Brent Crude Oil (ICE)
-        "ng": "NG",         # Henry Hub Natural Gas (NYMEX)
-        "gold": "GC",       # Gold (COMEX)
-        "silver": "SI",     # Silver (COMEX)
-        "copper": "HG",     # Copper (COMEX)
-        "spy": "ES",        # S&P 500 E-mini (CME)
-        "nasdaq": "NQ",     # Nasdaq 100 E-mini (CME)
-    }
+    def fetch_single(asset: str, symbol: str) -> pl.DataFrame:
+        df_pd = ak.futures_foreign_hist(symbol=symbol)
+        if df_pd is None or df_pd.empty:
+            raise ValueError(f"akshare вернул пустую историю {symbol} ({asset})")
+
+        df = pl.from_pandas(df_pd)
+        if df.schema["date"] in (pl.Utf8, pl.String):
+            df = df.with_columns(pl.col("date").str.to_date().alias("date"))
+        else:
+            df = df.with_columns(pl.col("date").cast(pl.Date).alias("date"))
+
+        return (
+            df.filter((pl.col("date") >= date.fromisoformat(from_date)) & (pl.col("date") <= date.fromisoformat(till_date)))
+            .select([
+                pl.col("date"),
+                pl.lit(symbol).alias("symbol"),
+                pl.lit(asset).alias("asset"),
+                pl.col("open").cast(pl.Float64),
+                pl.col("high").cast(pl.Float64),
+                pl.col("low").cast(pl.Float64),
+                pl.col("close").cast(pl.Float64),
+                pl.col("volume").cast(pl.Float64),
+            ])
+            .unique(subset=["date"], keep="last", maintain_order=True)
+        )
 
     all_frames = []
-
-    def fetch_single(asset: str, symbol: str) -> pl.DataFrame | None:
-        try:
-            df_pd = ak.futures_foreign_hist(symbol=symbol)
-            if df_pd is None or df_pd.empty:
-                return None
-
-            df = pl.from_pandas(df_pd)
-            if df.schema["date"] in (pl.Utf8, pl.String):
-                df = df.with_columns(pl.col("date").str.to_date().alias("date"))
-            else:
-                df = df.with_columns(pl.col("date").cast(pl.Date).alias("date"))
-
-            df = (
-                df.filter((pl.col("date") >= date.fromisoformat(from_date)) & (pl.col("date") <= date.fromisoformat(till_date)))
-                .select([
-                    pl.col("date"),
-                    pl.lit(symbol).alias("symbol"),
-                    pl.lit(asset).alias("asset"),
-                    pl.col("open").cast(pl.Float64),
-                    pl.col("high").cast(pl.Float64),
-                    pl.col("low").cast(pl.Float64),
-                    pl.col("close").cast(pl.Float64),
-                    pl.col("volume").cast(pl.Float64),
-                ])
-                .sort("date")
-                .unique(subset=["date"])
-                .with_columns(
-                    (pl.col("close") / pl.col("close").shift(1) - 1.0).alias("ret_1d")
-                )
-            )
-            return df
-        except Exception as exc:
-            log.warning("Сетевая ошибка akshare для бенчмарка %s: %s", symbol, exc)
-            return None
-
-    # Запускаем в пуле потоков с таймаутом на случай блокировки Sina finance
+    # Пул потоков: бенчмарки качаются параллельно, result(timeout) не даёт
+    # бесконечно ждать один источник (сам поток при этом не прерывается).
     with ThreadPoolExecutor(max_workers=3) as executor:
-        future_map = {executor.submit(fetch_single, asset, sym): (asset, sym) for asset, sym in benchmarks.items()}
+        future_map = {executor.submit(fetch_single, asset, sym): (asset, sym) for asset, sym in WORLD_BENCHMARKS.items()}
         for fut, (asset, sym) in future_map.items():
             try:
-                # Таймаут 10 секунд на бенчмарк
                 res = fut.result(timeout=12)
-                if res is not None and len(res) > 0:
-                    all_frames.append(res)
-                    log.info("  ✓ Мировой бенчмарк %s (%s): %d дней (последний Close: %.2f)", sym, asset, len(res), res["close"][-1])
             except Exception as exc:
-                log.warning("Таймаут или ошибка akshare для %s (%s), проверяем локальный кэш ml...", sym, asset)
-                # Пробуем подтянуть из ml/data/reference/benchmark_{asset}.parquet
-                fallback_p = ML_REFERENCE_DIR / f"benchmark_{asset}.parquet"
-                if fallback_p.exists():
-                    fb_df = pl.read_parquet(fallback_p).with_columns(pl.lit(asset).alias("asset"))
-                    all_frames.append(fb_df)
-                    log.info("  ✓ Подгружен из ml: %s (%d дней)", asset, len(fb_df))
-
-    if not all_frames:
-        return pl.DataFrame()
+                raise RuntimeError(f"бенчмарк {sym} ({asset}) не скачался: {exc}") from exc
+            all_frames.append(res)
+            if len(res) > 0:
+                log.info("  ✓ Мировой бенчмарк %s (%s): %d дней (последний Close: %.2f)", sym, asset, len(res), res["close"][-1])
 
     return pl.concat(all_frames).sort(["asset", "date"])
+
+
+def add_benchmark_returns(df: pl.DataFrame) -> pl.DataFrame:
+    """Дневная доходность каждого бенчмарка по всему файлу, после сортировки.
+
+    Считается после слияния, чтобы на стыке старых и новых данных не было
+    пропуска, и после сортировки по дате: удаление дублей порядок не хранит.
+    """
+    return df.sort(["asset", "date"]).with_columns(
+        (pl.col("close") / pl.col("close").shift(1).over("asset") - 1.0).alias("ret_1d")
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -686,9 +745,6 @@ def fetch_futures_contracts(
     except Exception as exc:
         log.warning("Не удалось получить срез активных контрактов через moexalgo: %s", exc)
 
-    all_tickers = sorted(set(ticker_to_asset.keys()).union(active_map.keys()))
-    log.info("  Всего контрактов для учета в справочнике: %d", len(all_tickers))
-
     # 3. Загрузка существующего кэша при наличии
     cached_records: dict[str, dict[str, Any]] = {}
     if output_path.exists():
@@ -699,6 +755,12 @@ def fetch_futures_contracts(
             log.info("  Загружено %d существующих записей из %s", len(cached_records), output_path.name)
         except Exception as exc:
             log.warning("Ошибка чтения существующего справочника %s: %s", output_path, exc)
+
+    # Контракты из старого справочника остаются всегда. Иначе истёкшие контракты
+    # рынков вне реестра (их нет ни в генераторе тикеров, ни среди активных)
+    # пропадали бы из справочника при следующем запуске.
+    all_tickers = sorted(set(ticker_to_asset) | set(active_map) | set(cached_records))
+    log.info("  Всего контрактов для учета в справочнике: %d", len(all_tickers))
 
     today = date.today()
     tickers_to_query: list[str] = []
@@ -714,44 +776,35 @@ def fetch_futures_contracts(
     log.info("  Требуется запрос спецификаций MOEX ISS для %d контрактов...", len(tickers_to_query))
 
     # 4. Запрос спецификаций через MOEX ISS
-    def fetch_desc(secid: str) -> tuple[str, dict[str, Any], int | None]:
+    def fetch_desc(secid: str) -> tuple[str, dict[str, Any]]:
         url = f"{ISS_BASE_URL}/securities/{secid}.json"
-        params = {"iss.only": "description,boards", "iss.meta": "off"}
+        params = {"iss.only": "description", "iss.meta": "off"}
         for attempt in range(MAX_RETRIES):
             try:
                 resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
                 if resp.status_code == 200:
                     payload = resp.json()
                     desc_data = payload.get("description", {}).get("data", [])
-                    desc = {row[0]: row[2] for row in desc_data if len(row) >= 3}
-                    decimals = None
-                    boards_data = payload.get("boards", {}).get("data", [])
-                    boards_cols = payload.get("boards", {}).get("columns", [])
-                    for b_row in boards_data:
-                        bd = dict(zip(boards_cols, b_row))
-                        if bd.get("is_primary") == 1 or bd.get("boardid") == "RFUD":
-                            decimals = bd.get("decimals")
-                            break
-                    return secid, desc, decimals
+                    return secid, {row[0]: row[2] for row in desc_data if len(row) >= 3}
                 elif resp.status_code in (429, 502, 503, 504):
                     time.sleep(REQUEST_DELAY * (2**attempt))
                 else:
                     break
-            except Exception:
+            except (requests.RequestException, ValueError):
                 time.sleep(REQUEST_DELAY * (2**attempt))
-        return secid, {}, None
+        return secid, {}
 
-    queried_meta: dict[str, tuple[dict[str, Any], int | None]] = {}
+    queried_meta: dict[str, dict[str, Any]] = {}
     if tickers_to_query:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            for secid, desc, decimals in pool.map(fetch_desc, tickers_to_query):
-                queried_meta[secid] = (desc, decimals)
+            for secid, desc in pool.map(fetch_desc, tickers_to_query):
+                queried_meta[secid] = desc
 
     # 5. Сборка итоговых записей
     final_rows: list[dict[str, Any]] = []
     for t in all_tickers:
         act = active_map.get(t, {})
-        desc, decimals = queried_meta.get(t, ({}, None))
+        desc = queried_meta.get(t, {})
         cached = cached_records.get(t, {})
 
         name = desc.get("NAME") or desc.get("CONTRACTNAME") or act.get("secname") or cached.get("name") or t
@@ -777,18 +830,19 @@ def fetch_futures_contracts(
         except (ValueError, TypeError):
             lot = 1
 
+        # Шаг цены и его стоимость биржа отдаёт только по действующим контрактам.
+        # Для истёкших шаг раньше угадывался по числу знаков после запятой
+        # (MIX 1 вместо 25, MXI 0.01 вместо 0.05). Теперь из кэша берётся только
+        # шаг, записанный вместе со стоимостью шага — то есть пришедший с биржи,
+        # пока контракт торговался. Иначе — пусто, а не догадка.
         min_step = act.get("minstep")
         step_price = act.get("stepprice")
-        if min_step is None and cached.get("min_price_increment") is not None:
+        if (
+            min_step is None
+            and step_price is None
+            and cached.get("min_price_increment_amount") is not None
+        ):
             min_step = cached.get("min_price_increment")
-        elif min_step is None and decimals is not None:
-            try:
-                dec_int = decimals if isinstance(decimals, int) else int(decimals)
-                min_step = 10.0 ** (-dec_int) if dec_int > 0 else 1.0
-            except (ValueError, TypeError):
-                min_step = 1.0
-
-        if step_price is None and cached.get("min_price_increment_amount") is not None:
             step_price = cached.get("min_price_increment_amount")
 
         final_rows.append({
@@ -1074,145 +1128,88 @@ def main() -> None:
     REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
 
     till_date = args.till_date or date.today().strftime("%Y-%m-%d")
-    only_set = set(x.strip().lower() for x in args.only.split(","))
+    only_set = {x.strip().lower() for x in args.only.split(",")}
     run_all = "all" in only_set
 
     log.info("Параметры запуска справочников:")
     log.info("  Режим: %s", "UPDATE (докачка новых дней)" if args.update else "FULL (загрузка с нуля)")
     log.info("  Конечная дата: %s", till_date)
 
+    common = {"from_date": args.from_date, "till_date": till_date, "update": args.update}
+
     # 1. Ключевая ставка ЦБ
     if run_all or "cbr" in only_set:
-        p = REFERENCE_DIR / "cbr_key_rate.parquet"
-        from_d = get_update_start_date(p, args.from_date) if args.update else args.from_date
-        if from_d > till_date:
-            log.info("1/9. cbr_key_rate: актуален, пропускаем.")
-        else:
-            log.info("1/9. Ключевая ставка ЦБ РФ (с %s по %s)...", from_d, till_date)
-            t0 = time.time()
-            new_df = fetch_cbr_key_rate(from_d, till_date)
-            if len(new_df) > 0:
-                if p.exists() and args.update:
-                    old_df = pl.read_parquet(p)
-                    full_df = pl.concat([old_df, new_df]).unique(subset=["date"]).sort("date")
-                else:
-                    full_df = new_df
-                full_df.write_parquet(p, compression="zstd")
-                log.info("  ✓ cbr_key_rate: %d записей (текущая: %.2f%%) за %.1fс", len(full_df), full_df["rate"][-1], time.time() - t0)
+        refresh_reference_file(
+            "1/9. Ключевая ставка ЦБ РФ",
+            REFERENCE_DIR / "cbr_key_rate.parquet",
+            fetch_cbr_key_rate,
+            **common,
+        )
 
     # 2. Курсы валют ЦБ
     if run_all or "fx" in only_set:
-        p = REFERENCE_DIR / "rates_cbr_fx.parquet"
-        from_d = get_update_start_date(p, args.from_date) if args.update else args.from_date
-        if from_d > till_date:
-            log.info("2/9. rates_cbr_fx: актуален, пропускаем.")
-        else:
-            log.info("2/9. Официальные курсы валют ЦБ РФ (USD, CNY, EUR) (с %s по %s)...", from_d, till_date)
-            t0 = time.time()
-            new_df = fetch_cbr_fx_rates(from_d, till_date)
-            if len(new_df) > 0:
-                if p.exists() and args.update:
-                    old_df = pl.read_parquet(p)
-                    full_df = pl.concat([old_df, new_df]).unique(subset=["date", "currency"]).sort(["currency", "date"])
-                else:
-                    full_df = new_df
-                full_df.write_parquet(p, compression="zstd")
-                log.info("  ✓ rates_cbr_fx: %d записей за %.1fс", len(full_df), time.time() - t0)
+        refresh_reference_file(
+            "2/9. Официальные курсы валют ЦБ РФ (USD, CNY, EUR)",
+            REFERENCE_DIR / "rates_cbr_fx.parquet",
+            fetch_cbr_fx_rates,
+            key_col="currency",
+            keys=list(CBR_CURRENCIES),
+            **common,
+        )
 
     # 3. Ставки Китая
     if run_all or "china" in only_set:
-        p = REFERENCE_DIR / "rates_china.parquet"
-        from_d = get_update_start_date(p, args.from_date) if args.update else args.from_date
-        if from_d > till_date:
-            log.info("3/9. rates_china: актуален, пропускаем.")
-        else:
-            log.info("3/9. Ставки Китая (SHIBOR, LPR) (с %s по %s)...", from_d, till_date)
-            t0 = time.time()
-            new_df = fetch_china_rates(from_d, till_date)
-            if len(new_df) > 0:
-                if p.exists() and args.update:
-                    old_df = pl.read_parquet(p)
-                    full_df = pl.concat([old_df, new_df]).unique(subset=["date", "series"]).sort(["series", "date"])
-                else:
-                    full_df = new_df
-                full_df.write_parquet(p, compression="zstd")
-                log.info("  ✓ rates_china: %d записей за %.1fс", len(full_df), time.time() - t0)
+        refresh_reference_file(
+            "3/9. Ставки Китая (SHIBOR, LPR)",
+            REFERENCE_DIR / "rates_china.parquet",
+            fetch_china_rates,
+            key_col="series",
+            keys=CHINA_SERIES,
+            **common,
+        )
 
     # 4. Ставка США SOFR
     if run_all or "usd" in only_set:
-        p = REFERENCE_DIR / "rates_usd.parquet"
-        from_d = get_update_start_date(p, args.from_date) if args.update else args.from_date
-        if from_d > till_date:
-            log.info("4/9. rates_usd: актуален, пропускаем.")
-        else:
-            log.info("4/9. Ставка США SOFR (с %s по %s)...", from_d, till_date)
-            t0 = time.time()
-            new_df = fetch_usd_sofr(from_d, till_date)
-            if len(new_df) > 0:
-                if p.exists() and args.update:
-                    old_df = pl.read_parquet(p)
-                    full_df = pl.concat([old_df, new_df]).unique(subset=["date"]).sort("date")
-                else:
-                    full_df = new_df
-                full_df.write_parquet(p, compression="zstd")
-                log.info("  ✓ rates_usd: %d записей (текущая: %.2f%%) за %.1fс", len(full_df), full_df["rate"][-1], time.time() - t0)
+        refresh_reference_file(
+            "4/9. Ставка США SOFR",
+            REFERENCE_DIR / "rates_usd.parquet",
+            fetch_usd_sofr,
+            **common,
+        )
 
     # 5. Спот валют MOEX
     if run_all or "spot" in only_set:
-        p = REFERENCE_DIR / "spot_currency.parquet"
-        from_d = get_update_start_date(p, args.from_date) if args.update else args.from_date
-        if from_d > till_date:
-            log.info("5/9. spot_currency: актуален, пропускаем.")
-        else:
-            log.info("5/9. Дневной спот валют (CNYRUB_TOM, USD, EUR) (с %s по %s)...", from_d, till_date)
-            t0 = time.time()
-            new_df = fetch_spot_currencies(from_d, till_date)
-            if len(new_df) > 0:
-                if p.exists() and args.update:
-                    old_df = pl.read_parquet(p)
-                    full_df = pl.concat([old_df, new_df]).unique(subset=["date", "secid"]).sort(["secid", "date"])
-                else:
-                    full_df = new_df
-                full_df.write_parquet(p, compression="zstd")
-                log.info("  ✓ spot_currency: %d записей за %.1fс", len(full_df), time.time() - t0)
+        refresh_reference_file(
+            "5/9. Дневной спот валют (CNYRUB_TOM, USD, EUR)",
+            REFERENCE_DIR / "spot_currency.parquet",
+            fetch_spot_currencies,
+            key_col="secid",
+            keys=SPOT_TICKERS,
+            **common,
+        )
 
     # 6. Фондовые индексы
     if run_all or "indices" in only_set:
-        p = REFERENCE_DIR / "indices_daily.parquet"
-        from_d = get_update_start_date(p, args.from_date) if args.update else args.from_date
-        if from_d > till_date:
-            log.info("6/9. indices_daily: актуален, пропускаем.")
-        else:
-            log.info("6/9. Фондовые индексы IMOEX и RTSI (с %s по %s)...", from_d, till_date)
-            t0 = time.time()
-            new_df = fetch_indices(from_d, till_date)
-            if len(new_df) > 0:
-                if p.exists() and args.update:
-                    old_df = pl.read_parquet(p)
-                    full_df = pl.concat([old_df, new_df]).unique(subset=["date", "secid"]).sort(["secid", "date"])
-                else:
-                    full_df = new_df
-                full_df.write_parquet(p, compression="zstd")
-                log.info("  ✓ indices_daily: %d записей за %.1fс", len(full_df), time.time() - t0)
+        refresh_reference_file(
+            "6/9. Фондовые индексы IMOEX и RTSI",
+            REFERENCE_DIR / "indices_daily.parquet",
+            fetch_indices,
+            key_col="secid",
+            keys=list(INDEX_BOARDS),
+            **common,
+        )
 
     # 7. Мировые бенчмарки
     if run_all or "benchmarks" in only_set:
-        p = REFERENCE_DIR / "benchmarks_world.parquet"
-        from_d = get_update_start_date(p, args.from_date) if args.update else args.from_date
-        if from_d > till_date:
-            log.info("7/9. benchmarks_world: актуален, пропускаем.")
-        else:
-            log.info("7/9. Мировые бенчмарки через akshare (с %s по %s)...", from_d, till_date)
-            t0 = time.time()
-            new_df = fetch_world_benchmarks(from_d, till_date)
-            if len(new_df) > 0:
-                if p.exists() and args.update:
-                    old_df = pl.read_parquet(p)
-                    full_df = pl.concat([old_df, new_df]).unique(subset=["date", "asset"]).sort(["asset", "date"])
-                else:
-                    full_df = new_df
-                full_df.write_parquet(p, compression="zstd")
-                log.info("  ✓ benchmarks_world: %d записей за %.1fс", len(full_df), time.time() - t0)
+        refresh_reference_file(
+            "7/9. Мировые бенчмарки через akshare",
+            REFERENCE_DIR / "benchmarks_world.parquet",
+            fetch_world_benchmarks,
+            key_col="asset",
+            keys=list(WORLD_BENCHMARKS),
+            finalize=add_benchmark_returns,
+            **common,
+        )
 
     # 8. Запасы газа EIA
     if run_all or "eia" in only_set:
@@ -1226,8 +1223,8 @@ def main() -> None:
                     if max_d and (date.today() - max_d).days < 7:
                         need_eia = False
                         log.info("8/9. eia_ng_storage: актуален (последний релиз %s), пропускаем.", max_d)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 — не прочитали: просто качаем заново
+                log.warning("eia_ng_storage: не удалось прочитать файл (%s), качаем заново", exc)
 
         if need_eia:
             log.info("8/9. Загрузка еженедельного отчета EIA о запасах газа...")
