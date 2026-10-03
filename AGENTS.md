@@ -29,7 +29,7 @@ raw никогда не переписывается
 - Краткие факты, уроки, успехи, решенные и открытые вопросы фиксировать исключительно в journal.md после подтверждения пользователем.
 - В tariffs/tariffs.md — тарифные сетки комиссий брокера и биржи для расчета себестоимости сделок.
 - Мои текущие тарифы:
-  - ВТБ: Мой онлайн Привилегия: Изумруд (tariffs/moy_online_privilegiya.pdf), есть возможность перейти на №60 - Профессиональный (tariffs/prof.pdf)
+  - ВТБ: Мой онлайн Привилегия: Изумруд (tariffs/moy_online_privilegiya.pdf) - приоритетный, есть возможность перейти на №60 - Профессиональный (tariffs/prof.pdf)
   - Т-Инвестиции: Инвестор (tariffs/invest-tariff-fees.pdf). Есть возможность перейти на Трейдер (tariffs/invest-tariff-trader.pdf.
   - Финам: Долгосрочный портфель (https://broker.finam.ru/landing/tariffs-n1-dolgosrochniy/). Есть возможность перейти на Стратег (https://broker.finam.ru/landing/tariffs-n4-strateg/) или Единый дневной (https://broker.finam.ru/landing/tariffs-n2-day/)
 - В [`info.md`](info.md) пишет только пользователь.
