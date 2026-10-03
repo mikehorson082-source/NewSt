@@ -12,6 +12,7 @@
   9. calendar_events.parquet    — календарь событий: заседания ЦБ, налоговые даты (ЕНП 28 числа), экспирации
  10. Корпоративные реестры      — corp_dividends, corp_splits, corp_listing, ru_working_saturdays
  11. futures_contracts.parquet  — реестр спецификаций фьючерсов FORTS (активные + архивные)
+ 12. margin_rates.parquet       — дневная история минимальных ставок ГО (mr1–mr3) по базовым активам FORTS
 
 Поддержка режимов:
   - Первичная загрузка с глубокой историей (с 2020 года):
@@ -50,6 +51,7 @@ import requests
 from src.core.config import (
     ASSETS,
     ISS_BASE_URL,
+    Cadence,
     MAX_RETRIES,
     REQUEST_DELAY,
     REQUEST_TIMEOUT,
@@ -807,6 +809,78 @@ def fetch_futures_contracts(
     return result_df
 
 
+# -----------------------------------------------------------------------------
+# 12. Ставки обеспечения (ГО) срочного рынка MOEX
+# -----------------------------------------------------------------------------
+def margin_asset_codes() -> list[str]:
+    """Коды базовых активов реестра, для которых нужны ставки ГО (без вечных)."""
+    return sorted({
+        spec.asset_code
+        for spec in ASSETS.values()
+        if spec.cadence != Cadence.PERPETUAL
+    })
+
+
+def fetch_margin_rates(starts: dict[str, str], till_date: str) -> pl.DataFrame:
+    """История минимальных ставок обеспечения (ГО) по базовым активам FORTS.
+
+    ISS rms/limits: на каждый торговый день биржа задаёт три уровня ставки
+    mr1 < mr2 < mr3 — доли от стоимости контракта — и границы объёма позиции
+    lk1, lk2, после которых действует следующий уровень. Для небольшой позиции
+    действует mr1. Фактическое ГО контракта не ниже mr1 × стоимость контракта;
+    бесплатной истории фактического ГО в ISS нет.
+
+    starts — код актива -> дата начала загрузки (у каждого актива своя).
+    При ошибке запроса бросает исключение: частично скачанная история
+    при докачке оставила бы дыры, которые потом не заполнятся.
+    """
+    rows = []
+    for code, from_date in sorted(starts.items()):
+        if from_date > till_date:
+            continue
+        cursor = 0
+        code_rows = 0
+        while True:
+            url = (
+                f"{ISS_BASE_URL}/rms/engines/futures/objects/limits/{code}.json"
+                f"?from={from_date}&till={till_date}&start={cursor}&iss.meta=off"
+            )
+            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            payload = resp.json()
+            block = payload.get("limits", {})
+            cols = block.get("columns", [])
+            data = block.get("data", [])
+            for values in data:
+                r = dict(zip(cols, values))
+                rows.append({
+                    "date": date.fromisoformat(r["tradedate"]),
+                    "asset_code": r["assetcode"],
+                    "mr1": float(r["mr1"]) if r["mr1"] is not None else None,
+                    "mr2": float(r["mr2"]) if r["mr2"] is not None else None,
+                    "mr3": float(r["mr3"]) if r["mr3"] is not None else None,
+                    "lk1": float(r["lk1"]) if r["lk1"] is not None else None,
+                    "lk2": float(r["lk2"]) if r["lk2"] is not None else None,
+                })
+            code_rows += len(data)
+            cursor += len(data)
+            total = payload.get("limits.cursor", {}).get("data", [[0, 0, 0]])[0][1]
+            if not data or cursor >= total:
+                break
+            time.sleep(REQUEST_DELAY)
+        if code_rows == 0:
+            log.warning("  ставки ГО для %s не найдены (с %s по %s)", code, from_date, till_date)
+        time.sleep(REQUEST_DELAY)
+
+    if not rows:
+        return pl.DataFrame()
+    return (
+        pl.DataFrame(rows)
+        .unique(subset=["date", "asset_code"])
+        .sort(["asset_code", "date"])
+    )
+
+
 def sync_corporate_and_calendar_files() -> None:
     """Копирует корпоративные действия и рабочие субботы из ml/data/reference при наличии."""
     files = [
@@ -852,7 +926,7 @@ def main() -> None:
         "--only",
         type=str,
         default="all",
-        help="Фильтр загрузки: all или через запятую (cbr,fx,china,usd,spot,indices,benchmarks,eia,calendar,contracts)",
+        help="Фильтр загрузки: all или через запятую (cbr,fx,china,usd,spot,indices,benchmarks,eia,calendar,contracts,margins)",
     )
     args = parser.parse_args()
 
@@ -1046,6 +1120,39 @@ def main() -> None:
         if len(df_contracts) > 0:
             df_contracts.write_parquet(p, compression="zstd")
             log.info("  ✓ futures_contracts: %d контрактов сохранено в %s за %.1fс", len(df_contracts), p.name, time.time() - t0)
+
+    # 12. Ставки обеспечения (ГО) срочного рынка
+    if run_all or "margins" in only_set:
+        p = REFERENCE_DIR / "margin_rates.parquet"
+        codes = margin_asset_codes()
+        starts = {code: args.from_date for code in codes}
+        old_df = pl.read_parquet(p) if p.exists() and args.update else None
+        if old_df is not None:
+            # Докачка у каждого актива со своей даты: новый рынок реестра
+            # получит всю историю, а не только последние дни.
+            last = old_df.group_by("asset_code").agg(pl.col("date").max())
+            for code, last_date in last.iter_rows():
+                if code in starts:
+                    starts[code] = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+        log.info("12/12. Ставки ГО срочного рынка по %d активам (по %s)...", len(codes), till_date)
+        t0 = time.time()
+        try:
+            new_df = fetch_margin_rates(starts, till_date)
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            log.error("  ✗ margin_rates: ошибка загрузки (%s), файл не изменён", exc)
+        else:
+            if len(new_df) == 0:
+                log.info("  margin_rates: новых дней нет, файл не изменён.")
+            else:
+                full_df = new_df
+                if old_df is not None:
+                    full_df = (
+                        pl.concat([old_df, new_df])
+                        .unique(subset=["date", "asset_code"], keep="last")
+                        .sort(["asset_code", "date"])
+                    )
+                full_df.write_parquet(p, compression="zstd")
+                log.info("  ✓ margin_rates: %d записей за %.1fс", len(full_df), time.time() - t0)
 
     log.info("✅ Обработка справочных данных завершена!")
 
