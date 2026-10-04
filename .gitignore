@@ -21,3 +21,7 @@ data/raw/algopack/
 machine-learning-for-trading/
 hse/
 backtesting-py/
+
+# Фронтенд пульта (app/frontend): зависимости и сборка
+app/frontend/node_modules/
+app/frontend/dist/
