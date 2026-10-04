@@ -21,6 +21,16 @@
       uv run python src/data/download_reference.py
   - Быстрая инкрементальная докачка новых дней:
       uv run python src/data/download_reference.py --update
+
+Надёжность:
+  - Любая ошибка источника — файл справочника не меняется: частичный
+    результат не записывается (без --update он стирал бы целый ряд).
+  - При --update старт берётся по самому отставшему ряду файла (валюта,
+    тикер, актив), а не по последней дате всего файла: ряд, не скачавшийся
+    в прошлый раз, догоняется, а не остаётся с дырой.
+  - В futures_contracts шаг цены истёкших контрактов не угадывается: только
+    значение с биржи, пока контракт торговался, иначе пусто. Контракты из
+    прежнего справочника не выпадают при пересборке.
 """
 from __future__ import annotations
 
@@ -896,7 +906,6 @@ def fetch_margin_rates(starts: dict[str, str], till_date: str) -> pl.DataFrame:
         if from_date > till_date:
             continue
         cursor = 0
-        code_rows = 0
         while True:
             url = (
                 f"{ISS_BASE_URL}/rms/engines/futures/objects/limits/{code}.json"
@@ -919,14 +928,13 @@ def fetch_margin_rates(starts: dict[str, str], till_date: str) -> pl.DataFrame:
                     "lk1": float(r["lk1"]) if r["lk1"] is not None else None,
                     "lk2": float(r["lk2"]) if r["lk2"] is not None else None,
                 })
-            code_rows += len(data)
             cursor += len(data)
             total = payload.get("limits.cursor", {}).get("data", [[0, 0, 0]])[0][1]
             if not data or cursor >= total:
                 break
             time.sleep(REQUEST_DELAY)
-        if code_rows == 0:
-            log.warning("  ставки ГО для %s не найдены (с %s по %s)", code, from_date, till_date)
+        # Пусто бывает и в норме: в выходные новых торговых дней нет.
+        # Об активах, которых нет в файле вовсе, предупреждает main().
         time.sleep(REQUEST_DELAY)
 
     if not rows:
@@ -1280,6 +1288,7 @@ def main() -> None:
             log.error("  ✗ margin_rates: ошибка загрузки (%s), файл не изменён", exc)
         else:
             if len(new_df) == 0:
+                full_df = old_df
                 log.info("  margin_rates: новых дней нет, файл не изменён.")
             else:
                 full_df = new_df
@@ -1291,6 +1300,10 @@ def main() -> None:
                     )
                 full_df.write_parquet(p, compression="zstd")
                 log.info("  ✓ margin_rates: %d записей за %.1fс", len(full_df), time.time() - t0)
+            present = set(full_df["asset_code"].unique()) if full_df is not None else set()
+            missing = sorted(set(codes) - present)
+            if missing:
+                log.warning("  ставок ГО нет совсем для: %s", ", ".join(missing))
 
         # Снимок текущего ГО всегда «на сейчас», --till-date на него не влияет.
         # Снимки копятся: по ним видно, стабилен ли коэффициент ГО к mr1.
