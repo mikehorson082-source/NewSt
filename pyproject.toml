@@ -31,7 +31,8 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "ipykernel>=6.29",
-    "httpx>=0.28",  # клиент для тестов API (fastapi.testclient)
+    # клиент для тестов API (fastapi.testclient)
+    "httpx2>=2.13.1",
 ]
 ml = [
     "lightgbm>=4.3",

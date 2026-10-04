@@ -1,11 +1,10 @@
-"""Инвентарь данных: что лежит в data/, за какие даты и насколько оно свежее.
+"""Чтение data/ для инвентаря: метаданные файлов, свежесть, срезы справочников.
 
 Только читает. У parquet-файлов открывается «оглавление» (метаданные): число
 строк и min/max колонки даты из статистики, сами данные не читаются. Целиком
-читаются только маленькие справочники и колонка даты склеек (для пропусков).
-
-Функции возвращают данные, печатает только main(). Этот же отчёт отдаёт
-веб-пульт (app/api): движок про веб ничего не знает.
+читаются только маленькие справочники, колонка даты склеек (для пропусков)
+и колонки secid/tradedate Algopack (по акциям). Всё кэшируется по времени
+изменения файла: файл не менялся — повторно не читается.
 
 Свежесть. Ожидаемая дата — последний завершённый торговый день до сегодня
 (пн–пт и рабочие субботы из reference/ru_working_saturdays.json). Праздники
@@ -17,31 +16,36 @@
 и праздников биржа приписывает следующему торговому дню, поэтому праздник,
 в который торговалась только часть рынков, пропуском не считается. Пропуск —
 торговый день внутри ряда, в который у рынка нет ни одного бара.
-
-Запуск:
-    uv run python -m data.inventory              # таблица по группам
-    uv run python -m data.inventory --problems   # только то, что требует внимания
-    uv run python -m data.inventory --json       # весь отчёт в JSON
 """
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import json
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
 from zoneinfo import ZoneInfo
 
 import polars as pl
 import pyarrow.parquet as pq
 
-from core.config import DATA_DIR, Paths
-from core.instruments import ASSETS, Cadence
+from core.config import Paths
+
+from .catalog import (
+    ALGOPACK_DATASETS,
+    ALGOPACK_MARKETS,
+    CONTINUOUS_ALL,
+    CONTINUOUS_SERVICE,
+    FUTOI_ALLOWED_LAG,
+    REBUILD_HINT,
+    REFERENCE_FILES,
+    ReferenceSpec,
+    RefLink,
+)
+from .model import SEVERITY, DatasetStatus, Fact, Status
 
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -51,140 +55,6 @@ STALE_AFTER = 5
 
 # Сколько дат пропусков перечислять в заметке.
 GAPS_IN_NOTE = 5
-
-Status = Literal["ok", "lagging", "stale", "unchecked", "missing", "error"]
-
-# Чем выше, тем хуже: так из двух статусов выбирается худший.
-SEVERITY: dict[Status, int] = {
-    "ok": 0,
-    "unchecked": 0,
-    "lagging": 1,
-    "stale": 2,
-    "missing": 3,
-    "error": 3,
-}
-
-
-@dataclass(frozen=True)
-class Fact:
-    """Дополнительный факт о наборе: «Роллов: 53», «Рынков: 24»."""
-
-    label: str
-    value: int | float | str
-
-
-@dataclass(frozen=True)
-class DatasetStatus:
-    """Одна строка инвентаря: файл справочника, папка рынка или ряд."""
-
-    id: str  # стабильный ключ: путь относительно data/
-    group: str
-    title: str  # короткое техническое имя: файл, рынок, тикер
-    description: str  # по-русски, что это
-    path: str  # относительно data/
-    status: Status
-    files: int = 0
-    rows: int | None = None
-    first_date: date | None = None
-    last_date: date | None = None
-    size_bytes: int = 0
-    modified_at: datetime | None = None
-    lag_days: int | None = None  # торговых дней после last_date до ожидаемой даты
-    note: str | None = None  # почему такой статус
-    facts: tuple[Fact, ...] = ()
-
-
-@dataclass(frozen=True)
-class Group:
-    """Группа строк инвентаря: справочники, минутки, склейки…"""
-
-    id: str
-    title: str
-    description: str
-    files_label: str | None = None  # как назвать число файлов в строке; None — не показывать
-
-
-@dataclass(frozen=True)
-class InventoryReport:
-    """Весь инвентарь: группы, строки и сводка по статусам."""
-
-    generated_at: datetime
-    expected_date: date  # последний завершённый торговый день: от него считается отставание
-    data_root: str
-    groups: tuple[Group, ...]
-    datasets: tuple[DatasetStatus, ...]
-    summary: dict[Status, int]  # число строк по статусам
-
-
-GROUPS: tuple[Group, ...] = (
-    Group("reference", "Справочники и макро", "data/reference: ставки ГО, курсы, ставки, календари"),
-    Group("futures_minutes", "Минутные свечи", "data/raw/futures: файл на контракт", "Контрактов"),
-    Group("futures_daily", "Дневные свечи", "data/raw/futures_daily: файл на контракт", "Контрактов"),
-    Group("continuous", "Непрерывные ряды, 15 минут", "data/continuous_15m: склейка по обороту и NAV"),
-    Group("futoi_5min", "Открытый интерес FUTOI, 5 минут", "data/raw/futoi/5min: файл на тикер"),
-    Group("futoi_daily", "Открытый интерес FUTOI, дни", "data/raw/futoi/daily: файл на тикер"),
-    Group("algopack", "Algopack", "data/raw/algopack: архив, свежесть не проверяется", "Файлов"),
-    Group("other", "Прочее", "Папки, которых нет в каталоге инвентаря", "Файлов"),
-)
-
-
-@dataclass(frozen=True)
-class ReferenceSpec:
-    """Как проверять файл справочника."""
-
-    file: str
-    description: str
-    date_column: str | None  # колонка даты; None — без дат
-    allowed_lag: int | None  # допустимое отставание в торговых днях; None — не проверять
-    count_column: str | None = None  # что посчитать уникальным: рынки, валюты…
-    count_label: str | None = None
-
-
-REFERENCE_FILES: tuple[ReferenceSpec, ...] = (
-    ReferenceSpec("margin_rates.parquet", "Минимальные ставки ГО mr1–mr3", "date", 0, "asset_code", "Рынков"),
-    ReferenceSpec(
-        "margin_snapshot.parquet",
-        "Снимки фактического ГО (копятся при обновлении)",
-        "snapshot_date",
-        0,
-        "snapshot_date",
-        "Снимков",
-    ),
-    ReferenceSpec("rates_moex_clearing.parquet", "Курс клиринга MOEX USD/RUB", "date", 0),
-    ReferenceSpec("rates_cbr_fx.parquet", "Официальные курсы ЦБ", "date", 0, "currency", "Валют"),
-    ReferenceSpec("cbr_key_rate.parquet", "Ключевая ставка ЦБ", "date", 0),
-    # SOFR публикуется утром следующего рабочего дня США — день отставания норма.
-    ReferenceSpec("rates_usd.parquet", "Ставка SOFR", "date", 1),
-    # Праздники Китая (Чуньцзе, Золотая неделя) — до 5 торговых дней без публикаций.
-    ReferenceSpec("rates_china.parquet", "Ставки Китая", "date", 5, "series", "Рядов"),
-    ReferenceSpec("spot_currency.parquet", "Спот валют MOEX", "date", 0, "secid", "Инструментов"),
-    ReferenceSpec("indices_daily.parquet", "Индексы MOEX", "date", 0, "secid", "Индексов"),
-    ReferenceSpec("benchmarks_world.parquet", "Мировые бенчмарки", "date", 0, "symbol", "Инструментов"),
-    # Отчёт EIA выходит раз в неделю: неделя отставания норма.
-    ReferenceSpec("eia_ng_storage.parquet", "Запасы газа в США (EIA)", "release_date", 5),
-    ReferenceSpec(
-        "futures_contracts.parquet", "Справочник контрактов", "first_trade_date", None, "asset_code", "Активов"
-    ),
-    ReferenceSpec("calendar_events.parquet", "Календарь событий", "date", None),
-    ReferenceSpec("corp_dividends.parquet", "Дивиденды", "declared_date", None, "ticker", "Тикеров"),
-    ReferenceSpec("corp_listing.parquet", "Листинг акций", None, None, "ticker", "Тикеров"),
-    ReferenceSpec("corp_splits.parquet", "Сплиты акций", "date", None),
-    ReferenceSpec("ru_working_saturdays.json", "Рабочие субботы (торги идут)", None, None),
-)
-
-ALGOPACK_DATASETS = {
-    "tradestats": "сделки",
-    "orderstats": "заявки",
-    "obstats": "стакан",
-}
-ALGOPACK_MARKETS = {"eq": "Акции", "fo": "Фьючерсы", "fx": "Валюта"}
-
-CONTINUOUS_ALL = "continuous_futures_15m.parquet"
-CONTINUOUS_SERVICE = {
-    CONTINUOUS_ALL: ("Все рынки одним файлом", "date"),
-    "daily_contract_selection.parquet": ("Выбранный контракт по дням", "date"),
-}
-REBUILD_HINT = "uv run python src/data/build_continuous_futures.py"
 
 
 # ----------------------------------------------------------------- calendar
@@ -350,6 +220,70 @@ def scan_parquet(files: Sequence[Path], column: str | None) -> Scan:
     )
 
 
+def plain_scan(files: Sequence[Path]) -> Scan:
+    """Сводка по файлам без чтения содержимого: число, размер, время изменения."""
+    stats = [path.stat() for path in files]
+    return Scan(
+        files=len(files),
+        size=sum(stat.st_size for stat in stats),
+        modified=modified_at(max((stat.st_mtime for stat in stats), default=None)),
+    )
+
+
+def csv_scan(path: Path, column: str) -> Scan:
+    stat = path.stat()
+    try:
+        values = pl.read_csv(path, columns=[column], try_parse_dates=True)[column]
+    except Exception as error:  # noqa: BLE001
+        return Scan(files=1, size=stat.st_size, modified=modified_at(stat.st_mtime), errors=(f"{path.name}: {error}",))
+    return Scan(
+        files=1,
+        rows=len(values),
+        first=as_date(values.min()),
+        last=as_date(values.max()),
+        size=stat.st_size,
+        modified=modified_at(stat.st_mtime),
+    )
+
+
+def scan_json_dates(path: Path) -> Scan:
+    """JSON-список дат (рабочие субботы)."""
+    stat = path.stat()
+    days = sorted(date.fromisoformat(day) for day in json.loads(path.read_text()))
+    return Scan(
+        files=1,
+        rows=len(days),
+        first=days[0] if days else None,
+        last=days[-1] if days else None,
+        size=stat.st_size,
+        modified=modified_at(stat.st_mtime),
+    )
+
+
+@lru_cache(maxsize=64)
+def read_frame(path: str, mtime_ns: int, size: int) -> pl.DataFrame:
+    """Файл справочника целиком; mtime_ns и size — ключ кэша."""
+    del mtime_ns, size
+    return pl.read_parquet(path)
+
+
+def frame_of(path: Path) -> pl.DataFrame:
+    stat = path.stat()
+    return read_frame(str(path), stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=4096)
+def file_dates(path: str, column: str, mtime_ns: int, size: int) -> frozenset[date]:
+    """Все даты колонки файла; mtime_ns и size — ключ кэша."""
+    del mtime_ns, size
+    return frozenset(pl.read_parquet(path, columns=[column])[column].unique().drop_nulls().to_list())
+
+
+def dates_of(path: Path, column: str) -> frozenset[date]:
+    stat = path.stat()
+    return file_dates(str(path), column, stat.st_mtime_ns, stat.st_size)
+
+
 def visible_files(folder: Path, pattern: str = "*") -> list[Path]:
     """Файлы папки без скрытых (.DS_Store и т. п.)."""
     return sorted(p for p in folder.glob(pattern) if p.is_file() and not p.name.startswith("."))
@@ -392,7 +326,7 @@ def join_notes(*notes: str | None) -> str | None:
 def make_status(
     ctx: Context,
     *,
-    group: str,
+    kind: str,
     title: str,
     description: str,
     path: Path,
@@ -400,8 +334,12 @@ def make_status(
     allowed_lag: int | None,
     facts: tuple[Fact, ...] = (),
     note: str | None = None,
+    key: str | None = None,
 ) -> DatasetStatus:
-    """Строка инвентаря по сводке файлов и правилу свежести (allowed_lag None — не проверять)."""
+    """Набор по сводке файлов и правилу свежести (allowed_lag None — не проверять).
+
+    key — ключ среза («BR»): id становится «путь#ключ».
+    """
     lag: int | None = None
     if scan.errors:
         status: Status = "error"
@@ -417,12 +355,13 @@ def make_status(
         note = join_notes("в файлах нет дат", note)
     else:
         status, lag = freshness(scan.last, ctx.expected, allowed_lag, ctx.working_saturdays)
+    rel = ctx.rel(path)
     return DatasetStatus(
-        id=ctx.rel(path),
-        group=group,
+        id=f"{rel}#{key}" if key else rel,
+        kind=kind,
         title=title,
         description=description,
-        path=ctx.rel(path),
+        path=rel,
         status=status,
         files=scan.files,
         rows=scan.rows if scan.files else None,
@@ -436,12 +375,12 @@ def make_status(
     )
 
 
-def missing_folder(ctx: Context, group: str, folder: Path, description: str) -> DatasetStatus:
+def missing_folder(ctx: Context, folder: Path) -> DatasetStatus:
     return make_status(
         ctx,
-        group=group,
+        kind="other",
         title=folder.name,
-        description=description,
+        description="Папка из раскладки data/",
         path=folder,
         scan=Scan(),
         allowed_lag=None,
@@ -453,140 +392,140 @@ def missing_folder(ctx: Context, group: str, folder: Path, description: str) -> 
 def reference_facts(path: Path, spec: ReferenceSpec) -> tuple[Fact, ...]:
     if spec.count_column is None or spec.count_label is None:
         return ()
-    values = pl.read_parquet(path, columns=[spec.count_column])[spec.count_column]
+    values = frame_of(path)[spec.count_column]
     return (Fact(spec.count_label, values.n_unique()),)
 
 
-def scan_json_dates(path: Path) -> Scan:
-    """JSON-список дат (рабочие субботы)."""
-    stat = path.stat()
-    days = sorted(date.fromisoformat(day) for day in json.loads(path.read_text()))
-    return Scan(
-        files=1,
-        rows=len(days),
-        first=days[0] if days else None,
-        last=days[-1] if days else None,
-        size=stat.st_size,
-        modified=modified_at(stat.st_mtime),
-    )
-
-
-def scan_reference(ctx: Context) -> list[DatasetStatus]:
-    """Справочники по каталогу REFERENCE_FILES; файлы вне каталога — без проверки."""
-    group = "reference"
+def scan_reference(ctx: Context) -> dict[str, DatasetStatus]:
+    """Файлы справочников целиком: {имя файла: набор}. Файлы вне каталога — без проверки."""
     folder = ctx.paths.reference
     if not folder.is_dir():
-        return [missing_folder(ctx, group, folder, "Справочники")]
-    rows: list[DatasetStatus] = []
-    known = {spec.file for spec in REFERENCE_FILES}
+        return {}
+    rows: dict[str, DatasetStatus] = {}
     for spec in REFERENCE_FILES:
         path = folder / spec.file
-        title = Path(spec.file).stem
-        if not path.is_file():
-            rows.append(
-                make_status(
-                    ctx,
-                    group=group,
-                    title=title,
-                    description=spec.description,
-                    path=path,
-                    scan=Scan(),
-                    allowed_lag=spec.allowed_lag,
-                    note="нет файла",
-                )
-            )
-            continue
         facts: tuple[Fact, ...] = ()
-        if path.suffix == ".json":
+        if not path.is_file():
+            scan = Scan()
+        elif path.suffix == ".json":
             scan = scan_json_dates(path)
         else:
             scan = scan_parquet([path], spec.date_column)
             if not scan.errors:
                 facts = reference_facts(path, spec)
-        rows.append(
-            make_status(
-                ctx,
-                group=group,
-                title=title,
-                description=spec.description,
-                path=path,
-                scan=scan,
-                allowed_lag=spec.allowed_lag,
-                facts=facts,
-            )
+        rows[spec.file] = make_status(
+            ctx,
+            kind="reference",
+            title=path.stem,
+            description=spec.description,
+            path=path,
+            scan=scan,
+            allowed_lag=spec.allowed_lag,
+            facts=facts,
+            note=None if path.is_file() else "нет файла",
         )
     for path in visible_files(folder):
-        if path.name in known:
+        if path.name in rows:
             continue
         scan = scan_parquet([path], None) if path.suffix == ".parquet" else plain_scan([path])
-        rows.append(
-            make_status(
-                ctx,
-                group=group,
-                title=path.stem,
-                description="Нет в каталоге инвентаря",
-                path=path,
-                scan=scan,
-                allowed_lag=None,
-            )
+        rows[path.name] = make_status(
+            ctx,
+            kind="reference",
+            title=path.stem,
+            description="Нет в каталоге инвентаря",
+            path=path,
+            scan=scan,
+            allowed_lag=None,
         )
     return rows
 
 
-# ----------------------------------------------------------------- futures
-def market_name(name: str) -> str:
-    """Название рынка из реестра core/instruments.py."""
-    spec = ASSETS.get(name)
-    return spec.short_name if spec else name
-
-
-def scan_contract_dirs(ctx: Context, group: str, folder: Path, column: str) -> list[DatasetStatus]:
-    """Папка на рынок, файл на контракт: минутные и дневные свечи."""
-    if not folder.is_dir():
-        return [missing_folder(ctx, group, folder, "Папка рынков")]
-    return [
-        make_status(
+def reference_slice(ctx: Context, spec: ReferenceSpec, link: RefLink) -> DatasetStatus | None:
+    """Срез справочника по ключу (asset_code == "BR"). Пустой срез — None."""
+    path = ctx.paths.reference / spec.file
+    key = str(link.value)
+    try:
+        part = frame_of(path).filter(pl.col(str(link.column)) == link.value)
+    except Exception as error:  # noqa: BLE001 — сбой чтения показываем в строке инструмента
+        scan = Scan(files=1, errors=(f"{path.name}: {error}",))
+        return make_status(
             ctx,
-            group=group,
-            title=market.name,
-            description=market_name(market.name),
-            path=market,
-            scan=scan_parquet(visible_files(market, "*.parquet"), column),
-            allowed_lag=0,
-        )
-        for market in visible_dirs(folder)
-    ]
-
-
-def futoi_names() -> dict[str, str]:
-    """Тикер FUTOI → название рынка: по префиксу контрактов и тикерам вечных фьючерсов."""
-    names: dict[str, str] = {}
-    for spec in ASSETS.values():
-        if spec.cadence == Cadence.PERPETUAL:
-            names.update({ticker: f"Вечный фьючерс {ticker}" for ticker in spec.fixed_tickers})
-            continue
-        for prefix in (spec.ticker_prefix, *spec.extra_prefixes):
-            names.setdefault(prefix, spec.short_name)
-    return names
-
-
-def scan_futoi(ctx: Context, group: str, folder: Path) -> list[DatasetStatus]:
-    """Файл на тикер: FUTOI 5 минут и по дням."""
-    if not folder.is_dir():
-        return [missing_folder(ctx, group, folder, "FUTOI")]
-    names = futoi_names()
-    return [
-        make_status(
-            ctx,
-            group=group,
+            kind="reference",
             title=path.stem,
-            description=names.get(path.stem, path.stem),
+            description=spec.description,
+            path=path,
+            scan=scan,
+            allowed_lag=spec.allowed_lag,
+            key=key,
+        )
+    if part.is_empty():
+        return None
+    first = last = None
+    if spec.date_column is not None:
+        first, last = as_date(part[spec.date_column].min()), as_date(part[spec.date_column].max())
+    facts: tuple[Fact, ...] = ()
+    if link.fact_column is not None and link.fact_label is not None:
+        facts = (Fact(link.fact_label, part[link.fact_column].n_unique()),)
+    scan = Scan(files=1, rows=part.height, first=first, last=last, modified=modified_at(path.stat().st_mtime))
+    return make_status(
+        ctx,
+        kind="reference",
+        title=path.stem,
+        description=f"{spec.description} · {key}",
+        path=path,
+        scan=scan,
+        allowed_lag=spec.allowed_lag,
+        facts=facts,
+        key=key,
+    )
+
+
+def column_values(path: Path, column: str) -> set[str]:
+    """Уникальные значения колонки справочника; нет файла — пустое множество."""
+    if not path.is_file():
+        return set()
+    with contextlib.suppress(Exception):
+        return set(frame_of(path)[column].drop_nulls().unique().to_list())
+    return set()
+
+
+# ----------------------------------------------------------------- futures
+def scan_contract_dirs(ctx: Context, kind: str, folder: Path, column: str, title: str) -> dict[str, DatasetStatus]:
+    """Папка на рынок, файл на контракт: {рынок: набор}. Минутные и дневные свечи."""
+    if not folder.is_dir():
+        return {}
+    rows = {}
+    for market in visible_dirs(folder):
+        scan = scan_parquet(visible_files(market, "*.parquet"), column)
+        rows[market.name] = make_status(
+            ctx,
+            kind=kind,
+            title=title,
+            description="файл на контракт",
+            path=market,
+            scan=scan,
+            allowed_lag=0,
+            facts=(Fact("Контрактов", scan.files),),
+        )
+    return rows
+
+
+def scan_futoi(ctx: Context, kind: str, folder: Path, title: str) -> dict[str, DatasetStatus]:
+    """Файл на тикер: {тикер: набор}. Задержка бесплатного API — норма."""
+    if not folder.is_dir():
+        return {}
+    return {
+        path.stem: make_status(
+            ctx,
+            kind=kind,
+            title=title,
+            description=f"тикер {path.stem} · задержка бесплатного API — 2 недели",
             path=path,
             scan=scan_parquet([path], "tradedate"),
-            allowed_lag=0,
+            allowed_lag=FUTOI_ALLOWED_LAG,
         )
         for path in visible_files(folder, "*.parquet")
-    ]
+    }
 
 
 # -------------------------------------------------------------- continuous
@@ -608,22 +547,10 @@ def roll_stats(path: Path) -> dict[str, RollStats]:
     return {row["asset"]: RollStats(row["rolls"], row["stale"]) for row in frame.iter_rows(named=True)}
 
 
-@lru_cache(maxsize=4096)
-def file_dates(path: str, column: str, mtime_ns: int, size: int) -> frozenset[date]:
-    """Все даты колонки файла; mtime_ns и size — ключ кэша."""
-    del mtime_ns, size
-    return frozenset(pl.read_parquet(path, columns=[column])[column].unique().drop_nulls().to_list())
-
-
-def dates_of(path: Path, column: str) -> frozenset[date]:
-    stat = path.stat()
-    return file_dates(str(path), column, stat.st_mtime_ns, stat.st_size)
-
-
 def official_trading_days(daily_root: Path) -> frozenset[date]:
     """Торговые дни биржи: даты TRADEDATE дневных свечей всех рынков.
 
-    Нечитаемый файл пропускается: его ошибку покажет строка дневных свечей.
+    Нечитаемый файл пропускается: его ошибку покажет набор дневных свечей.
     """
     days: set[date] = set()
     if daily_root.is_dir():
@@ -635,28 +562,24 @@ def official_trading_days(daily_root: Path) -> frozenset[date]:
 
 def scan_continuous(
     ctx: Context, raw_last: dict[str, date | None], trading_days: frozenset[date]
-) -> list[DatasetStatus]:
-    """Склейки по рынкам: свежесть, пропуски, роллы и отставание от минуток в raw."""
-    group = "continuous"
+) -> tuple[dict[str, DatasetStatus], list[DatasetStatus]]:
+    """Склейки: ({рынок: набор}, общие файлы). Свежесть, пропуски, роллы, отставание от минуток."""
     folder = ctx.data_root / "continuous_15m"
     if not folder.is_dir():
-        return [missing_folder(ctx, group, folder, "Склейки")]
+        return {}, []
     rolls = roll_stats(folder / "roll_schedule.csv")
-    market_files = [p for p in visible_files(folder, "*_15m.parquet") if p.name != CONTINUOUS_ALL]
-
-    days_by_market: dict[str, frozenset[date]] = {}
-    for path in market_files:
-        try:
-            days_by_market[path.name] = dates_of(path, "date")
-        except Exception:  # noqa: BLE001 — ошибку покажет scan_parquet в строке рынка
-            days_by_market[path.name] = frozenset()
     calendar = sorted(trading_days)
 
-    rows: list[DatasetStatus] = []
-    for path in market_files:
+    markets: dict[str, DatasetStatus] = {}
+    for path in visible_files(folder, "*_15m.parquet"):
+        if path.name == CONTINUOUS_ALL:
+            continue
         market = path.name.removesuffix("_15m.parquet")
         scan = scan_parquet([path], "date")
-        days = days_by_market[path.name]
+        try:
+            days = dates_of(path, "date")
+        except Exception:  # noqa: BLE001 — ошибку уже показывает scan
+            days = frozenset()
         facts: list[Fact] = [Fact("Дней с данными", len(days))]
         notes: list[str] = []
         if scan.first is not None and scan.last is not None:
@@ -670,9 +593,9 @@ def scan_continuous(
             facts.append(Fact("Поправок по устаревшей минуте", rolls[market].stale_adjustments))
         row = make_status(
             ctx,
-            group=group,
-            title=market,
-            description=market_name(market),
+            kind="continuous",
+            title="Склейка, 15 минут",
+            description="по обороту, с NAV",
             path=path,
             scan=scan,
             allowed_lag=0,
@@ -692,28 +615,28 @@ def scan_continuous(
                         row.note,
                     ),
                 )
-        rows.append(row)
+        markets[market] = row
 
+    common: list[DatasetStatus] = []
     for name, (description, column) in CONTINUOUS_SERVICE.items():
         path = folder / name
-        scan = scan_parquet([path], column) if path.is_file() else Scan()
-        rows.append(
+        common.append(
             make_status(
                 ctx,
-                group=group,
+                kind="continuous",
                 title=path.stem,
                 description=description,
                 path=path,
-                scan=scan,
+                scan=scan_parquet([path], column) if path.is_file() else Scan(),
                 allowed_lag=0,
                 note=None if path.is_file() else "нет файла",
             )
         )
     schedule = folder / "roll_schedule.csv"
-    rows.append(
+    common.append(
         make_status(
             ctx,
-            group=group,
+            kind="continuous",
             title=schedule.stem,
             description="Расписание переходов между контрактами",
             path=schedule,
@@ -723,62 +646,92 @@ def scan_continuous(
             note=None if schedule.is_file() else "нет файла",
         )
     )
-    return rows
-
-
-def csv_scan(path: Path, column: str) -> Scan:
-    stat = path.stat()
-    try:
-        values = pl.read_csv(path, columns=[column], try_parse_dates=True)[column]
-    except Exception as error:  # noqa: BLE001
-        return Scan(files=1, size=stat.st_size, modified=modified_at(stat.st_mtime), errors=(f"{path.name}: {error}",))
-    return Scan(
-        files=1,
-        rows=len(values),
-        first=as_date(values.min()),
-        last=as_date(values.max()),
-        size=stat.st_size,
-        modified=modified_at(stat.st_mtime),
-    )
+    return markets, common
 
 
 # ---------------------------------------------------------------- algopack
 def scan_algopack(ctx: Context) -> list[DatasetStatus]:
-    """Algopack: папка на рынок и набор, файл на год. Архив — свежесть не проверяется."""
-    group = "algopack"
+    """Algopack целиком: папка на рынок и набор, файл на год. Архив — свежесть не проверяется."""
     folder = ctx.paths.raw / "algopack"
     if not folder.is_dir():
-        return [missing_folder(ctx, group, folder, "Algopack")]
+        return []
     rows = []
     for market in visible_dirs(folder):
         for dataset in visible_dirs(market):
             label = ALGOPACK_DATASETS.get(dataset.name, dataset.name)
+            scan = scan_parquet(visible_files(dataset, "*.parquet"), "tradedate")
             rows.append(
                 make_status(
                     ctx,
-                    group=group,
+                    kind="algopack",
                     title=f"{market.name}/{dataset.name}",
                     description=f"{ALGOPACK_MARKETS.get(market.name, market.name)}: {label}",
                     path=dataset,
-                    scan=scan_parquet(visible_files(dataset, "*.parquet"), "tradedate"),
+                    scan=scan,
                     allowed_lag=None,
+                    facts=(Fact("Файлов", scan.files),),
                 )
             )
     return rows
 
 
+@lru_cache(maxsize=256)
+def secid_ranges(path: str, mtime_ns: int, size: int) -> dict[str, tuple[date, date, int]]:
+    """Файл Algopack по бумагам: {secid: (первая дата, последняя, строк)}; mtime_ns и size — ключ кэша."""
+    del mtime_ns, size
+    frame = (
+        pl.scan_parquet(path)
+        .filter(pl.col("secid").is_not_null())
+        .group_by("secid")
+        .agg(pl.col("tradedate").min().alias("lo"), pl.col("tradedate").max().alias("hi"), pl.len().alias("n"))
+        .collect()
+    )
+    return {row["secid"]: (row["lo"], row["hi"], row["n"]) for row in frame.iter_rows(named=True)}
+
+
+def file_secid_ranges(path: Path) -> dict[str, tuple[date, date, int]]:
+    """Нечитаемый файл даёт пустой результат: его ошибку покажет набор Algopack целиком."""
+    stat = path.stat()
+    with contextlib.suppress(Exception):
+        return secid_ranges(str(path), stat.st_mtime_ns, stat.st_size)
+    return {}
+
+
+def algopack_by_secid(dataset: Path) -> dict[str, Scan]:
+    """Набор Algopack (папка с файлами по годам) по бумагам: {secid: сводка}."""
+    merged: dict[str, Scan] = {}
+    files = visible_files(dataset, "*.parquet")
+    modified = modified_at(max((path.stat().st_mtime for path in files), default=None))
+    for path in files:
+        for secid, (lo, hi, n) in file_secid_ranges(path).items():
+            old = merged.get(secid)
+            merged[secid] = Scan(
+                files=(old.files if old else 0) + 1,
+                rows=(old.rows if old else 0) + n,
+                first=min(lo, old.first) if old and old.first else lo,
+                last=max(hi, old.last) if old and old.last else hi,
+                modified=modified,
+            )
+    return merged
+
+
+def algopack_slice(ctx: Context, dataset: Path, secid: str, scan: Scan) -> DatasetStatus:
+    label = ALGOPACK_DATASETS.get(dataset.name, dataset.name)
+    return make_status(
+        ctx,
+        kind="algopack",
+        title=f"Algopack: {label}",
+        description=f"{dataset.name} · {secid} · архив",
+        path=dataset,
+        scan=scan,
+        allowed_lag=None,
+        key=secid,
+    )
+
+
 # ------------------------------------------------------------------- other
 KNOWN_TOP = {"raw", "continuous_15m", "reference"}
 KNOWN_RAW = {"futures", "futures_daily", "futoi", "algopack"}
-
-
-def plain_scan(files: Sequence[Path]) -> Scan:
-    stats = [path.stat() for path in files]
-    return Scan(
-        files=len(files),
-        size=sum(stat.st_size for stat in stats),
-        modified=modified_at(max((stat.st_mtime for stat in stats), default=None)),
-    )
 
 
 def scan_other(ctx: Context) -> list[DatasetStatus]:
@@ -794,143 +747,13 @@ def scan_other(ctx: Context) -> list[DatasetStatus]:
         rows.append(
             make_status(
                 ctx,
-                group="other",
+                kind="other",
                 title=folder.name,
                 description="Нет в каталоге инвентаря",
                 path=folder,
                 scan=plain_scan(files),
                 allowed_lag=None,
+                facts=(Fact("Файлов", len(files)),),
             )
         )
     return rows
-
-
-# ------------------------------------------------------------------- report
-def build_inventory(data_root: Path = DATA_DIR, today: date | None = None) -> InventoryReport:
-    """Инвентарь data/: группы, строки и сводка по статусам. Ничего не пишет."""
-    data_root = data_root.resolve()
-    now = datetime.now(MSK).replace(microsecond=0)
-    working_saturdays = load_working_saturdays(Paths(root=data_root).reference)
-    ctx = Context(
-        data_root=data_root,
-        expected=expected_last_date(today or now.date(), working_saturdays),
-        working_saturdays=working_saturdays,
-    )
-    paths = ctx.paths
-    minutes = scan_contract_dirs(ctx, "futures_minutes", paths.raw_futures_min, "timestamp")
-    datasets = [
-        *scan_reference(ctx),
-        *minutes,
-        *scan_contract_dirs(ctx, "futures_daily", paths.raw_futures_daily, "TRADEDATE"),
-        *scan_continuous(
-            ctx,
-            {row.title: row.last_date for row in minutes},
-            official_trading_days(paths.raw_futures_daily),
-        ),
-        *scan_futoi(ctx, "futoi_5min", paths.raw_futoi_5min),
-        *scan_futoi(ctx, "futoi_daily", paths.raw_futoi_daily),
-        *scan_algopack(ctx),
-        *scan_other(ctx),
-    ]
-    used = {row.group for row in datasets}
-    summary = {status: 0 for status in SEVERITY}
-    for row in datasets:
-        summary[row.status] += 1
-    return InventoryReport(
-        generated_at=now,
-        expected_date=ctx.expected,
-        data_root=str(data_root),
-        groups=tuple(group for group in GROUPS if group.id in used),
-        datasets=tuple(datasets),
-        summary=summary,
-    )
-
-
-# ---------------------------------------------------------------------- CLI
-STATUS_TEXT = {
-    "ok": "ok",
-    "lagging": "ОТСТАЁТ",
-    "stale": "УСТАРЕЛ",
-    "unchecked": "·",
-    "missing": "НЕТ",
-    "error": "ОШИБКА",
-}
-
-
-def human_size(size: int) -> str:
-    value = float(size)
-    for unit in ("Б", "КБ", "МБ", "ГБ"):
-        if value < 1024 or unit == "ГБ":
-            return f"{value:.0f} {unit}" if unit == "Б" else f"{value:.1f} {unit}"
-        value /= 1024
-    raise AssertionError("unreachable")
-
-
-def number(value: int | None) -> str:
-    return "" if value is None else f"{value:,}".replace(",", " ")
-
-
-def format_table(rows: list[list[str]]) -> list[str]:
-    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
-    return ["  " + "  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)).rstrip() for row in rows]
-
-
-WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
-
-
-def facts_text(row: DatasetStatus, files_label: str | None) -> str:
-    facts = [(files_label, row.files)] if files_label else []
-    facts += [(fact.label, fact.value) for fact in row.facts]
-    return " · ".join(
-        f"{label.lower()} {number(value) if isinstance(value, int) else value}" for label, value in facts
-    )
-
-
-def print_report(report: InventoryReport, problems_only: bool = False) -> None:
-    expected = report.expected_date
-    print(f"Инвентарь {report.data_root}")
-    print(
-        f"Ожидаемая дата: {WEEKDAYS[expected.weekday()]} {expected:%d.%m.%Y}"
-        f" · проверено {report.generated_at:%d.%m.%Y %H:%M}"
-    )
-    for group in report.groups:
-        rows = [row for row in report.datasets if row.group == group.id]
-        if problems_only:
-            rows = [row for row in rows if SEVERITY[row.status] > 0]
-        if not rows:
-            continue
-        print(f"\n{group.title} — {group.description}")
-        table = [["статус", "набор", "с", "по", "отстаёт", "строк", "размер", "факты", "заметка"]]
-        for row in rows:
-            table.append(
-                [
-                    STATUS_TEXT[row.status],
-                    row.title,
-                    row.first_date.isoformat() if row.first_date else "",
-                    row.last_date.isoformat() if row.last_date else "",
-                    "" if row.lag_days is None else str(row.lag_days),
-                    number(row.rows),
-                    human_size(row.size_bytes),
-                    facts_text(row, group.files_label),
-                    row.note or "",
-                ]
-            )
-        print("\n".join(format_table(table)))
-    counts = ", ".join(f"{STATUS_TEXT[status]}: {count}" for status, count in report.summary.items() if count)
-    print(f"\nИтого строк: {len(report.datasets)} ({counts})")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Инвентарь data/: что лежит, за какие даты и насколько свежее")
-    parser.add_argument("--problems", action="store_true", help="показать только то, что требует внимания")
-    parser.add_argument("--json", action="store_true", help="вывести весь отчёт в JSON")
-    args = parser.parse_args()
-    report = build_inventory()
-    if args.json:
-        print(json.dumps(asdict(report), ensure_ascii=False, indent=2, default=str))
-        return
-    print_report(report, problems_only=args.problems)
-
-
-if __name__ == "__main__":
-    main()

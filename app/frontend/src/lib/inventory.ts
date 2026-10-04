@@ -1,4 +1,4 @@
-import type { DatasetStatus, Group, InventoryReport } from '../api/schema'
+import type { DatasetStatus, Instrument, InventoryReport, Section } from '../api/schema'
 import { DAY_MS, parseDate } from './format'
 import type { Status } from './status'
 
@@ -7,27 +7,43 @@ export interface Filter {
   query: string
 }
 
-export interface GroupView {
-  group: Group
+export interface InstrumentView {
+  instrument: Instrument
   rows: DatasetStatus[]
 }
 
-/** Подходит ли строка под фильтр: статус и поиск по имени, описанию и пути. */
-export function matches(row: DatasetStatus, filter: Filter): boolean {
-  if (filter.status !== null && row.status !== filter.status) return false
-  const query = filter.query.trim().toLowerCase()
-  if (!query) return true
-  return [row.title, row.description, row.path].some((text) => text.toLowerCase().includes(query))
+export interface SectionView {
+  section: Section
+  instruments: InstrumentView[]
 }
 
-/** Группы в порядке отчёта со строками под фильтр; группы без строк не показываются. */
-export function groupRows(report: InventoryReport, filter: Filter): GroupView[] {
-  return report.groups
-    .map((group) => ({
-      group,
-      rows: report.datasets.filter((row) => row.group === group.id && matches(row, filter)),
+function includes(texts: string[], query: string): boolean {
+  return texts.some((text) => text.toLowerCase().includes(query))
+}
+
+/**
+ * Разделы и инструменты под фильтр.
+ * Поиск: совпало название инструмента («нефть», «SBER») — видны все его наборы,
+ * иначе — только наборы, в которых нашлось слово. Статус фильтрует наборы.
+ * Инструменты и разделы без наборов скрываются.
+ */
+export function filterTree(report: InventoryReport, filter: Filter): SectionView[] {
+  const index = new Map(report.datasets.map((row) => [row.id, row]))
+  const query = filter.query.trim().toLowerCase()
+  return report.sections
+    .map((section) => ({
+      section,
+      instruments: section.instruments.flatMap((instrument) => {
+        const byName = query === '' || includes([instrument.title, instrument.subtitle], query)
+        const rows = instrument.datasets
+          .map((id) => index.get(id))
+          .filter((row): row is DatasetStatus => row !== undefined)
+          .filter((row) => filter.status === null || row.status === filter.status)
+          .filter((row) => byName || includes([row.title, row.description, row.path], query))
+        return rows.length > 0 ? [{ instrument, rows }] : []
+      }),
     }))
-    .filter((view) => view.rows.length > 0)
+    .filter((view) => view.instruments.length > 0)
 }
 
 export function countByStatus(rows: DatasetStatus[]): Record<Status, number> {
@@ -42,7 +58,7 @@ export interface Axis {
   years: { year: number; offset: number }[] // 1 января каждого года внутри оси, % ширины
 }
 
-/** Общая ось времени группы: от самой ранней даты до последней (не раньше ожидаемой даты). */
+/** Общая ось времени инструмента: от самой ранней даты до последней (не раньше ожидаемой даты). */
 export function timeAxis(rows: DatasetStatus[], expectedDate: string): Axis | null {
   const firsts: number[] = []
   const lasts: number[] = []

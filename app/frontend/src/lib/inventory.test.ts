@@ -1,13 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import type { DatasetStatus, InventoryReport } from '../api/schema'
-import { countByStatus, coverage, expectedOffset, groupRows, matches, timeAxis, yearLabelStep } from './inventory'
+import { countByStatus, coverage, expectedOffset, filterTree, timeAxis, yearLabelStep } from './inventory'
 
 function row(overrides: Partial<DatasetStatus>): DatasetStatus {
   return {
     id: 'raw/futures/brent',
-    group: 'futures_minutes',
-    title: 'brent',
-    description: 'Нефть Brent',
+    kind: 'futures_minutes',
+    title: 'Минутные свечи',
+    description: 'файл на контракт',
     path: 'raw/futures/brent',
     status: 'ok',
     files: 1,
@@ -24,44 +24,73 @@ function row(overrides: Partial<DatasetStatus>): DatasetStatus {
 }
 
 const brent = row({})
-const gold = row({ id: 'raw/futures/gold', title: 'gold', description: 'Золото', path: 'raw/futures/gold', status: 'stale' })
-const margins = row({
-  id: 'reference/margin_rates.parquet',
-  group: 'reference',
-  title: 'margin_rates',
-  description: 'Минимальные ставки ГО',
-  path: 'reference/margin_rates.parquet',
+const gold = row({ id: 'raw/futures/gold', path: 'raw/futures/gold', status: 'stale' })
+const clearing = row({
+  id: 'reference/rates_moex_clearing.parquet',
+  kind: 'reference',
+  title: 'rates_moex_clearing',
+  description: 'Курс клиринга MOEX USD/RUB',
+  path: 'reference/rates_moex_clearing.parquet',
 })
 
 const report: InventoryReport = {
   generated_at: '2026-01-05T10:00:00+03:00',
   expected_date: '2025-12-31',
   data_root: '/data',
-  groups: [
-    { id: 'reference', title: 'Справочники', description: '', files_label: null },
-    { id: 'futures_minutes', title: 'Минутные свечи', description: '', files_label: 'Контрактов' },
-    { id: 'algopack', title: 'Algopack', description: '', files_label: 'Файлов' },
+  sections: [
+    {
+      id: 'futures',
+      title: 'Фьючерсы',
+      description: '',
+      instruments: [
+        { id: 'futures/brent', title: 'Нефть Brent', subtitle: 'brent · BR · сырьё', datasets: [brent.id, clearing.id] },
+        { id: 'futures/gold', title: 'Золото', subtitle: 'gold · GOLD · сырьё', datasets: [gold.id, clearing.id] },
+      ],
+    },
+    {
+      id: 'common',
+      title: 'Общее',
+      description: '',
+      instruments: [{ id: 'common/reference', title: 'Справочники', subtitle: '', datasets: [clearing.id] }],
+    },
   ],
-  datasets: [margins, brent, gold],
+  datasets: [brent, gold, clearing],
   summary: { ok: 2, lagging: 0, stale: 1, unchecked: 0, missing: 0, error: 0 },
 }
 
-describe('фильтр', () => {
-  it('ищет по имени, описанию и пути без учёта регистра', () => {
-    expect(matches(gold, { status: null, query: 'золото' })).toBe(true)
-    expect(matches(gold, { status: null, query: 'FUTURES/GOLD' })).toBe(true)
-    expect(matches(gold, { status: null, query: 'brent' })).toBe(false)
-    expect(matches(gold, { status: 'ok', query: '' })).toBe(false)
+const titles = (filter: { status: DatasetStatus['status'] | null; query: string }) =>
+  filterTree(report, filter).map((view) => [
+    view.section.id,
+    view.instruments.map((item) => `${item.instrument.title}: ${item.rows.map((r) => r.title).join(', ')}`),
+  ])
+
+describe('фильтр по инструментам', () => {
+  it('без фильтра — все разделы и общий набор у каждого инструмента', () => {
+    expect(titles({ status: null, query: '' })).toEqual([
+      ['futures', ['Нефть Brent: Минутные свечи, rates_moex_clearing', 'Золото: Минутные свечи, rates_moex_clearing']],
+      ['common', ['Справочники: rates_moex_clearing']],
+    ])
   })
 
-  it('группы идут в порядке отчёта, пустые скрываются', () => {
-    const all = groupRows(report, { status: null, query: '' })
-    expect(all.map((view) => view.group.id)).toEqual(['reference', 'futures_minutes'])
-    const stale = groupRows(report, { status: 'stale', query: '' })
-    expect(stale.map((view) => view.rows.map((item) => item.title))).toEqual([['gold']])
+  it('совпало название инструмента — видны все его наборы', () => {
+    expect(titles({ status: null, query: 'нефть' })).toEqual([
+      ['futures', ['Нефть Brent: Минутные свечи, rates_moex_clearing']],
+    ])
+    expect(titles({ status: null, query: 'GOLD' })).toEqual([['futures', ['Золото: Минутные свечи, rates_moex_clearing']]])
   })
 
-  it('считает строки по статусам', () => {
+  it('иначе ищется по наборам: остаются только совпавшие', () => {
+    expect(titles({ status: null, query: 'клиринг' })).toEqual([
+      ['futures', ['Нефть Brent: rates_moex_clearing', 'Золото: rates_moex_clearing']],
+      ['common', ['Справочники: rates_moex_clearing']],
+    ])
+  })
+
+  it('статус скрывает инструменты и разделы без таких наборов', () => {
+    expect(titles({ status: 'stale', query: '' })).toEqual([['futures', ['Золото: Минутные свечи']]])
+  })
+
+  it('считает наборы по статусам', () => {
     expect(countByStatus(report.datasets)).toEqual({ ok: 2, lagging: 0, stale: 1, unchecked: 0, missing: 0, error: 0 })
   })
 })

@@ -1,10 +1,10 @@
 // Сгенерировано из схемы OpenAPI (app/api/contract.py). Руками не править:
 // uv run python -m app.api.contract  (или npm run gen:api в app/frontend)
 
-/** Одна строка инвентаря: файл справочника, папка рынка или ряд. */
+/** Набор данных: папка контрактов, файл, срез справочника по инструменту. */
 export interface DatasetStatus {
   id: string;
-  group: string;
+  kind: string;
   title: string;
   description: string;
   path: string;
@@ -20,28 +20,36 @@ export interface DatasetStatus {
   facts: Fact[];
 }
 
-/** Дополнительный факт о наборе: «Роллов: 53», «Рынков: 24». */
+/** Дополнительный факт о наборе: «Роллов: 53», «Контрактов: 77». */
 export interface Fact {
   label: string;
   value: number | string;
 }
 
-/** Группа строк инвентаря: справочники, минутки, склейки… */
-export interface Group {
+/** Инструмент (нефть, Сбербанк) или тематическая группа раздела «Общее». */
+export interface Instrument {
   id: string;
   title: string;
-  description: string;
-  files_label: string | null;
+  subtitle: string;
+  datasets: string[];
 }
 
-/** Весь инвентарь: группы, строки и сводка по статусам. */
+/** Весь инвентарь: разделы с инструментами, наборы и сводка по статусам. */
 export interface InventoryReport {
   generated_at: string;
   expected_date: string;
   data_root: string;
-  groups: Group[];
+  sections: Section[];
   datasets: DatasetStatus[];
   summary: Record<"ok" | "lagging" | "stale" | "unchecked" | "missing" | "error", number>;
+}
+
+/** Верхний уровень: Фьючерсы, Акции, Общее. */
+export interface Section {
+  id: string;
+  title: string;
+  description: string;
+  instruments: Instrument[];
 }
 
 /** GET-пути API и тип ответа: apiGet('/api/data/status') вернёт InventoryReport. */

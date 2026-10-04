@@ -1,5 +1,5 @@
 import type { DatasetStatus } from '../api/schema'
-import { formatBytes, formatCount, formatDate, formatDateTime, formatNumber, plural } from '../lib/format'
+import { formatBytes, formatCountNoun, formatDate, formatDateTime, formatNumber } from '../lib/format'
 import type { Axis } from '../lib/inventory'
 import { CoverageBar } from './Coverage'
 import StatusBadge from './StatusBadge'
@@ -8,11 +8,10 @@ interface Props {
   row: DatasetStatus
   axis: Axis | null
   expectedDate: string
-  filesLabel: string | null
 }
 
-/** Строка инвентаря: на телефоне — карточка, на широком экране — строка таблицы. */
-export default function DatasetRow({ row, axis, expectedDate, filesLabel }: Props) {
+/** Набор данных инструмента: на телефоне — карточка, на широком экране — строка таблицы. */
+export default function DatasetRow({ row, axis, expectedDate }: Props) {
   return (
     <li className={row.note ? 'row row--note' : 'row'}>
       <div className="row__title">
@@ -35,17 +34,8 @@ export default function DatasetRow({ row, axis, expectedDate, filesLabel }: Prop
             {formatDate(row.first_date)} → {formatDate(row.last_date)}
           </span>
         )}
-        {row.rows !== null && (
-          <span>
-            {formatCount(row.rows)} {plural(row.rows, ['строка', 'строки', 'строк'])}
-          </span>
-        )}
-        <span>{formatBytes(row.size_bytes)}</span>
-        {filesLabel && (
-          <span>
-            {filesLabel}: {formatNumber(row.files)}
-          </span>
-        )}
+        {row.rows !== null && <span>{formatCountNoun(row.rows, ['строка', 'строки', 'строк'])}</span>}
+        {row.size_bytes > 0 && <span>{formatBytes(row.size_bytes)}</span>}
         {row.facts.map((fact) => (
           <span key={fact.label}>
             {fact.label}: {typeof fact.value === 'number' ? formatNumber(fact.value) : fact.value}

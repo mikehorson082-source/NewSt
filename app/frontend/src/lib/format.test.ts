@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   formatBytes,
   formatCount,
+  formatCountNoun,
   formatDate,
   formatDateTime,
   formatDateWithWeekday,
@@ -52,6 +53,14 @@ describe('множественное число', () => {
     [112, 'дней'],
   ])('%i %s', (n, word) => {
     expect(plural(n, ['день', 'дня', 'дней'])).toBe(word)
+  })
+
+  it('число со словом: после «тыс.» и «млн» всегда «строк»', () => {
+    const rows = ['строка', 'строки', 'строк'] as const
+    expect(spaces(formatCountNoun(3, rows))).toBe('3 строки')
+    expect(spaces(formatCountNoun(32_581, rows))).toBe('32 581 строка')
+    expect(spaces(formatCountNoun(1_665_704, rows))).toBe('1,7 млн строк')
+    expect(spaces(formatCountNoun(225_994, rows))).toBe('226 тыс. строк')
   })
 
   it('торговые дни', () => {

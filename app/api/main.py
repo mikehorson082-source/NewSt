@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from core.config import DATA_DIR
@@ -39,6 +40,8 @@ def create_app(data_root: Path = DATA_DIR, frontend_dist: Path = FRONTEND_DIST) 
     """Приложение пульта. Пути — параметры, чтобы тесты подставляли свои папки."""
     app = FastAPI(title="NewSt · Кабинет исследователя", version="0.1.0")
     app.state.data_root = data_root
+    # Инвентарь — сотни наборов (~600 КБ JSON): сжатие уменьшает ответ примерно в 10 раз.
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     @app.get("/api/health", tags=["system"])
     def health() -> dict[str, str]:

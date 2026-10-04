@@ -1,16 +1,15 @@
 import { useMemo, useState } from 'react'
 import { useApi } from '../api/useApi'
-import GroupSection from '../components/GroupSection'
+import SectionBlock from '../components/SectionBlock'
 import StatusFilter from '../components/StatusFilter'
 import { formatDateTime, formatDateWithWeekday } from '../lib/format'
-import { countByStatus, groupRows, type Filter } from '../lib/inventory'
-import { isProblem } from '../lib/status'
+import { countByStatus, filterTree, type Filter } from '../lib/inventory'
 
 /** Экран 1 «Инвентарь данных»: что лежит в data/, за какие даты и насколько свежее. */
 export default function DataCatalog() {
   const { data, error, loading, refresh } = useApi('/api/data/status')
   const [filter, setFilter] = useState<Filter>({ status: null, query: '' })
-  const groups = useMemo(() => (data ? groupRows(data, filter) : []), [data, filter])
+  const sections = useMemo(() => (data ? filterTree(data, filter) : []), [data, filter])
   const counts = useMemo(() => countByStatus(data?.datasets ?? []), [data])
   const filtering = filter.status !== null || filter.query.trim() !== ''
 
@@ -52,24 +51,25 @@ export default function DataCatalog() {
               onChange={(status) => setFilter((current) => ({ ...current, status }))}
             />
             <label className="search">
-              <span className="visually-hidden">Поиск по рынку, тикеру или файлу</span>
+              <span className="visually-hidden">Поиск по инструменту, тикеру или файлу</span>
               <input
                 type="search"
-                placeholder="Рынок, тикер или файл"
+                placeholder="Инструмент, тикер или файл"
                 value={filter.query}
                 onChange={(event) => setFilter((current) => ({ ...current, query: event.target.value }))}
               />
             </label>
           </div>
 
-          {groups.length === 0 && <p className="empty">Ничего не найдено.</p>}
-          {groups.map((view) => (
-            // При фильтре группы раскрыты; без фильтра — только те, где есть проблемы.
-            <GroupSection
-              key={`${view.group.id}:${filtering}`}
+          {sections.length === 0 && <p className="empty">Ничего не найдено.</p>}
+          {sections.map((view, index) => (
+            // Фильтр меняет раскрытие: key пересоздаёт блоки с новыми значениями по умолчанию.
+            <SectionBlock
+              key={`${view.section.id}:${filtering}`}
               view={view}
               expectedDate={data.expected_date}
-              defaultOpen={filtering || view.rows.some((row) => isProblem(row.status))}
+              defaultOpen={filtering || index === 0}
+              filtering={filtering}
             />
           ))}
         </div>

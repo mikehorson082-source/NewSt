@@ -1,6 +1,9 @@
 import { formatDate, formatDateWithWeekday } from '../lib/format'
 import { coverage, expectedOffset, yearLabelStep, type Axis } from '../lib/inventory'
 
+// Сколько % ширины нужно подписи «2022» перед первой отметкой года.
+const START_LABEL_ROOM = 12
+
 interface BarProps {
   first: string
   last: string
@@ -23,12 +26,17 @@ export function CoverageBar({ first, last, axis, expectedDate }: BarProps) {
 
 /** Подписи лет над полосами группы. */
 export function CoverageAxis({ axis, expectedDate }: { axis: Axis; expectedDate: string }) {
+  // На длинной оси подписан каждый step-й год; черты без подписей только шумят.
   const step = yearLabelStep(axis)
+  const ticks = axis.years.filter(({ year }) => year % step === 0)
+  // Стартовый год подписываем, только если до первой отметки хватает места.
+  const showStart = (ticks[0]?.offset ?? 100) >= START_LABEL_ROOM
   return (
     <div className="axis" aria-hidden="true">
-      {axis.years.map(({ year, offset }) => (
+      {showStart && <span className="axis__start">{new Date(axis.start).getUTCFullYear()}</span>}
+      {ticks.map(({ year, offset }) => (
         <span key={year} className="axis__tick" style={{ left: `${offset}%` }}>
-          {year % step === 0 ? year : ''}
+          {year}
         </span>
       ))}
       <span

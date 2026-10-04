@@ -331,37 +331,31 @@ code {
   color: var(--ink-2);
 }
 
-/* ---------------------------------------------------------------- группы */
-.group {
-  margin-bottom: 12px;
-  border: 1px solid var(--ring);
-  border-radius: var(--radius);
-  background: var(--surface);
+/* --------------------------------------------------------------- разделы */
+.section {
+  margin-bottom: 20px;
 }
 
-.group__summary {
+.section__summary {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
-  gap: 6px 16px;
-  padding: 14px var(--gutter);
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 8px 0 12px;
   list-style: none;
   cursor: pointer;
 }
 
-.group__summary::-webkit-details-marker {
+.section__summary::-webkit-details-marker {
   display: none;
 }
 
-.group__heading {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-}
-
 /* Шеврон: вправо — свёрнуто, вниз — раскрыто. */
-.group__heading::before {
+.section__summary::before,
+.instrument__heading::before {
   content: '';
+  flex: none;
+  align-self: center;
   width: 7px;
   height: 7px;
   margin: 0 2px 0 1px;
@@ -371,43 +365,86 @@ code {
   transition: transform 0.15s;
 }
 
-.group[open] .group__heading::before {
+.section[open] > .section__summary::before,
+.instrument[open] .instrument__heading::before {
   transform: rotate(45deg);
 }
 
-.group__title {
-  font-size: 1.05rem;
+.section__title {
+  margin: 0;
+  font-size: 1.3rem;
   font-weight: 650;
 }
 
-.group__count {
+.section__count {
   color: var(--ink-3);
   font-variant-numeric: tabular-nums;
 }
 
-.group__health {
+.section__desc {
+  flex-basis: 100%;
+  font-size: 0.87rem;
+  color: var(--ink-3);
+}
+
+/* ----------------------------------------------------------- инструменты */
+.instrument {
+  margin-bottom: 8px;
+  border: 1px solid var(--ring);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.instrument__summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 16px;
+  padding: 12px var(--gutter);
+  list-style: none;
+  cursor: pointer;
+}
+
+.instrument__summary::-webkit-details-marker {
+  display: none;
+}
+
+.instrument__heading {
   display: inline-flex;
   flex-wrap: wrap;
-  gap: 4px 12px;
+  align-items: baseline;
+  gap: 2px 10px;
+  min-width: 0;
+}
+
+.instrument__title {
+  font-weight: 650;
+}
+
+.instrument__subtitle {
+  font-size: 0.85rem;
+  color: var(--ink-3);
+}
+
+.instrument__health {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
   font-size: 0.87rem;
+  font-variant-numeric: tabular-nums;
   color: var(--ink-2);
 }
 
 .health {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
 }
 
 .health--problem {
   font-weight: 550;
   color: var(--ink);
-}
-
-.group__desc {
-  margin: -6px var(--gutter) 8px;
-  font-size: 0.87rem;
-  color: var(--ink-3);
 }
 
 /* ---------------------------------------------------------------- строки */
@@ -526,13 +563,13 @@ code {
   background: var(--grid);
 }
 
-/* Отметка ожидаемой даты лежит под полосой: свежий набор её закрывает,
-   у отстающего она видна справа от конца полосы. */
+/* Отметка ожидаемой даты лежит под полосой и равна ей по высоте: свежий
+   набор закрывает её целиком, у отстающего она видна справа от конца полосы. */
 .coverage__expected {
   position: absolute;
-  top: 1px;
+  top: 4px;
   width: 1px;
-  height: 14px;
+  height: 8px;
   background: var(--ink-3);
 }
 
@@ -560,6 +597,13 @@ code {
   padding-left: 4px;
   border-left: 1px solid var(--axis);
   white-space: nowrap;
+}
+
+/* Год, с которого начинается ось, если она стартует не 1 января. */
+.axis__start {
+  position: absolute;
+  top: 0;
+  left: 0;
 }
 
 .axis__expected {

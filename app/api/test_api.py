@@ -49,15 +49,22 @@ def test_data_status_is_inventory_of_given_folder(client):
     response = client.get("/api/data/status")
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"generated_at", "expected_date", "data_root", "groups", "datasets", "summary"}
+    assert set(body) == {"generated_at", "expected_date", "data_root", "sections", "datasets", "summary"}
     brent = next(row for row in body["datasets"] if row["id"] == "raw/futures/brent")
     # Даты — строки ISO, пустые поля приходят как null, а не пропадают.
     assert (brent["first_date"], brent["last_date"]) == ("2026-09-01", "2026-09-11")
-    assert brent["files"] == 1
     assert brent["note"] is None
-    assert brent["facts"] == []
+    assert brent["facts"] == [{"label": "Контрактов", "value": 1}]
+    futures = next(section for section in body["sections"] if section["id"] == "futures")
+    assert futures["instruments"][0]["title"] == "Нефть Brent"
+    assert futures["instruments"][0]["datasets"] == ["raw/futures/brent"]
     assert body["generated_at"].endswith("+03:00")  # время проверки по Москве
     assert sum(body["summary"].values()) == len(body["datasets"])
+
+
+def test_large_responses_are_gzipped(client):
+    response = client.get("/api/data/status", headers={"Accept-Encoding": "gzip"})
+    assert response.headers["content-encoding"] == "gzip"
 
 
 def test_unknown_api_path_is_json_404_not_frontend(client):

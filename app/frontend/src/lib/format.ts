@@ -41,9 +41,16 @@ export function formatNumber(value: number): string {
   return numberFormat.format(value)
 }
 
+const COMPACT_FROM = 100_000
+
 /** До 100 000 — точно, дальше компактно: «3,1 млн». */
 export function formatCount(value: number): string {
-  return value < 100_000 ? numberFormat.format(value) : compactFormat.format(value)
+  return value < COMPACT_FROM ? numberFormat.format(value) : compactFormat.format(value)
+}
+
+/** Число со словом: «32 581 строка», «3,1 млн строк» — после «тыс.» и «млн» всегда родительный падеж. */
+export function formatCountNoun(value: number, forms: readonly [string, string, string]): string {
+  return `${formatCount(value)} ${value < COMPACT_FROM ? plural(value, forms) : forms[2]}`
 }
 
 /** Размер файла: «82 Б», «26,2 КБ», «2,5 ГБ». */
