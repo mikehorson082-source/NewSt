@@ -20,4 +20,10 @@ export default defineConfig([
       globals: globals.browser,
     },
   },
+  {
+    // Компоненты shadcn (npx shadcn add …) рядом с компонентом экспортируют его
+    // варианты (buttonVariants): так задумано генератором, руками их не правим.
+    files: ['src/components/ui/**'],
+    rules: { 'react-refresh/only-export-components': 'off' },
+  },
 ])

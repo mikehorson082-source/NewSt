@@ -6,11 +6,11 @@ import StatusIcon from './StatusIcon'
 export default function StatusBadge({ status, lagDays }: { status: Status; lagDays: number | null }) {
   const behind = (status === 'lagging' || status === 'stale') && lagDays ? tradingDays(lagDays) : null
   return (
-    <span className="status">
-      <StatusIcon status={status} />
-      <span className="status__text">
-        <span className="status__label">{STATUS[status].label}</span>
-        {behind && <span className="status__detail">{behind} позади</span>}
+    <span className="inline-flex items-start gap-2">
+      <StatusIcon status={status} className="mt-0.5" />
+      <span className="flex flex-col leading-snug">
+        <span className="font-medium">{STATUS[status].label}</span>
+        {behind && <span className="text-xs text-muted-foreground">{behind} позади</span>}
       </span>
     </span>
   )

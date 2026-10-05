@@ -1,9 +1,9 @@
 import type { DatasetStatus, Instrument, InventoryReport, Section } from '../api/schema'
 import { DAY_MS, parseDate } from './format'
-import type { Status } from './status'
+import { STATUS_ORDER, type Status } from './status'
 
 export interface Filter {
-  status: Status | null // null — все статусы
+  statuses: Status[] // пусто — все статусы
   query: string
 }
 
@@ -38,7 +38,7 @@ export function filterTree(report: InventoryReport, filter: Filter): SectionView
         const rows = instrument.datasets
           .map((id) => index.get(id))
           .filter((row): row is DatasetStatus => row !== undefined)
-          .filter((row) => filter.status === null || row.status === filter.status)
+          .filter((row) => filter.statuses.length === 0 || filter.statuses.includes(row.status))
           .filter((row) => byName || includes([row.title, row.description, row.path], query))
         return rows.length > 0 ? [{ instrument, rows }] : []
       }),
@@ -50,6 +50,35 @@ export function countByStatus(rows: DatasetStatus[]): Record<Status, number> {
   const counts: Record<Status, number> = { ok: 0, lagging: 0, stale: 0, unchecked: 0, missing: 0, error: 0 }
   for (const row of rows) counts[row.status] += 1
   return counts
+}
+
+/** Строка таблицы инструментов: сводка по его наборам (под фильтром) для столбцов и сортировки. */
+export interface InstrumentRow {
+  id: string
+  instrument: Instrument
+  datasets: DatasetStatus[]
+  worst: Status // худший статус наборов: по нему сортируется столбец «Статус»
+  firstDate: string | null // самая ранняя дата среди наборов
+  lastDate: string | null // самая поздняя
+  totalRows: number | null // null — ни у одного набора строки не считаются
+  sizeBytes: number
+}
+
+export function instrumentRow({ instrument, rows }: InstrumentView): InstrumentRow {
+  const firsts = rows.flatMap((row) => (row.first_date ? [row.first_date] : []))
+  const lasts = rows.flatMap((row) => (row.last_date ? [row.last_date] : []))
+  const counted = rows.filter((row) => row.rows !== null)
+  return {
+    id: instrument.id,
+    instrument,
+    datasets: rows,
+    // Даты ISO сравниваются как строки: «2024-01-05» < «2024-10-01».
+    worst: STATUS_ORDER.find((status) => rows.some((row) => row.status === status)) ?? 'unchecked',
+    firstDate: firsts.length > 0 ? firsts.reduce((a, b) => (b < a ? b : a)) : null,
+    lastDate: lasts.length > 0 ? lasts.reduce((a, b) => (b > a ? b : a)) : null,
+    totalRows: counted.length > 0 ? counted.reduce((sum, row) => sum + (row.rows ?? 0), 0) : null,
+    sizeBytes: rows.reduce((sum, row) => sum + row.size_bytes, 0),
+  }
 }
 
 export interface Axis {

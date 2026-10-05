@@ -1,0 +1,31 @@
+{
+  "sections": {
+    "futures": [
+      "futures/si",
+      "futures/cnyrub",
+      "futures/euro",
+      "futures/eurusd",
+      "futures/perpetual",
+      "futures/brent",
+      "futures/ng",
+      "futures/gold",
+      "futures/silver",
+      "futures/platinum",
+      "futures/palladium",
+      "futures/copper",
+      "futures/cocoa",
+      "futures/rts",
+      "futures/mix",
+      "futures/mix_mini",
+      "futures/sber",
+      "futures/gazp",
+      "futures/lkoh",
+      "futures/yandex",
+      "futures/ozon",
+      "futures/tbank",
+      "futures/spy",
+      "futures/nasdaq",
+      "futures/btc"
+    ]
+  }
+}

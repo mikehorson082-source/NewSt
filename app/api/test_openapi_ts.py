@@ -57,3 +57,23 @@ def test_interfaces_and_get_routes():
     assert "/** Отчёт. */\nexport interface Report {\n  day: string | null;\n  rows: number;\n}" in text
     assert 'export interface ApiGet {\n  "/api/report": Report;\n}' in text
     assert "/api/upload" not in text  # только GET-пути
+
+
+def test_body_routes_get_their_own_map():
+    order = {"$ref": "#/components/schemas/Order"}
+    schema = {
+        "paths": {
+            "/api/order": {
+                "get": {"responses": {"200": {"content": {"application/json": {"schema": order}}}}},
+                "patch": {
+                    "requestBody": {"content": {"application/json": {"schema": order}}},
+                    "responses": {"200": {"content": {"application/json": {"schema": order}}}},
+                },
+            },
+        },
+        "components": {"schemas": {"Order": {"properties": {"ids": {"type": "array", "items": {"type": "string"}}}}}},
+    }
+    text = typescript(schema)
+    assert 'export interface ApiGet {\n  "/api/order": Order;\n}' in text
+    assert 'export interface ApiPatch {\n  "/api/order": { body: Order; response: Order };\n}' in text
+    assert "ApiPost" not in text  # нет таких путей — нет и пустой карты

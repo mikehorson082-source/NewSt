@@ -51,6 +51,68 @@
           }
         }
       }
+    },
+    "/api/settings/instrument-order": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Get Instrument Order",
+        "description": "Порядок инструментов по разделам.",
+        "operationId": "get_instrument_order_api_settings_instrument_order_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstrumentOrder"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Patch Instrument Order",
+        "description": "Заменяет порядок в присланных разделах, остальные не трогает.\n\nТак перестановка акций на телефоне не затрёт порядок фьючерсов, который\nтолько что поменяли на Маке.",
+        "operationId": "patch_instrument_order_api_settings_instrument_order_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstrumentOrder"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstrumentOrder"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -218,6 +280,19 @@
         "title": "Fact",
         "description": "Дополнительный факт о наборе: «Роллов: 53», «Контрактов: 77»."
       },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
       "Instrument": {
         "properties": {
           "id": {
@@ -249,6 +324,26 @@
         ],
         "title": "Instrument",
         "description": "Инструмент (нефть, Сбербанк) или тематическая группа раздела «Общее»."
+      },
+      "InstrumentOrder": {
+        "properties": {
+          "sections": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "object",
+            "title": "Sections"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sections"
+        ],
+        "title": "InstrumentOrder",
+        "description": "Порядок инструментов: id раздела → id инструментов сверху вниз.\n\nИнструмента нет в списке (появился в каталоге позже) — он идёт после\nупорядоченных, в порядке каталога."
       },
       "InventoryReport": {
         "properties": {
@@ -341,6 +436,46 @@
         ],
         "title": "Section",
         "description": "Верхний уровень: Фьючерсы, Акции, Общее."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
       }
     }
   }

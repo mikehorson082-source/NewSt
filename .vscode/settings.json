@@ -1,0 +1,12 @@
+{
+    "dataWrangler.columnInsights.displayOnOpen": false,
+    "dataWrangler.panels.displayOnTabFocus": false,
+    "dataWrangler.enabledFileTypes": {
+        "csv": false,
+        "tsv": false,
+        "xlsx": false,
+        "parquet": false,
+        "xls": false,
+        "jsonl": false
+    }
+}

@@ -7,6 +7,7 @@
 # Даты в данных — naive MSK, как в data/raw.
 # ruff: noqa: DTZ001
 
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -37,8 +38,13 @@ def dist(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def client(data_root: Path, dist: Path) -> TestClient:
-    return TestClient(create_app(data_root=data_root, frontend_dist=dist))
+def settings(tmp_path: Path) -> Path:
+    return tmp_path / "settings"
+
+
+@pytest.fixture
+def client(data_root: Path, dist: Path, settings: Path) -> TestClient:
+    return TestClient(create_app(data_root=data_root, frontend_dist=dist, settings_dir=settings))
 
 
 def test_health(client):
@@ -65,6 +71,45 @@ def test_data_status_is_inventory_of_given_folder(client):
 def test_large_responses_are_gzipped(client):
     response = client.get("/api/data/status", headers={"Accept-Encoding": "gzip"})
     assert response.headers["content-encoding"] == "gzip"
+
+
+def test_instrument_order_starts_empty(client, settings):
+    assert client.get("/api/settings/instrument-order").json() == {"sections": {}}
+    assert not settings.exists()  # чтение файл не создаёт
+
+
+def test_instrument_order_patch_replaces_only_given_sections(client, settings):
+    client.patch("/api/settings/instrument-order", json={"sections": {"futures": ["futures/si", "futures/brent"]}})
+    response = client.patch("/api/settings/instrument-order", json={"sections": {"stocks": ["stocks/SBER"]}})
+    expected = {"sections": {"futures": ["futures/si", "futures/brent"], "stocks": ["stocks/SBER"]}}
+    assert response.json() == expected
+    assert client.get("/api/settings/instrument-order").json() == expected
+    assert json.loads((settings / "instrument_order.json").read_text()) == expected
+    assert [path.name for path in settings.iterdir()] == ["instrument_order.json"]  # временных файлов не осталось
+    assert (settings / "instrument_order.json").stat().st_mode & 0o777 == 0o644
+
+
+def test_instrument_order_drops_repeats(client):
+    body = {"sections": {"futures": ["futures/si", "futures/brent", "futures/si"]}}
+    assert client.patch("/api/settings/instrument-order", json=body).json()["sections"]["futures"] == [
+        "futures/si",
+        "futures/brent",
+    ]
+
+
+def test_instrument_order_rejects_bad_body(client):
+    response = client.patch("/api/settings/instrument-order", json={"sections": {"futures": "futures/si"}})
+    assert response.status_code == 422
+
+
+def test_broken_order_file_is_reported_not_overwritten(client, settings):
+    settings.mkdir()
+    (settings / "instrument_order.json").write_text("{не json")
+    assert client.get("/api/settings/instrument-order").status_code == 500
+    response = client.patch("/api/settings/instrument-order", json={"sections": {"futures": []}})
+    assert response.status_code == 500
+    assert "повреждён" in response.json()["detail"]
+    assert (settings / "instrument_order.json").read_text() == "{не json"
 
 
 def test_unknown_api_path_is_json_404_not_frontend(client):

@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import type { DatasetStatus, InventoryReport } from '../api/schema'
-import { countByStatus, coverage, expectedOffset, filterTree, timeAxis, yearLabelStep } from './inventory'
+import {
+  countByStatus,
+  coverage,
+  expectedOffset,
+  filterTree,
+  instrumentRow,
+  timeAxis,
+  yearLabelStep,
+  type Filter,
+} from './inventory'
 
 function row(overrides: Partial<DatasetStatus>): DatasetStatus {
   return {
@@ -58,7 +67,7 @@ const report: InventoryReport = {
   summary: { ok: 2, lagging: 0, stale: 1, unchecked: 0, missing: 0, error: 0 },
 }
 
-const titles = (filter: { status: DatasetStatus['status'] | null; query: string }) =>
+const titles = (filter: Filter) =>
   filterTree(report, filter).map((view) => [
     view.section.id,
     view.instruments.map((item) => `${item.instrument.title}: ${item.rows.map((r) => r.title).join(', ')}`),
@@ -66,28 +75,34 @@ const titles = (filter: { status: DatasetStatus['status'] | null; query: string 
 
 describe('фильтр по инструментам', () => {
   it('без фильтра — все разделы и общий набор у каждого инструмента', () => {
-    expect(titles({ status: null, query: '' })).toEqual([
+    expect(titles({ statuses: [], query: '' })).toEqual([
       ['futures', ['Нефть Brent: Минутные свечи, rates_moex_clearing', 'Золото: Минутные свечи, rates_moex_clearing']],
       ['common', ['Справочники: rates_moex_clearing']],
     ])
   })
 
   it('совпало название инструмента — видны все его наборы', () => {
-    expect(titles({ status: null, query: 'нефть' })).toEqual([
+    expect(titles({ statuses: [], query: 'нефть' })).toEqual([
       ['futures', ['Нефть Brent: Минутные свечи, rates_moex_clearing']],
     ])
-    expect(titles({ status: null, query: 'GOLD' })).toEqual([['futures', ['Золото: Минутные свечи, rates_moex_clearing']]])
+    expect(titles({ statuses: [], query: 'GOLD' })).toEqual([['futures', ['Золото: Минутные свечи, rates_moex_clearing']]])
   })
 
   it('иначе ищется по наборам: остаются только совпавшие', () => {
-    expect(titles({ status: null, query: 'клиринг' })).toEqual([
+    expect(titles({ statuses: [], query: 'клиринг' })).toEqual([
       ['futures', ['Нефть Brent: rates_moex_clearing', 'Золото: rates_moex_clearing']],
       ['common', ['Справочники: rates_moex_clearing']],
     ])
   })
 
   it('статус скрывает инструменты и разделы без таких наборов', () => {
-    expect(titles({ status: 'stale', query: '' })).toEqual([['futures', ['Золото: Минутные свечи']]])
+    expect(titles({ statuses: ['stale'], query: '' })).toEqual([['futures', ['Золото: Минутные свечи']]])
+  })
+
+  it('можно выбрать несколько статусов', () => {
+    expect(titles({ statuses: ['stale', 'ok'], query: 'золото' })).toEqual([
+      ['futures', ['Золото: Минутные свечи, rates_moex_clearing']],
+    ])
   })
 
   it('считает наборы по статусам', () => {
@@ -126,5 +141,34 @@ describe('ось времени', () => {
     expect(long.years).toHaveLength(16)
     expect(yearLabelStep(long)).toBe(3)
     expect(yearLabelStep(axis)).toBe(1)
+  })
+})
+
+describe('строка инструмента', () => {
+  it('сводка по наборам: худший статус, крайние даты, суммы', () => {
+    const view = filterTree(report, { statuses: [], query: 'золото' })[0].instruments[0]
+    const summary = instrumentRow({
+      ...view,
+      rows: [
+        gold,
+        { ...clearing, first_date: '2020-03-02', last_date: '2026-01-05', rows: null, size_bytes: 50 },
+      ],
+    })
+    expect(summary).toMatchObject({
+      id: 'futures/gold',
+      worst: 'stale',
+      firstDate: '2020-03-02',
+      lastDate: '2026-01-05',
+      totalRows: 10,
+      sizeBytes: 150,
+    })
+  })
+
+  it('без дат и строк — пусто, а не ноль', () => {
+    const summary = instrumentRow({
+      instrument: report.sections[1].instruments[0],
+      rows: [row({ first_date: null, last_date: null, rows: null, status: 'unchecked' })],
+    })
+    expect(summary).toMatchObject({ worst: 'unchecked', firstDate: null, lastDate: null, totalRows: null })
   })
 })

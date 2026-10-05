@@ -20,9 +20,11 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from core.config import DATA_DIR
 
 from .routers import data as data_routes
+from .routers import settings as settings_routes
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FRONTEND_DIST = PROJECT_ROOT / "app" / "frontend" / "dist"
+SETTINGS_DIR = PROJECT_ROOT / "app" / "settings"
 
 NOT_BUILT = """<!doctype html>
 <html lang="ru"><meta charset="utf-8"><title>Кабинет исследователя</title>
@@ -36,10 +38,13 @@ NOT_BUILT = """<!doctype html>
 """
 
 
-def create_app(data_root: Path = DATA_DIR, frontend_dist: Path = FRONTEND_DIST) -> FastAPI:
+def create_app(
+    data_root: Path = DATA_DIR, frontend_dist: Path = FRONTEND_DIST, settings_dir: Path = SETTINGS_DIR
+) -> FastAPI:
     """Приложение пульта. Пути — параметры, чтобы тесты подставляли свои папки."""
     app = FastAPI(title="NewSt · Кабинет исследователя", version="0.1.0")
     app.state.data_root = data_root
+    app.state.settings_dir = settings_dir
     # Инвентарь — сотни наборов (~600 КБ JSON): сжатие уменьшает ответ примерно в 10 раз.
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
@@ -48,6 +53,7 @@ def create_app(data_root: Path = DATA_DIR, frontend_dist: Path = FRONTEND_DIST) 
         return {"status": "ok"}
 
     app.include_router(data_routes.router)
+    app.include_router(settings_routes.router)
 
     # Фронтенд проверяется на каждом запросе: собрал его при запущенном
     # сервере — достаточно обновить страницу.

@@ -19,6 +19,9 @@ HEADER = (
     "// uv run python -m app.api.contract  (или npm run gen:api в app/frontend)\n"
 )
 
+# Методы с телом запроса; у каждого своя карта в schema.ts (ApiPatch…), если такие пути есть.
+BODY_METHODS = ("post", "put", "patch")
+
 PRIMITIVES = {
     "string": "string",
     "integer": "number",
@@ -79,8 +82,26 @@ def get_responses(schema: dict[str, Any]) -> list[tuple[str, str]]:
     return out
 
 
+def json_content(node: dict[str, Any]) -> dict[str, Any] | None:
+    """Схема JSON-содержимого тела запроса или ответа, если оно есть."""
+    content = node.get("content", {}).get("application/json")
+    return None if content is None else content.get("schema", {})
+
+
+def body_routes(schema: dict[str, Any], method: str) -> list[tuple[str, str, str]]:
+    """Пути метода с JSON-телом запроса: (путь, тип тела, тип успешного ответа)."""
+    out = []
+    for path, operations in schema.get("paths", {}).items():
+        operation = operations.get(method, {})
+        body = json_content(operation.get("requestBody", {}))
+        response = json_content(operation.get("responses", {}).get("200", {}))
+        if body is not None and response is not None:
+            out.append((path, ts_type(body), ts_type(response)))
+    return out
+
+
 def typescript(schema: dict[str, Any]) -> str:
-    """Текст schema.ts: интерфейсы ответов и карта «GET-путь → тип ответа»."""
+    """Текст schema.ts: интерфейсы, карта «GET-путь → тип ответа» и карты запросов с телом."""
     parts = [HEADER]
     for name, component in schema.get("components", {}).get("schemas", {}).items():
         parts.append(ts_interface(name, component) + "\n")
@@ -96,4 +117,21 @@ def typescript(schema: dict[str, Any]) -> str:
         )
         + "\n"
     )
+    for method in BODY_METHODS:
+        routes = [
+            f"  {json.dumps(path)}: {{ body: {body}; response: {response} }};"
+            for path, body, response in body_routes(schema, method)
+        ]
+        if routes:
+            parts.append(
+                "\n".join(
+                    [
+                        f"/** {method.upper()}-пути API: тело запроса и тип ответа. */",
+                        f"export interface Api{method.capitalize()} {{",
+                        *routes,
+                        "}",
+                    ]
+                )
+                + "\n"
+            )
     return "\n".join(parts)

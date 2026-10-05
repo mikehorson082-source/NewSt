@@ -26,12 +26,21 @@ export interface Fact {
   value: number | string;
 }
 
+export interface HTTPValidationError {
+  detail: ValidationError[];
+}
+
 /** Инструмент (нефть, Сбербанк) или тематическая группа раздела «Общее». */
 export interface Instrument {
   id: string;
   title: string;
   subtitle: string;
   datasets: string[];
+}
+
+/** Порядок инструментов: id раздела → id инструментов сверху вниз. */
+export interface InstrumentOrder {
+  sections: Record<string, string[]>;
 }
 
 /** Весь инвентарь: разделы с инструментами, наборы и сводка по статусам. */
@@ -52,8 +61,22 @@ export interface Section {
   instruments: Instrument[];
 }
 
+export interface ValidationError {
+  loc: (string | number)[];
+  msg: string;
+  type: string;
+  input: unknown;
+  ctx: Record<string, unknown>;
+}
+
 /** GET-пути API и тип ответа: apiGet('/api/data/status') вернёт InventoryReport. */
 export interface ApiGet {
   "/api/health": Record<string, string>;
   "/api/data/status": InventoryReport;
+  "/api/settings/instrument-order": InstrumentOrder;
+}
+
+/** PATCH-пути API: тело запроса и тип ответа. */
+export interface ApiPatch {
+  "/api/settings/instrument-order": { body: InstrumentOrder; response: InstrumentOrder };
 }

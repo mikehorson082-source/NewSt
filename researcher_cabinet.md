@@ -47,7 +47,9 @@ NewSt/
 ## 2. Стек технологий
 
 * **Фронтенд:** `React + Vite`
-  * Адаптивная верстка (Mobile First) для комфортной работы со смартфона.
+  * Компоненты — [shadcn/ui](https://ui.shadcn.com) на Base UI, стили — Tailwind CSS. Компоненты лежат в `app/frontend/src/components/ui/` как обычный код, добавляются командой `npx shadcn@latest add <имя>` из `app/frontend`.
+  * Таблицы — TanStack Table v9 (как в [Data Table](https://ui.shadcn.com/docs/components/base/data-table) shadcn), перетаскивание строк — dnd-kit.
+  * Адаптивная верстка (Mobile First) для комфортной работы со смартфона. Тёмная тема — по настройке системы.
   * Формат **PWA (Progressive Web App)**: возможность добавить сайт на домашний экран iPhone/Android в виде отдельного приложения с иконкой.
   * Быстрые графики (TradingView Lightweight Charts / интерактивный SVG).
 * **Бэкенд:** `FastAPI (Python)`
@@ -72,6 +74,7 @@ NewSt/
 Например:
 * **Справочники:** `margin_rates` (2020–2026, 24 рынка), `rates_moex_clearing` (2020–2026), статус: *Актуален (зелёный)*.
 * **Ряды фьючерсов:** Brent — минутки с 2020 по 2026 (77 контрактов), склейка с 05.2022 (1 216 дней, 0 пропусков, 53 перехода).
+* **Вид:** вкладки «Фьючерсы / Акции / Общее», в каждой — таблица инструментов. Сортировка по любому столбцу; свой порядок — перетаскиванием за ⋮⋮ или меню «…» → «Переместить в начало». Свой порядок хранится в `app/settings/instrument_order.json` (API `/api/settings/instrument-order`), один на Мак и телефон. Нажатие на инструмент раскрывает его наборы с полосами покрытия по датам.
 * **Кнопка в 1 клик:** *«Обновить всё с биржи»* или *«Докачать конкретный фьючерс»* (этап 2).
 * *Больше никогда не придётся вручную вспоминать, что скачано, а что нет.*
 
@@ -123,7 +126,7 @@ uv run python -m app
 * Движок `src/` не импортирует веб-слой — `app/test_architecture.py`. Инвентарь — пакет `src/data/inventory/`: `model` (формат), `scan` (чтение и свежесть), `catalog` (связи), `build` (сборка).
 * Функции движка возвращают данные, печатает только `main()`.
 * Формат ответов API задают dataclass-ы движка. Из них генерируются `app/frontend/openapi.json` и типы `app/frontend/src/api/schema.ts`: `uv run python -m app.api.contract`. Забыл перегенерировать — падает `app/api/test_contract.py`.
-* Инвентарь только читает `data/` — `src/data/test_inventory.py`.
+* Инвентарь только читает `data/` — `src/data/test_inventory.py`. Пульт пишет только свои настройки в `app/settings/` — `app/api/test_api.py`.
 * Все проверки: `uv run pytest` и `npm run check --prefix app/frontend` (TypeScript, ESLint, Vitest).
 
 ---
