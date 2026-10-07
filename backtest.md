@@ -39,10 +39,12 @@ src/backtest/
 ├── markets.py        # Паспорта рынков st01: рубли за пункт и ГО по датам из данных биржи
 ├── minutes.py        # Минутки контрактов из raw: что задето раньше внутри 15-минутной свечи
 ├── position.py       # Движок симуляции одной сделки (вход, стоп, тейк, ролл, выход)
+├── sizing.py         # Размер позиции: контракты от риска и предел ГО
 ├── test_costs.py     # Тесты спецификаций и формул издержек
 ├── test_markets.py   # 19 тестов паспортов рынков
 ├── test_minutes.py   # 6 тестов чтения минуток
-└── test_position.py  # 41 тест на все жизненные ситуации и краевые случаи
+├── test_position.py  # 41 тест на все жизненные ситуации и краевые случаи
+└── test_sizing.py    # 23 теста размера позиции
 ```
 
 Связь между ними простая и однонаправленная:
@@ -50,6 +52,7 @@ src/backtest/
 * [markets.py](file:///Users/anton/Documents/app/NewSt/src/backtest/markets.py) хранит паспорта реальных рынков и добавляет к 15-минутному ряду рубли за пункт и долю ГО на каждую свечу.
 * [costs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/costs.py) берет спецификацию и рубли за пункт свечи и считает рубли комиссий и сдвиг цены от проскальзывания.
 * [minutes.py](file:///Users/anton/Documents/app/NewSt/src/backtest/minutes.py) читает минутки того же контракта, когда свеча задела и стоп, и цель. Файлы `data/raw` только читаются.
+* [sizing.py](file:///Users/anton/Documents/app/NewSt/src/backtest/sizing.py) в момент сигнала считает, сколько контрактов взять.
 * [position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py) берет свечи вместе с их рублями за пункт, параметры издержек и честно проводит позицию от момента сигнала до закрытия.
 
 ---
@@ -303,9 +306,53 @@ trade = simulate_position(spec, bars, signal_bar, signal, minutes=minutes)
 
 ---
 
-## 6. Как тесты подтверждают корректность бэктестера
+## 6. Скрипт №4: `sizing.py` — Сколько контрактов взять
 
-В модуле написаны 82 юнит-теста ([test_position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py), [test_markets.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_markets.py), [test_minutes.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_minutes.py) и [test_costs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_costs.py)), которые проверяют каждую нестандартную ситуацию:
+Стратегия говорит «лонг Brent, стоп 69». Сколько контрактов купить, решает [size_position](file:///Users/anton/Documents/app/NewSt/src/backtest/sizing.py). Правила (`SizingRules`):
+* **Риск сделки** — 1% капитала: если сработает стоп, теряем не больше 10 000 ₽ из 1 000 000 ₽.
+* **Предел ГО** — ГО позиции не больше 50% капитала.
+
+### Риск одного контракта
+Сколько рублей потеряет 1 контракт, если сработает стоп:
+
+`риск контракта = (расстояние до стопа + 2 × проскальзывание) × рубли за пункт + сбор входа + сбор выхода`
+
+Рубли за пункт — **только известные в момент сигнала** (`point_value_known`). По какому курсу биржа рассчитает следующие свечи, в момент сигнала ещё не известно. Проверка 3.2 показала, что из-за этого риск в рублях отклоняется от плана в среднем на 1–2%.
+
+### Пример: Brent, закрытие 70, стоп 69, курс 85 (850 ₽ за пункт), ГО 25%
+1. Риск контракта: `(1 + 0.02) × 850 + (70 + 69) × 850 × 0.0132% ≈ 883 ₽`.
+2. По риску: `10 000 ÷ 883 = 11.3` → **11 контрактов** (всегда вниз).
+3. ГО контракта: `70 × 850 × 25% = 14 875 ₽`. По ГО: `500 000 ÷ 14 875 = 33.6` → 33.
+4. Берём меньшее: **11**, сработал лимит **риска**. ГО позиции 163 625 ₽ — 16% капитала.
+
+Если стоп поставить в 5 центах (69.95), по риску можно 132 контракта, но их ГО — почти 2 млн ₽. Тогда сработает лимит **ГО**: 33 контракта. Чем ближе стоп, тем вероятнее упереться в ГО.
+
+### Результат: `PositionSize`
+* `contracts` — сколько контрактов; `limit` — какой лимит сработал: `"risk"` или `"margin"`.
+* `contracts == 0` (`skipped`) — **сигнал пропускается**, `limit` — причина: даже 1 контракт рискует больше бюджета (стоп слишком далеко) или требует больше ГО, чем разрешено.
+* `risk` — плановый риск позиции до стопа в рублях. Это **1R** сделки: на шаге 3.5 по нему считается expectancy в R.
+* `margin` — ГО позиции на момент сигнала.
+
+Капитал передаётся в функцию: на шаге 3.4 портфель будет передавать текущий капитал на момент сигнала.
+
+В риск **не входят**: вход по открытию следующей свечи вместо закрытия сигнальной, выход хуже стопа при гэпе и стоимость переноса контракта. Поэтому реальный убыток по стопу иногда больше плана.
+
+Готовый сигнал для симулятора:
+```python
+from dataclasses import replace
+
+size = size_position(spec, bars, signal_bar, signal, capital=1_000_000)
+if not size.skipped:
+    trade = simulate_position(spec, bars, signal_bar, replace(signal, contracts=size.contracts))
+```
+
+Посмотреть на реальных рынках, при каком стопе включается лимит ГО: `uv run python st01/check_sizing.py`.
+
+---
+
+## 7. Как тесты подтверждают корректность бэктестера
+
+В модуле написаны 105 юнит-тестов ([test_position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py), [test_markets.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_markets.py), [test_minutes.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_minutes.py), [test_sizing.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sizing.py) и [test_costs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_costs.py)), которые проверяют каждую нестандартную ситуацию:
 
 1. **Тест на проскальзывание и комиссии** ([test_long_target_fills_by_next_open_with_costs](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L57)): проверяет, что при входе и выходе по цели чистая прибыль строго меньше грязной на величину двух комиссий и двух проскальзываний.
 2. **Тесты на бар-«вертолёт»**: свеча задела и цель 110, и стоп 95.
@@ -322,7 +369,8 @@ trade = simulate_position(spec, bars, signal_bar, signal, minutes=minutes)
    * Цена стоит, курс растёт — прибыль ноль ([test_flat_price_with_rising_rate_gives_zero_profit](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L401)).
    * Комиссия входа, перенос и выход — каждый по рублям за пункт своей свечи ([test_costs_use_point_value_of_their_bar](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L419)).
    * У CNY и MIX результат совпадает с прежней формулой «одно число» ([test_rub_markets_keep_single_point_value_result](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L465)).
-8. **Тест на отрицательные скорректированные цены** ([test_negative_adjusted_prices_do_not_change_result](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L214)): результат сделки не зависит от уровня поправки, даже если скорректированные цены ниже нуля.
+8. **Тесты размера позиции** ([test_sizing.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sizing.py)): пример из плана (11 контрактов), лимит ГО при близком стопе, пропуск сигнала по риску и по ГО, размер по известному курсу, а не по курсу будущего клиринга, и 10 контрактов, а не 9, когда бюджет делится нацело, но float дает 9.999999999999977.
+9. **Тест на отрицательные скорректированные цены** ([test_negative_adjusted_prices_do_not_change_result](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L214)): результат сделки не зависит от уровня поправки, даже если скорректированные цены ниже нуля.
 
 Запустить все тесты модуля можно стандартной командой:
 ```bash
@@ -331,12 +379,13 @@ uv run pytest src/backtest
 
 ---
 
-## 7. Резюме: памятка разработчику стратегий
+## 8. Резюме: памятка разработчику стратегий
 
 Когда вы будете писать генератор сигналов (в папках `features/`, `models/` или `st01/`):
 * **Сигнал строится только по закрытому бару T.** Не используйте в расчете сигнала данные, которые станут известны только в момент T+1.
 * **Симулятор сам войдет на баре T+1.** Вам не нужно вручную сдвигать цены входа — симулятор берет `open` следующего бара автоматически.
 * **Задавайте стоп и цель в реальных ценах.** Симулятор сам переведет их в непрерывное пространство через `price_adjustment`.
 * **Берите свечи из `load_market`.** В них есть рубли за пункт по каждой свече (`point_value`) и курс, известный в момент сигнала (`point_value_known`). Для размера позиции — только второй: будущий курс в момент сигнала ещё не известен.
+* **Число контрактов считайте через `size_position`**, а пропущенные сигналы (`skipped`) пишите в лог с причиной.
 * **Передавайте минутки рынка** (`minutes=RawMinutes.for_market("brent")`). Без них свеча, задевшая и стоп, и цель, всегда закрывается по стопу, и стратегии с близкими уровнями выглядят хуже, чем есть.
 * **Всегда проверяйте `net_pnl`.** Высокий `gross_pnl` при частых сделках может быть полностью съеден комиссиями и проскальзыванием. Бэктестер покажет реальный финансовый результат.
