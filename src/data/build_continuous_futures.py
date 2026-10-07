@@ -923,6 +923,11 @@ def require_derived_path(path: Path) -> Path:
 
 def main() -> None:
     args = parse_args()
+    # Один писатель в data/ за раз: данные уже пишет пульт или другой скрипт —
+    # выходим с сообщением, кто именно (src/data/pipeline/lock.py).
+    from data.pipeline.lock import hold_data_lock
+
+    hold_data_lock("build_continuous_futures.py")
     if args.roll_days_before_last_trade < 0:
         raise ValueError("Запас до LSTTRADE не может быть отрицательным")
     if args.volume_window_days < 1:

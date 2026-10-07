@@ -1,8 +1,9 @@
-"""Каталог инвентаря: как проверять справочники и что к какому инструменту относится.
+"""Каталог инвентаря: как читать справочники и что к какому инструменту относится.
 
 Связи записаны явно, чтобы их было видно и легко поправить: справочник
 попадает в карточку инструмента целиком (курс клиринга — у долларовых
 фьючерсов) или срезом по ключу (ставки ГО по asset_code BR — у нефти).
+Допустимое отставание наборов и его причины — в rules.json (rules.py).
 """
 
 from __future__ import annotations
@@ -11,56 +12,45 @@ from dataclasses import dataclass
 
 from core.instruments import ASSETS, Sector
 
-# Бесплатный тариф ALGOPACK отдаёт FUTOI с задержкой в две недели (T−14…15
-# календарных дней). Две недели — это 10 будних дней: у только что скачанного
-# FUTOI отставание 9–10 торговых дней, и это норма.
-FUTOI_ALLOWED_LAG = 10
-
 REBUILD_HINT = "uv run python src/data/build_continuous_futures.py"
+CONTRACTS_HINT = "uv run python src/data/download_reference.py --update --only contracts"
 
 
 @dataclass(frozen=True)
 class ReferenceSpec:
-    """Как проверять файл справочника."""
+    """Как читать файл справочника. Правило свежести — в rules.json по имени файла."""
 
     file: str
     description: str
     date_column: str | None  # колонка даты; None — без дат
-    allowed_lag: int | None  # допустимое отставание в торговых днях; None — не проверять
     count_column: str | None = None  # что посчитать уникальным у файла целиком
     count_label: str | None = None
 
 
 REFERENCE_FILES: tuple[ReferenceSpec, ...] = (
-    ReferenceSpec("margin_rates.parquet", "Минимальные ставки ГО mr1–mr3", "date", 0, "asset_code", "Рынков"),
+    ReferenceSpec("margin_rates.parquet", "Минимальные ставки ГО mr1–mr3", "date", "asset_code", "Рынков"),
     ReferenceSpec(
         "margin_snapshot.parquet",
         "Снимки фактического ГО (копятся при обновлении)",
         "snapshot_date",
-        0,
         "snapshot_date",
         "Снимков",
     ),
-    ReferenceSpec("rates_moex_clearing.parquet", "Курс клиринга MOEX USD/RUB", "date", 0),
-    ReferenceSpec("rates_cbr_fx.parquet", "Официальные курсы ЦБ", "date", 0, "currency", "Валют"),
-    ReferenceSpec("cbr_key_rate.parquet", "Ключевая ставка ЦБ", "date", 0),
-    # SOFR публикуется утром следующего рабочего дня США — день отставания норма.
-    ReferenceSpec("rates_usd.parquet", "Ставка SOFR", "date", 1),
-    # Праздники Китая (Чуньцзе, Золотая неделя) — до 5 торговых дней без публикаций.
-    ReferenceSpec("rates_china.parquet", "Ставки Китая", "date", 5, "series", "Рядов"),
-    ReferenceSpec("spot_currency.parquet", "Спот валют MOEX", "date", 0, "secid", "Инструментов"),
-    ReferenceSpec("indices_daily.parquet", "Индексы MOEX", "date", 0, "secid", "Индексов"),
-    ReferenceSpec("benchmarks_world.parquet", "Мировые бенчмарки", "date", 0, "symbol", "Инструментов"),
-    # Отчёт EIA выходит раз в неделю: неделя отставания норма.
-    ReferenceSpec("eia_ng_storage.parquet", "Запасы газа в США (EIA)", "release_date", 5),
-    ReferenceSpec(
-        "futures_contracts.parquet", "Справочник контрактов", "first_trade_date", None, "asset_code", "Активов"
-    ),
-    ReferenceSpec("calendar_events.parquet", "Календарь событий", "date", None),
-    ReferenceSpec("corp_dividends.parquet", "Дивиденды", "declared_date", None, "ticker", "Тикеров"),
-    ReferenceSpec("corp_listing.parquet", "Листинг акций", None, None, "ticker", "Тикеров"),
-    ReferenceSpec("corp_splits.parquet", "Сплиты акций", "date", None),
-    ReferenceSpec("ru_working_saturdays.json", "Рабочие субботы (торги идут)", None, None),
+    ReferenceSpec("rates_moex_clearing.parquet", "Курс клиринга MOEX USD/RUB", "date"),
+    ReferenceSpec("rates_cbr_fx.parquet", "Официальные курсы ЦБ", "date", "currency", "Валют"),
+    ReferenceSpec("cbr_key_rate.parquet", "Ключевая ставка ЦБ", "date"),
+    ReferenceSpec("rates_usd.parquet", "Ставка SOFR", "date"),
+    ReferenceSpec("rates_china.parquet", "Ставки Китая", "date", "series", "Рядов"),
+    ReferenceSpec("spot_currency.parquet", "Спот валют MOEX", "date", "secid", "Инструментов"),
+    ReferenceSpec("indices_daily.parquet", "Индексы MOEX", "date", "secid", "Индексов"),
+    ReferenceSpec("benchmarks_world.parquet", "Мировые бенчмарки", "date", "symbol", "Инструментов"),
+    ReferenceSpec("eia_ng_storage.parquet", "Запасы газа в США (EIA)", "release_date"),
+    ReferenceSpec("futures_contracts.parquet", "Справочник контрактов", "first_trade_date", "asset_code", "Активов"),
+    ReferenceSpec("calendar_events.parquet", "Календарь событий", "date"),
+    ReferenceSpec("corp_dividends.parquet", "Дивиденды", "declared_date", "ticker", "Тикеров"),
+    ReferenceSpec("corp_listing.parquet", "Листинг акций", None, "ticker", "Тикеров"),
+    ReferenceSpec("corp_splits.parquet", "Сплиты акций", "date"),
+    ReferenceSpec("ru_working_saturdays.json", "Рабочие субботы (торги идут)", None),
 )
 REFERENCE_BY_FILE = {spec.file: spec for spec in REFERENCE_FILES}
 

@@ -107,6 +107,16 @@ export function timeAxis(rows: DatasetStatus[], expectedDate: string): Axis | nu
   return { start, end, years }
 }
 
+/** Будни (пн–пт) среди дней [from, to); границы — полночь UTC. */
+function weekdays(from: number, to: number): number {
+  let count = 0
+  for (let day = from; day < to; day += DAY_MS) {
+    const weekday = new Date(day).getUTCDay()
+    if (weekday !== 0 && weekday !== 6) count += 1
+  }
+  return count
+}
+
 function offset(time: number, start: number, end: number): number {
   return ((time - start) / (end - start)) * 100
 }
@@ -116,6 +126,41 @@ export function coverage(first: string, last: string, axis: Axis): { left: numbe
   const from = parseDate(first).getTime()
   const to = parseDate(last).getTime() + DAY_MS
   return { left: offset(from, axis.start, axis.end), width: ((to - from) / (axis.end - axis.start)) * 100 }
+}
+
+/** Месяц графика на оси: края в % и высота 0…1. */
+export interface MonthStep {
+  left: number
+  right: number
+  value: number
+}
+
+/**
+ * Ступени графика «сколько данных» на оси: по ступени на месяц из monthly.
+ * Высота — строк за будний день (а не за месяц): неполные первый и последний
+ * месяцы и короткий февраль не проваливаются и не подскакивают. Будни, а не
+ * календарные дни: хвост «1–2 октября» — одни будни, а в полном месяце есть
+ * выходные без торгов. 1 — самый плотный месяц набора, 0 — месяц без данных.
+ * Пример: данные с пн 18.03.2024, в марте 1 000 строк за 10 будней, в апреле
+ * 2 200 за 22 — у обоих по 100 строк за будний день: ступени одной высоты.
+ */
+export function monthSteps(first: string, last: string, monthly: number[], axis: Axis): MonthStep[] {
+  const from = parseDate(first).getTime()
+  const to = parseDate(last).getTime() + DAY_MS
+  const start = parseDate(first)
+  const spans = monthly.map((rows, i) => {
+    const monthStart = Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + i, 1)
+    const monthEnd = Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + i + 1, 1)
+    const lo = Math.max(monthStart, from)
+    const hi = Math.min(monthEnd, to)
+    return { lo, hi, density: rows / Math.max(1, weekdays(lo, hi)) }
+  })
+  const peak = Math.max(0, ...spans.map((span) => span.density))
+  return spans.map(({ lo, hi, density }) => ({
+    left: offset(lo, axis.start, axis.end),
+    right: offset(hi, axis.start, axis.end),
+    value: peak > 0 ? density / peak : 0,
+  }))
 }
 
 /** Где на оси кончается ожидаемая дата, %: полоса, не дотянувшая до отметки, отстаёт. */

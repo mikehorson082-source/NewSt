@@ -113,6 +113,165 @@
           }
         }
       }
+    },
+    "/api/pipeline": {
+      "get": {
+        "tags": [
+          "pipeline"
+        ],
+        "summary": "Pipeline State",
+        "description": "Шаги, порядок «Обновить всё», журнал запусков и кто пишет данные вне пульта.",
+        "operationId": "pipeline_state_api_pipeline_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PipelineState"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/pipeline/runs": {
+      "post": {
+        "tags": [
+          "pipeline"
+        ],
+        "summary": "Start Run",
+        "description": "Запускает шаги в фоне. 409 — такой запуск уже идёт или данные пишет другой процесс.",
+        "operationId": "start_run_api_pipeline_runs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/pipeline/stop": {
+      "post": {
+        "tags": [
+          "pipeline"
+        ],
+        "summary": "Stop Run",
+        "description": "Остановить после текущего шага: текущий доработает, чтобы не испортить файлы.",
+        "operationId": "stop_run_api_pipeline_stop_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StopRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/pipeline/log": {
+      "get": {
+        "tags": [
+          "pipeline"
+        ],
+        "summary": "Run Log",
+        "description": "Лог запуска с байта offset; пульт дочитывает его, пока запуск идёт.",
+        "operationId": "run_log_api_pipeline_log_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogChunk"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -230,12 +389,31 @@
             ],
             "title": "Note"
           },
+          "rule": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule"
+          },
           "facts": {
             "items": {
               "$ref": "#/components/schemas/Fact"
             },
             "type": "array",
             "title": "Facts",
+            "default": []
+          },
+          "monthly": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Monthly",
             "default": []
           }
         },
@@ -405,6 +583,169 @@
         "title": "InventoryReport",
         "description": "Весь инвентарь: разделы с инструментами, наборы и сводка по статусам."
       },
+      "LogChunk": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "complete": {
+            "type": "boolean",
+            "title": "Complete"
+          }
+        },
+        "type": "object",
+        "required": [
+          "text",
+          "offset",
+          "complete"
+        ],
+        "title": "LogChunk",
+        "description": "Кусок лога запуска с позиции offset."
+      },
+      "PipelineState": {
+        "properties": {
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/Step"
+            },
+            "type": "array",
+            "title": "Steps"
+          },
+          "update_all": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Update All"
+          },
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/Run"
+            },
+            "type": "array",
+            "title": "Runs"
+          },
+          "busy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Busy"
+          },
+          "runs_dir": {
+            "type": "string",
+            "title": "Runs Dir"
+          }
+        },
+        "type": "object",
+        "required": [
+          "steps",
+          "update_all",
+          "runs",
+          "busy",
+          "runs_dir"
+        ],
+        "title": "PipelineState",
+        "description": "Экран «Загрузка»: шаги, порядок «Обновить всё», журнал запусков и чужая загрузка."
+      },
+      "Run": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "data",
+              "check"
+            ],
+            "title": "Kind"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "running",
+              "ok",
+              "error",
+              "stopped",
+              "interrupted"
+            ],
+            "title": "Status"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "stop_requested": {
+            "type": "boolean",
+            "title": "Stop Requested"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/StepResult"
+            },
+            "type": "array",
+            "title": "Steps"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "kind",
+          "status",
+          "started_at",
+          "finished_at",
+          "stop_requested",
+          "steps"
+        ],
+        "title": "Run",
+        "description": "Запуск из пульта: один шаг или «Обновить всё»."
+      },
+      "RunRequest": {
+        "properties": {
+          "steps": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Steps"
+          }
+        },
+        "type": "object",
+        "required": [
+          "steps"
+        ],
+        "title": "RunRequest",
+        "description": "Что запустить: id шагов (порядок — всегда как в реестре шагов)."
+      },
       "Section": {
         "properties": {
           "id": {
@@ -436,6 +777,155 @@
         ],
         "title": "Section",
         "description": "Верхний уровень: Фьючерсы, Акции, Общее."
+      },
+      "Step": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "data",
+              "check"
+            ],
+            "title": "Kind"
+          },
+          "args": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Args"
+          },
+          "command": {
+            "type": "string",
+            "title": "Command"
+          },
+          "writes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Writes",
+            "default": []
+          },
+          "needs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Needs",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "description",
+          "kind",
+          "args",
+          "command"
+        ],
+        "title": "Step",
+        "description": "Шаг конвейера: что запускается, куда пишет и от чего зависит."
+      },
+      "StepResult": {
+        "properties": {
+          "step": {
+            "type": "string",
+            "title": "Step"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "ok",
+              "error",
+              "skipped",
+              "stopped"
+            ],
+            "title": "Status"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "exit_code": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exit Code"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          }
+        },
+        "type": "object",
+        "required": [
+          "step",
+          "status"
+        ],
+        "title": "StepResult",
+        "description": "Итог шага в одном запуске."
+      },
+      "StopRequest": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id"
+        ],
+        "title": "StopRequest",
+        "description": "Какой запуск остановить после текущего шага."
       },
       "ValidationError": {
         "properties": {

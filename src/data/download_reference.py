@@ -61,6 +61,8 @@ if str(PROJECT_DIR) not in sys.path:
 import polars as pl
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from src.core.config import (
     ASSETS,
@@ -78,6 +80,31 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+def retrying_session() -> requests.Session:
+    """HTTP-сессия с повторами: обрыв соединения или ответ 429/5xx — ещё попытка.
+
+    Пример: ISS оборвал соединение («Connection reset by peer») — через 1, 2, 4… с
+    запрос повторится, и спот с индексами не останутся необновлёнными из-за одного
+    сбоя сети. После MAX_RETRIES попыток ошибка уходит вызывающему, как раньше.
+    """
+    retry = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        raise_on_status=False,  # последний ответ 5xx вернётся, и raise_for_status() покажет код
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.mount("http://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+# Общая для всех источников справочников, кроме спецификаций контрактов: те
+# запрашиваются в потоках и повторяют запросы сами.
+HTTP = retrying_session()
 
 REFERENCE_DIR = Paths().reference
 # Только для разовой копии корпоративных реестров (sync_corporate_and_calendar_files).
@@ -126,6 +153,17 @@ def get_update_start_date(
     return default_from
 
 
+# Файлы, не обновлённые из-за ошибки источника. По ним main() выходит с кодом 1:
+# пульт и `python -m data.pipeline` видят, что шаг не удался, а не «Готово».
+FAILED: list[str] = []
+
+
+def source_failed(name: str, exc: BaseException) -> None:
+    """Источник файла не ответил или ответил не так: файл не меняется, ошибка запоминается."""
+    log.error("  ✗ %s: ошибка загрузки (%s), файл не изменён", name, exc)
+    FAILED.append(name)
+
+
 def refresh_reference_file(
     label: str,
     path: Path,
@@ -158,7 +196,7 @@ def refresh_reference_file(
     try:
         new_df = fetch(start, till_date)
     except Exception as exc:  # noqa: BLE001 — граница: любая ошибка источника
-        log.error("  ✗ %s: ошибка загрузки (%s), файл не изменён", path.name, exc)
+        source_failed(path.name, exc)
         return
     if new_df.is_empty():
         log.info("  %s: новых данных нет, файл не изменён.", path.name)
@@ -185,7 +223,7 @@ def fetch_cbr_key_rate(from_date: str, till_date: str) -> pl.DataFrame:
     url = f"https://www.cbr.ru/hd_base/KeyRate/?UniDbQuery.Posted=True&UniDbQuery.From={d_from}&UniDbQuery.To={d_till}"
 
     headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    resp = HTTP.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     table = soup.find("table", {"class": "data"})
@@ -233,7 +271,7 @@ def fetch_cbr_fx_rates(from_date: str, till_date: str) -> pl.DataFrame:
     all_rows = []
     for curr, val_code in CBR_CURRENCIES.items():
         url = f"https://www.cbr.ru/scripts/XML_dynamic.asp?date_req1={d1}&date_req2={d2}&VAL_NM_RQ={val_code}"
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+        resp = HTTP.get(url, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         root = ET.fromstring(resp.content)
         for rec in root.findall("Record"):
@@ -313,7 +351,7 @@ def fetch_usd_sofr(from_date: str, till_date: str) -> pl.DataFrame:
     # 1. New York Fed
     try:
         url = f"https://markets.newyorkfed.org/api/rates/secured/sofr/search.json?startDate={from_date}&endDate={till_date}"
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+        resp = HTTP.get(url, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
             payload = resp.json()
             for r in payload.get("refRates", []):
@@ -327,7 +365,7 @@ def fetch_usd_sofr(from_date: str, till_date: str) -> pl.DataFrame:
     # 2. FRED — второй официальный источник того же ряда; его ошибка уже не глотается.
     if not rows:
         fred_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SOFR"
-        resp = requests.get(fred_url, timeout=REQUEST_TIMEOUT)
+        resp = HTTP.get(fred_url, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         raw_df = pl.read_csv(io.BytesIO(resp.content), null_values=["."])
         d_col, v_col = raw_df.columns[0], raw_df.columns[1]
@@ -369,7 +407,7 @@ def fetch_spot_currencies(from_date: str, till_date: str) -> pl.DataFrame:
                 f"/boards/CETS/securities/{secid}.json"
                 f"?from={from_date}&till={till_date}&start={cursor}&iss.meta=off&iss.only=history"
             )
-            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+            resp = HTTP.get(url, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             payload = resp.json()
             history = payload.get("history", {})
@@ -433,7 +471,7 @@ def fetch_indices(from_date: str, till_date: str) -> pl.DataFrame:
                 f"/boards/{board}/securities/{secid}.json"
                 f"?from={from_date}&till={till_date}&start={cursor}&iss.meta=off&iss.only=history"
             )
-            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+            resp = HTTP.get(url, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             payload = resp.json()
             history = payload.get("history", {})
@@ -565,7 +603,7 @@ def fetch_eia_ng_storage() -> pl.DataFrame:
 
     url = "https://www.eia.gov/dnav/ng/xls/NG_STOR_WKLY_S1_W.xls"
     headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(url, headers=headers, timeout=30)
+    resp = HTTP.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
 
     df_raw = pd.read_excel(io.BytesIO(resp.content), sheet_name="Data 1", skiprows=3, header=None)
@@ -911,7 +949,7 @@ def fetch_margin_rates(starts: dict[str, str], till_date: str) -> pl.DataFrame:
                 f"{ISS_BASE_URL}/rms/engines/futures/objects/limits/{code}.json"
                 f"?from={from_date}&till={till_date}&start={cursor}&iss.meta=off"
             )
-            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+            resp = HTTP.get(url, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             payload = resp.json()
             block = payload.get("limits", {})
@@ -948,7 +986,7 @@ def fetch_margin_rates(starts: dict[str, str], till_date: str) -> pl.DataFrame:
 
 def _iss_block(url: str, block: str) -> list[dict[str, Any]]:
     """Строки одного блока ответа ISS как словари; ошибка запроса — исключение."""
-    resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+    resp = HTTP.get(url, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     payload = resp.json().get(block, {})
     cols = payload.get("columns", [])
@@ -1054,7 +1092,7 @@ def fetch_clearing_fx_rates(from_date: str, till_date: str) -> pl.DataFrame:
                 f"/securities/{pair}.json"
                 f"?from={from_date}&till={till_date}&start={cursor}&iss.meta=off"
             )
-            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+            resp = HTTP.get(url, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             payload = resp.json()
             block = payload.get("securities", {})
@@ -1132,6 +1170,11 @@ def main() -> None:
         help="Фильтр загрузки: all или через запятую (cbr,fx,china,usd,spot,indices,benchmarks,eia,calendar,contracts,margins,clearing_fx)",
     )
     args = parser.parse_args()
+    # Один писатель в data/ за раз: данные уже пишет пульт или другой скрипт —
+    # выходим с сообщением, кто именно (src/data/pipeline/lock.py).
+    from data.pipeline.lock import hold_data_lock
+
+    hold_data_lock("download_reference.py")
 
     REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1241,8 +1284,8 @@ def main() -> None:
                 df_eia = fetch_eia_ng_storage()
                 df_eia.write_parquet(p, compression="zstd")
                 log.info("  ✓ eia_ng_storage: %d недель за %.1fс", len(df_eia), time.time() - t0)
-            except Exception as exc:
-                log.warning("Не удалось загрузить отчет EIA: %s", exc)
+            except Exception as exc:  # noqa: BLE001 — граница: любая ошибка источника
+                source_failed(p.name, exc)
 
     # 9. Календарь макро-событий
     if run_all or "calendar" in only_set:
@@ -1285,7 +1328,7 @@ def main() -> None:
         try:
             new_df = fetch_margin_rates(starts, till_date)
         except (requests.RequestException, ValueError, KeyError) as exc:
-            log.error("  ✗ margin_rates: ошибка загрузки (%s), файл не изменён", exc)
+            source_failed("margin_rates.parquet", exc)
         else:
             if len(new_df) == 0:
                 full_df = old_df
@@ -1313,7 +1356,7 @@ def main() -> None:
         try:
             snap_df = fetch_margin_snapshot(datetime.now(ZoneInfo("Europe/Moscow")).date())
         except (requests.RequestException, ValueError, KeyError) as exc:
-            log.error("  ✗ margin_snapshot: ошибка загрузки (%s), файл не изменён", exc)
+            source_failed("margin_snapshot.parquet", exc)
         else:
             full_df = snap_df
             if p.exists():
@@ -1344,7 +1387,7 @@ def main() -> None:
             try:
                 new_df = fetch_clearing_fx_rates(from_d, till_date)
             except (requests.RequestException, ValueError, KeyError) as exc:
-                log.error("  ✗ rates_moex_clearing: ошибка загрузки (%s), файл не изменён", exc)
+                source_failed("rates_moex_clearing.parquet", exc)
             else:
                 if len(new_df) == 0:
                     log.info("  rates_moex_clearing: новых дней нет, файл не изменён.")
@@ -1359,6 +1402,9 @@ def main() -> None:
                     full_df.write_parquet(p, compression="zstd")
                     log.info("  ✓ rates_moex_clearing: %d записей за %.1fс", len(full_df), time.time() - t0)
 
+    if FAILED:
+        log.error("❌ Не обновились из-за ошибки источника: %s", ", ".join(FAILED))
+        sys.exit(1)
     log.info("✅ Обработка справочных данных завершена!")
 
 

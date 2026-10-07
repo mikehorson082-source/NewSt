@@ -96,20 +96,23 @@ def fetch_contract_history(
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 resp = s.get(url, params=params, timeout=REQUEST_TIMEOUT)
-                if resp.status_code == 200:
-                    payload = resp.json()
-                    data = payload.get("history", {})
-                    break
-                elif resp.status_code in (429, 502, 503, 504):
-                    time.sleep(REQUEST_DELAY * (2**attempt))
-                else:
-                    log.warning("SECID %s: HTTP %s на start=%s", secid, resp.status_code, start)
-                    break
             except requests.RequestException as exc:
                 if attempt == MAX_RETRIES:
                     log.error("SECID %s: исчерпаны попытки (%s)", secid, exc)
                     raise
                 time.sleep(REQUEST_DELAY * (2**attempt))
+                continue
+            if resp.status_code == 200:
+                payload = resp.json()
+                data = payload.get("history", {})
+                break
+            if resp.status_code in (429, 502, 503, 504) and attempt < MAX_RETRIES:
+                time.sleep(REQUEST_DELAY * (2**attempt))
+                continue
+            # Сбой нельзя принять за «новых дней нет»: при --update контракт молча
+            # считался бы актуальным, а в итогах было бы «Ошибок: 0». Несуществующий
+            # контракт ISS отдаёт как 200 с пустым списком, не как ошибку.
+            raise requests.HTTPError(f"SECID {secid}: HTTP {resp.status_code} на start={start}", response=resp)
 
         if not data:
             break
@@ -209,7 +212,9 @@ def process_single_contract(
                     else:
                         return {"secid": secid, "asset": asset, "status": "up_to_date", "rows": len(df_existing)}
             except Exception as e:
-                log.warning("Не удалось инкрементально обновить %s (%s), качаю заново", secid, e)
+                # Файл не трогаем: следующий --update докачает с того же места.
+                log.error("Не удалось инкрементально обновить %s (%s), файл не изменён: %s", secid, asset, e)
+                return {"secid": secid, "asset": asset, "status": "error", "error": str(e), "rows": 0}
 
         # Обычный пропуск, если не флаг update
         try:
@@ -257,8 +262,8 @@ def download_all_futures_daily(
     overwrite: bool = False,
     update: bool = False,
     asset_filter: list[str] | None = None,
-) -> None:
-    """Основной пайплайн скачивания и обновления дневных данных."""
+) -> int:
+    """Основной пайплайн скачивания и обновления дневных данных. Возвращает число ошибок."""
     paths = Paths(root=PROJECT_ROOT / "data")
     src_dir = paths.raw_futures_min
     dest_dir = paths.raw_futures_daily
@@ -266,7 +271,7 @@ def download_all_futures_daily(
     all_contracts = discover_contracts_to_download(src_dir)
     if not all_contracts:
         log.error("Не найдено контрактов для загрузки")
-        return
+        return 1
 
     if asset_filter:
         all_contracts = {k: v for k, v in all_contracts.items() if k in asset_filter}
@@ -327,6 +332,7 @@ def download_all_futures_daily(
     print(f"  Затраченное время:             {total_time:.1f} сек ({total_time / 60:.2f} мин)")
     print(f"  Папка назначения:              {dest_dir}")
     print("=" * 70)
+    return errors
 
 
 if __name__ == "__main__":
@@ -336,10 +342,17 @@ if __name__ == "__main__":
     parser.add_argument("--update", action="store_true", help="Инкрементально докачать новые дни для активных контрактов")
     parser.add_argument("--assets", nargs="+", help="Фильтр по активам (например: cocoa euro platinum)")
     args = parser.parse_args()
+    # Один писатель в data/ за раз: данные уже пишет пульт или другой скрипт —
+    # выходим с сообщением, кто именно (src/data/pipeline/lock.py).
+    from data.pipeline.lock import hold_data_lock
 
-    download_all_futures_daily(
+    hold_data_lock("download_futures_daily.py")
+
+    errors = download_all_futures_daily(
         max_workers=args.workers,
         overwrite=args.overwrite,
         update=args.update,
         asset_filter=args.assets,
     )
+    # Код 1 при ошибках: пульт и `python -m data.pipeline` покажут, что шаг не удался.
+    sys.exit(1 if errors else 0)

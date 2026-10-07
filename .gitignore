@@ -25,3 +25,7 @@ backtesting-py/
 # Фронтенд пульта (app/frontend): зависимости и сборка
 app/frontend/node_modules/
 app/frontend/dist/
+
+# Пульт: журнал запусков загрузки; блокировка «один писатель в data/»
+app/runs/
+data/.pipeline.lock

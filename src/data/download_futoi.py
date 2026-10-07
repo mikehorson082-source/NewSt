@@ -115,7 +115,9 @@ def fetch_futoi_chunk(
 ) -> tuple[list[list[Any]], list[str], bool]:
     """Запрашивает данные FUTOI за диапазон дат from_d..till_d.
 
-    Возвращает (rows, columns, is_cutoff_reached).
+    Возвращает (rows, columns, is_cutoff_reached). Сбой (сеть, HTTP не 200) —
+    исключение, а не пустой ответ: иначе тикер сохранился бы с дырой в эти дни,
+    и следующий --update начал бы уже после неё.
     """
     url = f"{FUTOI_BASE_URL}/securities/{ticker}.json"
     params = {"from": from_d, "till": till_d}
@@ -123,29 +125,29 @@ def fetch_futoi_chunk(
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = session.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
-            if resp.status_code == 200:
-                payload = resp.json()
-                futoi_block = payload.get("futoi", {})
-                cols = futoi_block.get("columns", [])
-                rows = futoi_block.get("data", [])
-
-                # Проверка на ошибку ограничения бесплатного доступа (T-14 дней)
-                if cols == ["ERROR_MESSAGE"] or (rows and len(rows) == 1 and isinstance(rows[0][0], str) and "Free users" in rows[0][0]):
-                    return [], cols, True
-
-                return rows, cols, False
-            elif resp.status_code in (429, 500, 502, 503, 504):
-                time.sleep(REQUEST_DELAY * (2**attempt))
-            else:
-                log.warning("Тикер %s [%s..%s]: HTTP %s", ticker, from_d, till_d, resp.status_code)
-                return [], [], False
         except requests.RequestException as exc:
             if attempt == MAX_RETRIES:
                 log.error("Тикер %s [%s..%s]: ошибка сети: %s", ticker, from_d, till_d, exc)
-                return [], [], False
+                raise
             time.sleep(REQUEST_DELAY * (2**attempt))
+            continue
+        if resp.status_code == 200:
+            payload = resp.json()
+            futoi_block = payload.get("futoi", {})
+            cols = futoi_block.get("columns", [])
+            rows = futoi_block.get("data", [])
 
-    return [], [], False
+            # Проверка на ошибку ограничения бесплатного доступа (T-14 дней)
+            if cols == ["ERROR_MESSAGE"] or (rows and len(rows) == 1 and isinstance(rows[0][0], str) and "Free users" in rows[0][0]):
+                return [], cols, True
+
+            return rows, cols, False
+        if resp.status_code in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES:
+            time.sleep(REQUEST_DELAY * (2**attempt))
+            continue
+        raise requests.HTTPError(f"Тикер {ticker} [{from_d}..{till_d}]: HTTP {resp.status_code}", response=resp)
+
+    raise AssertionError("unreachable")  # каждая попытка либо вернула ответ, либо продолжила, либо бросила
 
 
 def download_ticker_futoi(
@@ -280,6 +282,78 @@ def build_daily_pivot(df_5min: pl.DataFrame, ticker: str) -> pl.DataFrame:
     return daily
 
 
+def update_ticker(
+    idx: int,
+    total: int,
+    ticker: str,
+    paths: Paths,
+    args: argparse.Namespace,
+    from_date: str,
+    till_date: str,
+) -> int:
+    """Скачивает или докачивает FUTOI одного тикера: 1 — файл обновлён, 0 — нечего обновлять.
+
+    Сбой загрузки — исключение до записи: файл тикера не меняется.
+    """
+    file_5min = paths.raw_futoi_5min / f"{ticker}.parquet"
+    file_daily = paths.raw_futoi_daily / f"{ticker}.parquet"
+
+    current_from = from_date
+    existing_5min: pl.DataFrame | None = None
+
+    if file_5min.exists() and not args.force:
+        if not args.update:
+            log.info("[%d/%d] Тикер %s: уже существует, пропускаем (используйте --update для докачки)", idx, total, ticker)
+            return 0
+        else:
+            existing_5min = pl.read_parquet(file_5min)
+            max_dt = existing_5min["tradedate"].max()
+            if max_dt:
+                next_day = max_dt + timedelta(days=1)
+                current_from = next_day.strftime("%Y-%m-%d")
+                if current_from > till_date:
+                    log.info("[%d/%d] Тикер %s: актуален (последняя дата %s)", idx, total, ticker, max_dt)
+                    return 0
+
+    log.info("[%d/%d] Тикер %s: получение дат с %s по %s...", idx, total, ticker, current_from, till_date)
+    dates = get_trading_dates(current_from, till_date)
+    if not dates:
+        log.info("  Нет новых торговых дат для %s", ticker)
+        return 0
+
+    log.info("  Загрузка %d торговых дней (%d запросов)...", len(dates), (len(dates) + 1) // 2)
+    t0 = time.time()
+    new_df = download_ticker_futoi(ticker, dates, workers=args.workers)
+    elapsed = time.time() - t0
+
+    if new_df is None or len(new_df) == 0:
+        log.warning("  Тикер %s: нет данных за указанный период", ticker)
+        return 0
+
+    if existing_5min is not None:
+        full_5min = (
+            pl.concat([existing_5min, new_df])
+            .unique(subset=["tradedate", "tradetime", "clgroup"])
+            .sort(["timestamp", "clgroup"])
+        )
+    else:
+        full_5min = new_df
+
+    # Сохранение 5-минутного среза
+    full_5min.write_parquet(file_5min, compression="zstd")
+
+    # Формирование и сохранение дневного агрегата
+    daily_df = build_daily_pivot(full_5min, ticker)
+    daily_df.write_parquet(file_daily, compression="zstd")
+
+    mb_5min = file_5min.stat().st_size / (1024 * 1024)
+    log.info(
+        "  ✓ %s: %d строк (5min: %.2f MB, daily: %d дней) за %.1fс",
+        ticker, len(full_5min), mb_5min, len(daily_df), elapsed
+    )
+    return 1
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Загрузка данных FUTOI с MOEX Algopack")
     parser.add_argument(
@@ -318,6 +392,11 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    # Один писатель в data/ за раз: данные уже пишет пульт или другой скрипт —
+    # выходим с сообщением, кто именно (src/data/pipeline/lock.py).
+    from data.pipeline.lock import hold_data_lock
+
+    hold_data_lock("download_futoi.py")
     paths = Paths()
 
     paths.raw_futoi_5min.mkdir(parents=True, exist_ok=True)
@@ -355,69 +434,23 @@ def main() -> None:
     log.info("  Потоки: %d | Режим: %s", args.workers, "UPDATE" if args.update else ("FORCE" if args.force else "RESUME"))
 
     total_downloaded = 0
+    errors = 0
     t_start = time.time()
 
     for idx, ticker in enumerate(tickers, start=1):
-        file_5min = paths.raw_futoi_5min / f"{ticker}.parquet"
-        file_daily = paths.raw_futoi_daily / f"{ticker}.parquet"
-
-        current_from = from_date
-        existing_5min: pl.DataFrame | None = None
-
-        if file_5min.exists() and not args.force:
-            if not args.update:
-                log.info("[%d/%d] Тикер %s: уже существует, пропускаем (используйте --update для докачки)", idx, len(tickers), ticker)
-                continue
-            else:
-                existing_5min = pl.read_parquet(file_5min)
-                max_dt = existing_5min["tradedate"].max()
-                if max_dt:
-                    next_day = max_dt + timedelta(days=1)
-                    current_from = next_day.strftime("%Y-%m-%d")
-                    if current_from > till_date:
-                        log.info("[%d/%d] Тикер %s: актуален (последняя дата %s)", idx, len(tickers), ticker, max_dt)
-                        continue
-
-        log.info("[%d/%d] Тикер %s: получение дат с %s по %s...", idx, len(tickers), ticker, current_from, till_date)
-        dates = get_trading_dates(current_from, till_date)
-        if not dates:
-            log.info("  Нет новых торговых дат для %s", ticker)
-            continue
-
-        log.info("  Загрузка %d торговых дней (%d запросов)...", len(dates), (len(dates) + 1) // 2)
-        t0 = time.time()
-        new_df = download_ticker_futoi(ticker, dates, workers=args.workers)
-        elapsed = time.time() - t0
-
-        if new_df is None or len(new_df) == 0:
-            log.warning("  Тикер %s: нет данных за указанный период", ticker)
-            continue
-
-        if existing_5min is not None:
-            full_5min = (
-                pl.concat([existing_5min, new_df])
-                .unique(subset=["tradedate", "tradetime", "clgroup"])
-                .sort(["timestamp", "clgroup"])
-            )
-        else:
-            full_5min = new_df
-
-        # Сохранение 5-минутного среза
-        full_5min.write_parquet(file_5min, compression="zstd")
-
-        # Формирование и сохранение дневного агрегата
-        daily_df = build_daily_pivot(full_5min, ticker)
-        daily_df.write_parquet(file_daily, compression="zstd")
-
-        mb_5min = file_5min.stat().st_size / (1024 * 1024)
-        log.info(
-            "  ✓ %s: %d строк (5min: %.2f MB, daily: %d дней) за %.1fс",
-            ticker, len(full_5min), mb_5min, len(daily_df), elapsed
-        )
-        total_downloaded += 1
+        try:
+            total_downloaded += update_ticker(idx, len(tickers), ticker, paths, args, from_date, till_date)
+        except Exception as exc:  # noqa: BLE001 — сбой одного тикера не должен останавливать остальные
+            errors += 1
+            log.error("  ✗ Тикер %s: %s — файл не изменён, следующий --update докачает этот же период", ticker, exc)
 
     total_time = time.time() - t_start
-    log.info("Завершена загрузка FUTOI: обработано %d тикеров за %.1fс", total_downloaded, total_time)
+    log.info(
+        "Завершена загрузка FUTOI: обновлено %d тикеров, ошибок %d, за %.1fс", total_downloaded, errors, total_time
+    )
+    # Код 1 при ошибках: пульт и `python -m data.pipeline` покажут, что шаг не удался.
+    if errors:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

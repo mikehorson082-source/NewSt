@@ -81,20 +81,23 @@ def fetch_minute_candles(
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 resp = s.get(url, params=params, timeout=REQUEST_TIMEOUT)
-                if resp.status_code == 200:
-                    payload = resp.json()
-                    data = payload.get("candles", {})
-                    break
-                elif resp.status_code in (429, 502, 503, 504):
-                    time.sleep(REQUEST_DELAY * (2**attempt))
-                else:
-                    log.warning("SECID %s: HTTP %s на start=%s", secid, resp.status_code, start)
-                    break
             except requests.RequestException as exc:
                 if attempt == MAX_RETRIES:
                     log.error("SECID %s: исчерпаны попытки (%s)", secid, exc)
                     raise
                 time.sleep(REQUEST_DELAY * (2**attempt))
+                continue
+            if resp.status_code == 200:
+                payload = resp.json()
+                data = payload.get("candles", {})
+                break
+            if resp.status_code in (429, 502, 503, 504) and attempt < MAX_RETRIES:
+                time.sleep(REQUEST_DELAY * (2**attempt))
+                continue
+            # Сбой нельзя принять за «свечей больше нет»: при --update контракт молча
+            # считался бы актуальным, а в итогах было бы «Ошибок: 0». Несуществующий
+            # контракт ISS отдаёт как 200 с пустым списком, не как ошибку.
+            raise requests.HTTPError(f"SECID {secid}: HTTP {resp.status_code} на start={start}", response=resp)
 
         if not data:
             break
@@ -193,7 +196,9 @@ def process_contract_minutes(
                         else:
                             return {"secid": secid, "asset": asset, "status": "up_to_date", "rows": len(df_existing)}
             except Exception as exc:
-                log.warning("Ошибка при обновлении %s (%s), качаю заново: %s", secid, asset, exc)
+                # Файл не трогаем: следующий --update докачает с того же места.
+                log.error("Ошибка при обновлении %s (%s), файл не изменён: %s", secid, asset, exc)
+                return {"secid": secid, "asset": asset, "status": "error", "error": str(exc), "rows": 0}
 
         # Обычный пропуск уже скачанного
         try:
@@ -242,8 +247,8 @@ def download_futures_minutes(
     update: bool = False,
     asset_filter: list[str] | None = None,
     contract_filter: list[str] | None = None,
-) -> None:
-    """Главный пайплайн загрузки минутных данных."""
+) -> int:
+    """Главный пайплайн загрузки минутных данных. Возвращает число ошибок."""
     paths = Paths(root=PROJECT_ROOT / "data")
     dest_dir = paths.raw_futures_min
     daily_dir = paths.raw_futures_daily
@@ -251,7 +256,7 @@ def download_futures_minutes(
     catalog = get_contracts_catalog(daily_dir)
     if not catalog:
         log.error("Каталог инструментов пуст")
-        return
+        return 1
 
     # Фильтры
     if asset_filter:
@@ -314,6 +319,7 @@ def download_futures_minutes(
     print(f"  Затраченное время:             {total_time:.1f} сек ({total_time / 60:.2f} мин)")
     print(f"  Папка сохранения:              {dest_dir}")
     print("=" * 70)
+    return errors
 
 
 if __name__ == "__main__":
@@ -324,11 +330,18 @@ if __name__ == "__main__":
     parser.add_argument("--assets", nargs="+", help="Фильтр по активам (например: si brent gold)")
     parser.add_argument("--contracts", nargs="+", help="Фильтр по конкретным тикерам (например: SiU4 USDRUBF)")
     args = parser.parse_args()
+    # Один писатель в data/ за раз: данные уже пишет пульт или другой скрипт —
+    # выходим с сообщением, кто именно (src/data/pipeline/lock.py).
+    from data.pipeline.lock import hold_data_lock
 
-    download_futures_minutes(
+    hold_data_lock("download_futures_min.py")
+
+    errors = download_futures_minutes(
         max_workers=args.workers,
         overwrite=args.overwrite,
         update=args.update,
         asset_filter=args.assets,
         contract_filter=args.contracts,
     )
+    # Код 1 при ошибках: пульт и `python -m data.pipeline` покажут, что шаг не удался.
+    sys.exit(1 if errors else 0)

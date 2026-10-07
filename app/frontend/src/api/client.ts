@@ -1,4 +1,4 @@
-import type { ApiGet, ApiPatch } from './schema'
+import type { ApiGet, ApiPatch, ApiPost } from './schema'
 
 export class ApiError extends Error {
   status: number
@@ -22,9 +22,22 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
   return (await response.json()) as T
 }
 
-/** GET к API; тип ответа берётся из контракта: apiGet('/api/data/status') → InventoryReport. */
-export function apiGet<P extends keyof ApiGet>(path: P, signal?: AbortSignal): Promise<ApiGet[P]> {
-  return request(path, { signal })
+/**
+ * GET к API; тип ответа берётся из контракта: apiGet('/api/data/status') → InventoryReport.
+ * query — параметры строки запроса: apiGet('/api/pipeline/log', signal, { run_id, offset }).
+ */
+export function apiGet<P extends keyof ApiGet>(
+  path: P,
+  signal?: AbortSignal,
+  query?: Record<string, string | number>,
+): Promise<ApiGet[P]> {
+  const params = query ? new URLSearchParams(Object.entries(query).map(([key, value]) => [key, String(value)])) : null
+  return request(params ? `${path}?${params}` : path, { signal })
+}
+
+/** POST к API: тело и ответ — из контракта (ApiPost в schema.ts). */
+export function apiPost<P extends keyof ApiPost>(path: P, body: ApiPost[P]['body']): Promise<ApiPost[P]['response']> {
+  return request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
 }
 
 /** PATCH к API: тело и ответ — из контракта (ApiPatch в schema.ts). */

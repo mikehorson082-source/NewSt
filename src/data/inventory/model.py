@@ -50,7 +50,13 @@ class DatasetStatus:
     modified_at: datetime | None = None
     lag_days: int | None = None  # торговых дней после last_date до ожидаемой даты
     note: str | None = None  # почему такой статус
+    # Правило проверки из rules.json по-русски: «Норма — отставание до 10 торговых дней. Бесплатный тариф…».
+    rule: str | None = None
     facts: tuple[Fact, ...] = ()
+    # Строк по календарным месяцам подряд: первое число — месяц first_date, последнее —
+    # месяц last_date, месяц без данных — 0. Пусто — по месяцам не считается.
+    # Пример: first_date 18.03.2019, monthly (9800, 21000, 0, …) — март, апрель, май без данных.
+    monthly: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -18,13 +18,17 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from core.config import DATA_DIR
+from data.pipeline import STEPS, Step
 
 from .routers import data as data_routes
+from .routers import pipeline as pipeline_routes
 from .routers import settings as settings_routes
+from .runs import RunManager
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FRONTEND_DIST = PROJECT_ROOT / "app" / "frontend" / "dist"
 SETTINGS_DIR = PROJECT_ROOT / "app" / "settings"
+RUNS_DIR = PROJECT_ROOT / "app" / "runs"  # журнал запусков загрузки и их логи
 
 NOT_BUILT = """<!doctype html>
 <html lang="ru"><meta charset="utf-8"><title>Кабинет исследователя</title>
@@ -39,12 +43,17 @@ NOT_BUILT = """<!doctype html>
 
 
 def create_app(
-    data_root: Path = DATA_DIR, frontend_dist: Path = FRONTEND_DIST, settings_dir: Path = SETTINGS_DIR
+    data_root: Path = DATA_DIR,
+    frontend_dist: Path = FRONTEND_DIST,
+    settings_dir: Path = SETTINGS_DIR,
+    runs_dir: Path = RUNS_DIR,
+    steps: tuple[Step, ...] = STEPS,
 ) -> FastAPI:
-    """Приложение пульта. Пути — параметры, чтобы тесты подставляли свои папки."""
+    """Приложение пульта. Пути и шаги — параметры, чтобы тесты подставляли свои."""
     app = FastAPI(title="NewSt · Кабинет исследователя", version="0.1.0")
     app.state.data_root = data_root
     app.state.settings_dir = settings_dir
+    app.state.runs = RunManager(runs_dir, data_root, steps)
     # Инвентарь — сотни наборов (~600 КБ JSON): сжатие уменьшает ответ примерно в 10 раз.
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
@@ -54,6 +63,7 @@ def create_app(
 
     app.include_router(data_routes.router)
     app.include_router(settings_routes.router)
+    app.include_router(pipeline_routes.router)
 
     # Фронтенд проверяется на каждом запросе: собрал его при запущенном
     # сервере — достаточно обновить страницу.

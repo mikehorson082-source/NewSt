@@ -184,11 +184,14 @@ export default function InstrumentTable(props: Props) {
                       ))}
                     </TableRow>
                     {row.getIsExpanded() && (
-                      <TableRow className="hover:bg-transparent">
-                        <TableCell colSpan={row.getVisibleCells().length} className="p-0 whitespace-normal">
-                          <DatasetList datasets={row.original.datasets} expectedDate={expectedDate} />
-                        </TableCell>
-                      </TableRow>
+                      <DatasetList
+                        datasets={row.original.datasets}
+                        expectedDate={expectedDate}
+                        columns={row.getVisibleCells().map(({ column }) => ({
+                          id: column.id,
+                          className: column.columnDef.meta?.className,
+                        }))}
+                      />
                     )}
                   </SortableRow>
                 ))}

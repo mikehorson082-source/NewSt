@@ -6,6 +6,7 @@ import {
   expectedOffset,
   filterTree,
   instrumentRow,
+  monthSteps,
   timeAxis,
   yearLabelStep,
   type Filter,
@@ -27,7 +28,9 @@ function row(overrides: Partial<DatasetStatus>): DatasetStatus {
     modified_at: null,
     lag_days: 0,
     note: null,
+    rule: null,
     facts: [],
+    monthly: [],
     ...overrides,
   }
 }
@@ -170,5 +173,32 @@ describe('строка инструмента', () => {
       rows: [row({ first_date: null, last_date: null, rows: null, status: 'unchecked' })],
     })
     expect(summary).toMatchObject({ worst: 'unchecked', firstDate: null, lastDate: null, totalRows: null })
+  })
+})
+
+describe('график по месяцам', () => {
+  const axis = { start: Date.UTC(2024, 2, 1), end: Date.UTC(2024, 5, 1), years: [] }
+
+  it('высота — строки за будний день: неполный первый месяц не проваливается', () => {
+    // Март с пн 18-го: 10 будней по 100 строк; апрель 22 будня по 100; май пуст.
+    const steps = monthSteps('2024-03-18', '2024-05-31', [1000, 2200, 0], axis)
+    expect(steps.map((step) => step.value)).toEqual([1, 1, 0])
+  })
+
+  it('хвост из одних будней не подскакивает над полным месяцем', () => {
+    // Апрель 2024: 22 будня по 5 строк; 1–2 мая (ср, чт) — тоже по 5.
+    const steps = monthSteps('2024-04-01', '2024-05-02', [110, 10], axis)
+    expect(steps.map((step) => step.value)).toEqual([1, 1])
+  })
+
+  it('ступени стоят на оси от первой даты до конца последнего дня', () => {
+    const steps = monthSteps('2024-03-18', '2024-05-31', [1000, 2200, 0], axis)
+    expect(steps[0].left).toBeCloseTo((17 / 92) * 100)
+    expect(steps[0].right).toBeCloseTo((31 / 92) * 100)
+    expect(steps[2].right).toBeCloseTo(100)
+  })
+
+  it('без строк — все ступени нулевые', () => {
+    expect(monthSteps('2024-03-01', '2024-04-30', [0, 0], axis).map((step) => step.value)).toEqual([0, 0])
   })
 })

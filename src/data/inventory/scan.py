@@ -1,10 +1,10 @@
 """Чтение data/ для инвентаря: метаданные файлов, свежесть, срезы справочников.
 
 Только читает. У parquet-файлов открывается «оглавление» (метаданные): число
-строк и min/max колонки даты из статистики, сами данные не читаются. Целиком
-читаются только маленькие справочники, колонка даты склеек (для пропусков)
-и колонки secid/tradedate Algopack (по акциям). Всё кэшируется по времени
-изменения файла: файл не менялся — повторно не читается.
+строк и min/max колонки даты из статистики. Колонка даты читается ещё и для
+счёта строк по месяцам (график на странице). Целиком читаются только маленькие
+справочники и колонки secid/tradedate Algopack (по акциям). Всё кэшируется по
+времени изменения файла: файл не менялся — повторно не читается.
 
 Свежесть. Ожидаемая дата — последний завершённый торговый день до сегодня
 (пн–пт и рабочие субботы из reference/ru_working_saturdays.json). Праздники
@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from functools import lru_cache
@@ -33,25 +34,24 @@ import polars as pl
 import pyarrow.parquet as pq
 
 from core.config import Paths
+from core.instruments import ASSETS
 
 from .catalog import (
     ALGOPACK_DATASETS,
     ALGOPACK_MARKETS,
     CONTINUOUS_ALL,
     CONTINUOUS_SERVICE,
-    FUTOI_ALLOWED_LAG,
+    CONTRACTS_HINT,
     REBUILD_HINT,
     REFERENCE_FILES,
     ReferenceSpec,
     RefLink,
+    futoi_market,
 )
 from .model import SEVERITY, DatasetStatus, Fact, Status
+from .rules import CONTRACTS_FILE, Rule, Rules
 
 MSK = ZoneInfo("Europe/Moscow")
-
-# Сколько торговых дней сверх допустимого отставания набор «отстаёт»;
-# дальше он «устарел».
-STALE_AFTER = 5
 
 # Сколько дат пропусков перечислять в заметке.
 GAPS_IN_NOTE = 5
@@ -82,13 +82,16 @@ def trading_days_behind(last: date, expected: date, working_saturdays: frozenset
 
 
 def freshness(
-    last: date, expected: date, allowed_lag: int, working_saturdays: frozenset[date] = frozenset()
+    last: date, expected: date, allowed_lag: int, stale_after: int, working_saturdays: frozenset[date] = frozenset()
 ) -> tuple[Status, int]:
-    """Статус свежести и отставание в торговых днях."""
+    """Статус свежести и отставание в торговых днях.
+
+    stale_after — сколько торговых дней сверх допустимого набор «отстаёт»; дальше «устарел».
+    """
     lag = trading_days_behind(last, expected, working_saturdays)
     if lag <= allowed_lag:
         return "ok", lag
-    if lag <= allowed_lag + STALE_AFTER:
+    if lag <= allowed_lag + stale_after:
         return "lagging", lag
     return "stale", lag
 
@@ -112,6 +115,21 @@ def trading_days_text(n: int) -> str:
     return f"{n} {plural(n, ('торговый день', 'торговых дня', 'торговых дней'))}"
 
 
+def rule_text(rule: Rule) -> str:
+    """Правило по-русски для кабинета: норма и почему."""
+    if rule.min_active_contracts is not None:
+        n = rule.min_active_contracts
+        norm = f"Норма — у рынка не меньше {n} {plural(n, ('торгуемого контракта', 'торгуемых контрактов', 'торгуемых контрактов'))}."
+    elif rule.allowed_lag == 0:
+        norm = "Норма — данные по последний завершённый торговый день."
+    elif rule.allowed_lag is not None:
+        n = rule.allowed_lag
+        norm = f"Норма — отставание до {n} {plural(n, ('торгового дня', 'торговых дней', 'торговых дней'))}."
+    else:
+        norm = "Свежесть не проверяется."
+    return f"{norm} {rule.why}"
+
+
 # ------------------------------------------------------------ file metadata
 @dataclass(frozen=True)
 class FileMeta:
@@ -133,6 +151,58 @@ def as_date(value: object) -> date | None:
     raise TypeError(f"не дата: {value!r}")
 
 
+# ------------------------------------------------------------------- months
+# Строки по месяцам: ((первое число месяца, строк), …) по возрастанию месяцев.
+Months = tuple[tuple[date, int], ...]
+
+
+def months_of(values: pl.Series) -> Months:
+    """Строки по месяцам из колонки дат (date, datetime или ISO-строки)."""
+    frame = (
+        values.drop_nulls()
+        .cast(pl.Date)
+        .dt.truncate("1mo")
+        .to_frame("month")
+        .group_by("month")
+        .len()
+        .sort("month")
+    )
+    return tuple(zip(frame["month"].to_list(), frame["len"].to_list(), strict=True))
+
+
+def merge_months(parts: Iterable[Months]) -> Months:
+    total: Counter[date] = Counter()
+    for part in parts:
+        for month, rows in part:
+            total[month] += rows
+    return tuple(sorted(total.items()))
+
+
+@lru_cache(maxsize=16384)
+def file_months(path: str, column: str, mtime_ns: int, size: int) -> Months:
+    """Строки файла по месяцам колонки даты; mtime_ns и size — ключ кэша."""
+    del mtime_ns, size
+    return months_of(pl.read_parquet(path, columns=[column])[column])
+
+
+def next_month(month: date) -> date:
+    return date(month.year + month.month // 12, month.month % 12 + 1, 1)
+
+
+def monthly_rows(months: Months, first: date | None, last: date | None) -> tuple[int, ...]:
+    """Строк по месяцам подряд от месяца first до месяца last; месяц без данных — 0."""
+    if not months or first is None or last is None:
+        return ()
+    counts = dict(months)
+    out: list[int] = []
+    month = first.replace(day=1)
+    while month <= last:
+        out.append(counts.get(month, 0))
+        month = next_month(month)
+    return tuple(out)
+
+
+# ------------------------------------------------------------ parquet meta
 @lru_cache(maxsize=16384)
 def parquet_meta(path: str, column: str | None, mtime_ns: int, size: int) -> FileMeta:
     """Число строк и min/max колонки даты по статистике parquet.
@@ -181,6 +251,7 @@ class Scan:
     size: int = 0
     modified: datetime | None = None
     errors: tuple[str, ...] = ()
+    months: Months = ()  # пусто — по месяцам не считали
 
 
 def modified_at(timestamp: float | None) -> datetime | None:
@@ -196,6 +267,7 @@ def scan_parquet(files: Sequence[Path], column: str | None) -> Scan:
     lasts: list[date] = []
     mtimes: list[float] = []
     errors: list[str] = []
+    months: list[Months] | None = [] if column is not None else None
     for path in files:
         stat = path.stat()
         size += stat.st_size
@@ -209,6 +281,11 @@ def scan_parquet(files: Sequence[Path], column: str | None) -> Scan:
         if meta.first is not None and meta.last is not None:
             firsts.append(meta.first)
             lasts.append(meta.last)
+        if months is not None and column is not None:
+            try:
+                months.append(file_months(str(path), column, stat.st_mtime_ns, stat.st_size))
+            except Exception:  # noqa: BLE001 — неполный график хуже, чем никакого
+                months = None
     return Scan(
         files=len(files),
         rows=rows,
@@ -217,6 +294,7 @@ def scan_parquet(files: Sequence[Path], column: str | None) -> Scan:
         size=size,
         modified=modified_at(max(mtimes, default=None)),
         errors=tuple(errors),
+        months=merge_months(months) if months is not None else (),
     )
 
 
@@ -243,6 +321,7 @@ def csv_scan(path: Path, column: str) -> Scan:
         last=as_date(values.max()),
         size=stat.st_size,
         modified=modified_at(stat.st_mtime),
+        months=months_of(values),
     )
 
 
@@ -257,6 +336,7 @@ def scan_json_dates(path: Path) -> Scan:
         last=days[-1] if days else None,
         size=stat.st_size,
         modified=modified_at(stat.st_mtime),
+        months=months_of(pl.Series(days, dtype=pl.Date)),
     )
 
 
@@ -301,6 +381,7 @@ class Context:
     data_root: Path
     expected: date
     working_saturdays: frozenset[date]
+    rules: Rules
 
     @property
     def paths(self) -> Paths:
@@ -331,12 +412,12 @@ def make_status(
     description: str,
     path: Path,
     scan: Scan,
-    allowed_lag: int | None,
+    rule: Rule | None,
     facts: tuple[Fact, ...] = (),
     note: str | None = None,
     key: str | None = None,
 ) -> DatasetStatus:
-    """Набор по сводке файлов и правилу свежести (allowed_lag None — не проверять).
+    """Набор по сводке файлов и правилу свежести (нет правила или allowed_lag None — не проверять).
 
     key — ключ среза («BR»): id становится «путь#ключ».
     """
@@ -348,13 +429,13 @@ def make_status(
     elif scan.files == 0:
         status = "missing"
         note = note or "нет файлов"
-    elif allowed_lag is None:
+    elif rule is None or rule.allowed_lag is None:
         status = "unchecked"
     elif scan.last is None:
         status = "missing"
         note = join_notes("в файлах нет дат", note)
     else:
-        status, lag = freshness(scan.last, ctx.expected, allowed_lag, ctx.working_saturdays)
+        status, lag = freshness(scan.last, ctx.expected, rule.allowed_lag, ctx.rules.stale_after, ctx.working_saturdays)
     rel = ctx.rel(path)
     return DatasetStatus(
         id=f"{rel}#{key}" if key else rel,
@@ -371,7 +452,9 @@ def make_status(
         modified_at=scan.modified,
         lag_days=lag,
         note=note,
+        rule=rule_text(rule) if rule is not None else None,
         facts=facts,
+        monthly=monthly_rows(scan.months, scan.first, scan.last),
     )
 
 
@@ -383,7 +466,7 @@ def missing_folder(ctx: Context, folder: Path) -> DatasetStatus:
         description="Папка из раскладки data/",
         path=folder,
         scan=Scan(),
-        allowed_lag=None,
+        rule=None,
         note="нет папки",
     )
 
@@ -394,6 +477,42 @@ def reference_facts(path: Path, spec: ReferenceSpec) -> tuple[Fact, ...]:
         return ()
     values = frame_of(path)[spec.count_column]
     return (Fact(spec.count_label, values.n_unique()),)
+
+
+def active_contracts(frame: pl.DataFrame, expected: date) -> dict[str, int]:
+    """Торгуемых контрактов по asset_code: последний день торгов позже ожидаемой даты."""
+    active = frame.filter(pl.col("last_trade_date") > expected).group_by("asset_code").len()
+    return dict(active.iter_rows())
+
+
+def check_contracts(ctx: Context, row: DatasetStatus, frame: pl.DataFrame, market: str | None = None) -> DatasetStatus:
+    """Хватает ли торгуемых контрактов по правилу futures_contracts.parquet.
+
+    market None — все рынки реестра (файл целиком), иначе один рынок (срез карточки).
+    Пример: в справочнике у Si остался один SIZ6 при норме 2 — «отстаёт»:
+    биржа уже открыла SIH7, а справочник о нём не знает. Ни одного — «устарел».
+    """
+    if row.status != "unchecked":  # нет файла, не читается
+        return row
+    try:
+        counts = active_contracts(frame, ctx.expected)
+    except Exception as error:  # noqa: BLE001 — нет колонки last_trade_date: показываем в строке
+        return replace(row, status="error", note=join_notes(f"не посчитать торгуемые контракты: {error}", row.note))
+    status: Status = "ok"
+    short = []
+    for name in ASSETS if market is None else [market]:
+        rule = ctx.rules.rule(CONTRACTS_FILE, name)
+        if rule is None or rule.min_active_contracts is None:
+            continue
+        count = counts.get(ASSETS[name].asset_code, 0)
+        if count < rule.min_active_contracts:
+            status = worse(status, "lagging" if count else "stale")
+            short.append(f"{name} — {count} из {rule.min_active_contracts}")
+    note = f"мало торгуемых контрактов: {', '.join(short)}; обновите: {CONTRACTS_HINT}" if short else None
+    facts = row.facts
+    if market is not None:
+        facts += (Fact("Торгуемых", counts.get(ASSETS[market].asset_code, 0)),)
+    return replace(row, status=status, note=join_notes(note, row.note), facts=facts)
 
 
 def scan_reference(ctx: Context) -> dict[str, DatasetStatus]:
@@ -420,10 +539,12 @@ def scan_reference(ctx: Context) -> dict[str, DatasetStatus]:
             description=spec.description,
             path=path,
             scan=scan,
-            allowed_lag=spec.allowed_lag,
+            rule=ctx.rules.rule(spec.file),
             facts=facts,
             note=None if path.is_file() else "нет файла",
         )
+        if spec.file == CONTRACTS_FILE and rows[spec.file].status == "unchecked":
+            rows[spec.file] = check_contracts(ctx, rows[spec.file], frame_of(path))
     for path in visible_files(folder):
         if path.name in rows:
             continue
@@ -435,15 +556,21 @@ def scan_reference(ctx: Context) -> dict[str, DatasetStatus]:
             description="Нет в каталоге инвентаря",
             path=path,
             scan=scan,
-            allowed_lag=None,
+            rule=None,
         )
     return rows
 
 
-def reference_slice(ctx: Context, spec: ReferenceSpec, link: RefLink) -> DatasetStatus | None:
-    """Срез справочника по ключу (asset_code == "BR"). Пустой срез — None."""
+def reference_slice(
+    ctx: Context, spec: ReferenceSpec, link: RefLink, market: str | None = None
+) -> DatasetStatus | None:
+    """Срез справочника по ключу (asset_code == "BR"). Пустой срез — None.
+
+    market — рынок карточки: по нему берётся исключение из rules.json.
+    """
     path = ctx.paths.reference / spec.file
     key = str(link.value)
+    rule = ctx.rules.rule(spec.file, market)
     try:
         part = frame_of(path).filter(pl.col(str(link.column)) == link.value)
     except Exception as error:  # noqa: BLE001 — сбой чтения показываем в строке инструмента
@@ -455,29 +582,36 @@ def reference_slice(ctx: Context, spec: ReferenceSpec, link: RefLink) -> Dataset
             description=spec.description,
             path=path,
             scan=scan,
-            allowed_lag=spec.allowed_lag,
+            rule=rule,
             key=key,
         )
     if part.is_empty():
         return None
     first = last = None
+    months: Months = ()
     if spec.date_column is not None:
         first, last = as_date(part[spec.date_column].min()), as_date(part[spec.date_column].max())
+        months = months_of(part[spec.date_column])
     facts: tuple[Fact, ...] = ()
     if link.fact_column is not None and link.fact_label is not None:
         facts = (Fact(link.fact_label, part[link.fact_column].n_unique()),)
-    scan = Scan(files=1, rows=part.height, first=first, last=last, modified=modified_at(path.stat().st_mtime))
-    return make_status(
+    scan = Scan(
+        files=1, rows=part.height, first=first, last=last, modified=modified_at(path.stat().st_mtime), months=months
+    )
+    row = make_status(
         ctx,
         kind="reference",
         title=path.stem,
         description=f"{spec.description} · {key}",
         path=path,
         scan=scan,
-        allowed_lag=spec.allowed_lag,
+        rule=rule,
         facts=facts,
         key=key,
     )
+    if spec.file == CONTRACTS_FILE and market in ASSETS:
+        row = check_contracts(ctx, row, part, market)
+    return row
 
 
 def column_values(path: Path, column: str) -> set[str]:
@@ -504,14 +638,14 @@ def scan_contract_dirs(ctx: Context, kind: str, folder: Path, column: str, title
             description="файл на контракт",
             path=market,
             scan=scan,
-            allowed_lag=0,
+            rule=ctx.rules.rule(kind, market.name),
             facts=(Fact("Контрактов", scan.files),),
         )
     return rows
 
 
 def scan_futoi(ctx: Context, kind: str, folder: Path, title: str) -> dict[str, DatasetStatus]:
-    """Файл на тикер: {тикер: набор}. Задержка бесплатного API — норма."""
+    """Файл на тикер: {тикер: набор}. Правило — по рынку тикера (Si → si)."""
     if not folder.is_dir():
         return {}
     return {
@@ -519,10 +653,10 @@ def scan_futoi(ctx: Context, kind: str, folder: Path, title: str) -> dict[str, D
             ctx,
             kind=kind,
             title=title,
-            description=f"тикер {path.stem} · задержка бесплатного API — 2 недели",
+            description=f"тикер {path.stem}",
             path=path,
             scan=scan_parquet([path], "tradedate"),
-            allowed_lag=FUTOI_ALLOWED_LAG,
+            rule=ctx.rules.rule(kind, futoi_market(path.stem)),
         )
         for path in visible_files(folder, "*.parquet")
     }
@@ -575,6 +709,7 @@ def scan_continuous(
         if path.name == CONTINUOUS_ALL:
             continue
         market = path.name.removesuffix("_15m.parquet")
+        rule = ctx.rules.rule("continuous", market)
         scan = scan_parquet([path], "date")
         try:
             days = dates_of(path, "date")
@@ -598,15 +733,17 @@ def scan_continuous(
             description="по обороту, с NAV",
             path=path,
             scan=scan,
-            allowed_lag=0,
+            rule=rule,
             facts=tuple(facts),
             note=join_notes(*notes),
         )
-        # Минутки свежее склейки — склейку пора пересобрать.
+        # Минутки свежее склейки больше чем на день — склейку пора пересобрать.
+        # На один день склейка позади всегда: последний день минуток она не берёт.
         source_last = raw_last.get(market)
-        if row.status != "error" and scan.last is not None and source_last is not None:
+        allowed = rule.allowed_lag if rule is not None else None
+        if row.status != "error" and allowed is not None and scan.last is not None and source_last is not None:
             behind = trading_days_behind(scan.last, source_last, ctx.working_saturdays)
-            if behind > 0:
+            if behind > allowed:
                 row = replace(
                     row,
                     status=worse(row.status, "lagging"),
@@ -628,7 +765,7 @@ def scan_continuous(
                 description=description,
                 path=path,
                 scan=scan_parquet([path], column) if path.is_file() else Scan(),
-                allowed_lag=0,
+                rule=ctx.rules.rule("continuous"),
                 note=None if path.is_file() else "нет файла",
             )
         )
@@ -641,7 +778,7 @@ def scan_continuous(
             description="Расписание переходов между контрактами",
             path=schedule,
             scan=csv_scan(schedule, "roll_date") if schedule.is_file() else Scan(),
-            allowed_lag=None,
+            rule=None,
             facts=(Fact("Рынков", len(rolls)),) if rolls else (),
             note=None if schedule.is_file() else "нет файла",
         )
@@ -668,28 +805,45 @@ def scan_algopack(ctx: Context) -> list[DatasetStatus]:
                     description=f"{ALGOPACK_MARKETS.get(market.name, market.name)}: {label}",
                     path=dataset,
                     scan=scan,
-                    allowed_lag=None,
+                    rule=ctx.rules.rule("algopack"),
                     facts=(Fact("Файлов", scan.files),),
                 )
             )
     return rows
 
 
+@dataclass(frozen=True)
+class SecidRange:
+    first: date
+    last: date
+    rows: int
+    months: Months
+
+
 @lru_cache(maxsize=256)
-def secid_ranges(path: str, mtime_ns: int, size: int) -> dict[str, tuple[date, date, int]]:
-    """Файл Algopack по бумагам: {secid: (первая дата, последняя, строк)}; mtime_ns и size — ключ кэша."""
+def secid_ranges(path: str, mtime_ns: int, size: int) -> dict[str, SecidRange]:
+    """Файл Algopack по бумагам: {secid: даты, строки, строки по месяцам}; mtime_ns и size — ключ кэша."""
     del mtime_ns, size
     frame = (
         pl.scan_parquet(path)
         .filter(pl.col("secid").is_not_null())
-        .group_by("secid")
+        .group_by("secid", pl.col("tradedate").cast(pl.Date).dt.truncate("1mo").alias("month"))
         .agg(pl.col("tradedate").min().alias("lo"), pl.col("tradedate").max().alias("hi"), pl.len().alias("n"))
+        .sort("secid", "month")
         .collect()
     )
-    return {row["secid"]: (row["lo"], row["hi"], row["n"]) for row in frame.iter_rows(named=True)}
+    out: dict[str, SecidRange] = {}
+    for part in frame.partition_by("secid", maintain_order=True):
+        out[part["secid"][0]] = SecidRange(
+            first=as_date(part["lo"].min()) or date.min,
+            last=as_date(part["hi"].max()) or date.min,
+            rows=int(part["n"].sum()),
+            months=tuple(zip(part["month"].to_list(), part["n"].to_list(), strict=True)),
+        )
+    return out
 
 
-def file_secid_ranges(path: Path) -> dict[str, tuple[date, date, int]]:
+def file_secid_ranges(path: Path) -> dict[str, SecidRange]:
     """Нечитаемый файл даёт пустой результат: его ошибку покажет набор Algopack целиком."""
     stat = path.stat()
     with contextlib.suppress(Exception):
@@ -703,14 +857,15 @@ def algopack_by_secid(dataset: Path) -> dict[str, Scan]:
     files = visible_files(dataset, "*.parquet")
     modified = modified_at(max((path.stat().st_mtime for path in files), default=None))
     for path in files:
-        for secid, (lo, hi, n) in file_secid_ranges(path).items():
+        for secid, part in file_secid_ranges(path).items():
             old = merged.get(secid)
             merged[secid] = Scan(
                 files=(old.files if old else 0) + 1,
-                rows=(old.rows if old else 0) + n,
-                first=min(lo, old.first) if old and old.first else lo,
-                last=max(hi, old.last) if old and old.last else hi,
+                rows=(old.rows if old else 0) + part.rows,
+                first=min(part.first, old.first) if old and old.first else part.first,
+                last=max(part.last, old.last) if old and old.last else part.last,
                 modified=modified,
+                months=merge_months([old.months, part.months]) if old else part.months,
             )
     return merged
 
@@ -724,7 +879,7 @@ def algopack_slice(ctx: Context, dataset: Path, secid: str, scan: Scan) -> Datas
         description=f"{dataset.name} · {secid} · архив",
         path=dataset,
         scan=scan,
-        allowed_lag=None,
+        rule=ctx.rules.rule("algopack"),
         key=secid,
     )
 
@@ -752,7 +907,7 @@ def scan_other(ctx: Context) -> list[DatasetStatus]:
                 description="Нет в каталоге инвентаря",
                 path=folder,
                 scan=plain_scan(files),
-                allowed_lag=None,
+                rule=None,
                 facts=(Fact("Файлов", len(files)),),
             )
         )

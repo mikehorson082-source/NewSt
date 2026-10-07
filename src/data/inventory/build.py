@@ -27,6 +27,7 @@ from .catalog import (
     stock_links,
 )
 from .model import SEVERITY, DatasetStatus, Instrument, InventoryReport, Section
+from .rules import Rules, load_rules
 from .scan import (
     MSK,
     Context,
@@ -65,8 +66,10 @@ class Collector:
         return Instrument(id=id, title=title, subtitle=subtitle, datasets=tuple(dict.fromkeys(r.id for r in present)))
 
 
-def linked(ctx: Context, reference: dict[str, DatasetStatus], link: RefLink) -> DatasetStatus | None:
-    """Справочник для карточки: файл целиком или срез.
+def linked(
+    ctx: Context, reference: dict[str, DatasetStatus], link: RefLink, market: str | None = None
+) -> DatasetStatus | None:
+    """Справочник для карточки: файл целиком или срез (market — рынок карточки фьючерса).
 
     Нет файла — None: отсутствие показывается один раз в «Общее», а не в
     каждой из сотен карточек.
@@ -77,15 +80,15 @@ def linked(ctx: Context, reference: dict[str, DatasetStatus], link: RefLink) -> 
         return None
     if link.column is None or spec is None:
         return reference.get(link.file)
-    return reference_slice(ctx, spec, link)
+    return reference_slice(ctx, spec, link, market)
 
 
 def section(id: str, title: str, description: str, instruments: Iterable[Instrument | None]) -> Section:
     return Section(id, title, description, tuple(item for item in instruments if item is not None))
 
 
-def build_inventory(data_root: Path = DATA_DIR, today: date | None = None) -> InventoryReport:
-    """Инвентарь data/ по инструментам. Ничего не пишет."""
+def build_inventory(data_root: Path = DATA_DIR, today: date | None = None, rules: Rules | None = None) -> InventoryReport:
+    """Инвентарь data/ по инструментам. Ничего не пишет. Правила — из rules.json, если не переданы."""
     data_root = data_root.resolve()
     now = datetime.now(MSK).replace(microsecond=0)
     working_saturdays = load_working_saturdays(Paths(root=data_root).reference)
@@ -93,6 +96,7 @@ def build_inventory(data_root: Path = DATA_DIR, today: date | None = None) -> In
         data_root=data_root,
         expected=expected_last_date(today or now.date(), working_saturdays),
         working_saturdays=working_saturdays,
+        rules=rules or load_rules(),
     )
     paths = ctx.paths
     reference = scan_reference(ctx)
@@ -136,7 +140,7 @@ def build_inventory(data_root: Path = DATA_DIR, today: date | None = None) -> In
         rows: list[DatasetStatus | None] = [minutes.get(name), daily.get(name), continuous.get(name)]
         for ticker in futoi_by_market.get(name, []):
             rows += [futoi_5min.get(ticker), futoi_daily.get(ticker)]
-        rows += [linked(ctx, reference, link) for link in market_links(name)]
+        rows += [linked(ctx, reference, link, name) for link in market_links(name)]
         for ticker in UNDERLYING_STOCKS.get(name, ()):
             rows += stock_rows(ticker)
         spec = ASSETS.get(name)
