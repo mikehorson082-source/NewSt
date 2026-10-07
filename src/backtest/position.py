@@ -15,9 +15,16 @@
 
 Уровни стопа и цели задаются в реальных ценах бара сигнала. Внутри они
 хранятся в непрерывном (adjusted) пространстве через `price_adjustment`,
-поэтому при переносе не «прыгают». P&L считается по adjusted-ценам: для
-рынков с постоянным `point_value` это в точности рубли. Заявки исполняются
-в реальных ценах: аддитивная поправка может увести adjusted-цены ниже нуля.
+поэтому при переносе не «прыгают». Заявки исполняются в реальных ценах:
+аддитивная поправка может увести adjusted-цены ниже нуля.
+
+P&L начисляется по барам, как биржа начисляет вариационную маржу:
+изменение цены за бар × рубли за пункт этого бара (столбец `point_value`,
+`markets.add_point_value`). У Brent и золота рубли за пункт идут за курсом
+клиринга USD/RUB: лонг, +$1 при курсе 80 и ещё +$1 при курсе 90 даёт
+1 × 10 × 80 + 1 × 10 × 90 = 1 700 ₽, а не 2 × 10 × 90 = 1 800 ₽. Изменения
+берутся по adjusted-ценам: внутри контракта они равны изменениям реальных
+цен. Комиссии и стоимость переноса тоже по рублям за пункт своего бара.
 """
 
 from __future__ import annotations
@@ -43,6 +50,7 @@ REQUIRED_COLUMNS = {
     "close",
     "price_adjustment",
     "is_first_bar_after_roll",
+    "point_value",
 }
 
 
@@ -103,6 +111,14 @@ def _validate_bars(bars: pl.DataFrame) -> None:
         raise ValueError(f"В барах нет столбцов: {', '.join(sorted(missing))}")
     if bars.height < 2:
         raise ValueError("Для симуляции нужно минимум два бара")
+
+
+def _point_value(row: dict[str, Any]) -> float:
+    """Рубли за пункт бара: без них прибыль бара не посчитать."""
+    value = row["point_value"]
+    if value is None or not value > 0:
+        raise ValueError(f"Нет рублей за пункт point_value на баре {row['timestamp']}")
+    return float(value)
 
 
 def _validate_levels(signal: Signal, close_signal: float) -> None:
@@ -226,6 +242,7 @@ def simulate_position(
 ) -> ClosedTrade:
     """Прогоняет одну позицию по барам начиная с сигнального бара.
 
+    В барах нужны рубли за пункт `point_value` — ряд из `markets.load_market`.
     `minutes` — минутки рынка для баров, задевших и стоп, и цель. Без них
     такой бар закрывается по стопу.
     """
@@ -244,7 +261,6 @@ def simulate_position(
 
     side = signal.side
     quantity = signal.contracts
-    point_value = spec.point_value
 
     entry_adj: float | None = None
     entry_time: datetime | None = None
@@ -258,6 +274,7 @@ def simulate_position(
 
     for i in range(signal_bar + 1, bars.height):
         row = bars.row(i, named=True)
+        point_value = _point_value(row)
         adjustment = float(row["price_adjustment"])
         open_adj = float(row["open"]) + adjustment
         high_adj = float(row["high"]) + adjustment
@@ -268,7 +285,7 @@ def simulate_position(
             entry_price = fill_price(spec, float(row["open"]), side, quantity)
             entry_adj = entry_price + adjustment
             entry_time = row["timestamp"]
-            commissions += commission(spec, entry_price, quantity)
+            commissions += commission(spec, entry_price, point_value, quantity)
             mark = entry_adj
             bars_held = 1
         else:
@@ -276,7 +293,9 @@ def simulate_position(
             if bool(row["is_first_bar_after_roll"]):
                 # mark не сбрасывается на open: базис уже убран поправкой,
                 # а движение рынка за ночь — настоящий P&L позиции.
-                roll_costs += roll_cost(spec, prev_close, float(row["open"]), quantity)
+                roll_costs += roll_cost(
+                    spec, prev_close, float(row["open"]), point_value, quantity
+                )
 
         resolution = "bar"
         if _hits_both_levels(side, open_adj, high_adj, low_adj, stop_adj, target_adj):
@@ -303,7 +322,7 @@ def simulate_position(
             exit_price = fill_price(spec, exit_adj - adjustment, -side, quantity)
             exit_fill_adj = exit_price + adjustment
             gross_pnl += side * (exit_fill_adj - mark) * point_value * quantity
-            commissions += commission(spec, exit_price, quantity)
+            commissions += commission(spec, exit_price, point_value, quantity)
             return ClosedTrade(
                 asset=spec.asset,
                 side=side,

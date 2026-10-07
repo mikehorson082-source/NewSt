@@ -23,6 +23,8 @@ from pathlib import Path
 
 import polars as pl
 
+from backtest.specs import ContractSpec
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONTINUOUS_DIR = PROJECT_ROOT / "data" / "continuous_15m"
 REFERENCE_DIR = PROJECT_ROOT / "data" / "reference"
@@ -85,6 +87,19 @@ class MarketParams:
     margin_factor: float
     snapshot_date: date
     snapshot_contract: str
+
+    def contract_spec(self) -> ContractSpec:
+        """Постоянные правила торговли для симулятора.
+
+        Рубли за пункт и ГО симулятор берёт из баров `load_market`.
+        """
+        return ContractSpec(
+            asset=self.market.name,
+            tick_size=self.tick_size,
+            exchange_fee_rate=self.market.exchange_fee_rate,
+            broker_fee_rate=self.market.broker_fee_rate,
+            slippage_ticks=self.market.slippage_ticks,
+        )
 
 
 def snapshot_params(

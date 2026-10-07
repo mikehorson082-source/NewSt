@@ -10,17 +10,14 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+from backtest.markets import MARKETS, add_point_value
 from backtest.minutes import RawMinutes
 from backtest.position import LONG, SHORT, Signal, simulate_position
 from backtest.specs import ContractSpec
 
-SPEC = ContractSpec(
-    asset="TEST",
-    point_value=1.0,
-    tick_size=0.5,
-    margin_rate=0.12,
-    exchange_fee_rate=0.0001,
-)
+# Рубли за пункт приходят из баров; в большинстве тестов 1 ₽ за пункт,
+# поэтому результат в рублях равен результату в пунктах.
+SPEC = ContractSpec(asset="TEST", tick_size=0.5, exchange_fee_rate=0.0001)
 START = datetime(2026, 9, 10, 10)
 
 
@@ -37,6 +34,7 @@ def bar(
     adjustment: float = 0.0,
     roll: bool = False,
     contract: str = "TSZ6",
+    point_value: float | None = 1.0,
 ) -> dict:
     return {
         "timestamp": START + timedelta(minutes=minute),
@@ -47,6 +45,7 @@ def bar(
         "close": close,
         "price_adjustment": adjustment,
         "is_first_bar_after_roll": roll,
+        "point_value": point_value,
     }
 
 
@@ -369,6 +368,138 @@ def test_entry_open_gap_through_stop_exits_on_entry_bar():
     assert trade.bars_held == 1
     assert trade.exit_price == pytest.approx(89.5)
     assert trade.gross_pnl == pytest.approx(-1.0)
+
+
+# Рубли за пункт по барам: Brent — $10 за пункт × курс клиринга этого бара.
+# Курс 80 — 800 ₽ за пункт, курс 90 — 900 ₽. Бар 1440 — следующий день.
+
+BRENT_NO_COSTS = ContractSpec(
+    asset="BRENT", tick_size=0.01, exchange_fee_rate=0.0, slippage_ticks=0.0
+)
+
+
+def test_profit_uses_point_value_of_each_bar():
+    # +$1 в первый день при курсе 80 и ещё +$1 во второй при курсе 90.
+    bars = make_bars(
+        [
+            bar(0, 70.0, 70.0, 70.0, 70.0, point_value=800.0),
+            bar(15, 70.0, 71.0, 70.0, 71.0, point_value=800.0),
+            bar(1440, 71.0, 72.0, 71.0, 72.0, point_value=900.0),
+        ]
+    )
+    signal = long_signal(stop=60.0, target=80.0, max_bars=2)
+    trade = simulate_position(BRENT_NO_COSTS, bars, 0, signal)
+    assert trade.gross_pnl == pytest.approx(1 * 800 + 1 * 900)
+    assert trade.net_pnl == pytest.approx(1_700.0)
+
+    # «Одно число» по последнему курсу переоценило бы и первый день.
+    single = bars.with_columns(pl.lit(900.0).alias("point_value"))
+    trade_single = simulate_position(BRENT_NO_COSTS, single, 0, signal)
+    assert trade_single.gross_pnl == pytest.approx(2 * 900)
+
+
+def test_flat_price_with_rising_rate_gives_zero_profit():
+    # Рублёвая стоимость контракта выросла с 56 000 до 63 000 ₽, но биржа
+    # платит только за изменение цены: вариационная маржа равна нулю.
+    bars = make_bars(
+        [
+            bar(0, 70.0, 70.0, 70.0, 70.0, point_value=800.0),
+            bar(15, 70.0, 70.0, 70.0, 70.0, point_value=800.0),
+            bar(1440, 70.0, 70.0, 70.0, 70.0, point_value=850.0),
+            bar(2880, 70.0, 70.0, 70.0, 70.0, point_value=900.0),
+        ]
+    )
+    signal = long_signal(stop=60.0, target=80.0, max_bars=3)
+    trade = simulate_position(BRENT_NO_COSTS, bars, 0, signal)
+    assert trade.bars_held == 3
+    assert trade.gross_pnl == pytest.approx(0.0)
+    assert trade.net_pnl == pytest.approx(0.0)
+
+
+def test_costs_use_point_value_of_their_bar():
+    # Вход при 800 ₽ за пункт, перенос при 850, выход при 900.
+    # Новый контракт дешевле старого на $1 (поправка 1.0).
+    fee = 0.000132
+    spec = ContractSpec(asset="BRENT", tick_size=0.01, exchange_fee_rate=fee)
+    bars = make_bars(
+        [
+            bar(0, 70.00, 70.10, 69.90, 70.00, point_value=800.0),
+            bar(15, 70.00, 70.60, 69.95, 70.50, point_value=800.0),
+            bar(
+                1440,
+                69.00,
+                69.60,
+                68.95,
+                69.50,
+                adjustment=1.0,
+                roll=True,
+                contract="TSH7",
+                point_value=850.0,
+            ),
+            bar(
+                2880,
+                69.50,
+                70.10,
+                69.45,
+                70.00,
+                adjustment=1.0,
+                contract="TSH7",
+                point_value=900.0,
+            ),
+        ]
+    )
+    signal = long_signal(stop=65.0, target=75.0, max_bars=3)
+    trade = simulate_position(spec, bars, 0, signal)
+    assert trade.entry_price == pytest.approx(70.01)
+    assert trade.exit_price == pytest.approx(69.99)
+    # Вход 70.01 → закрытие 70.50 при 800; перенос без движения; 70.50 → 70.99
+    # (выход 69.99 + поправка 1.0) при 900.
+    assert trade.gross_pnl == pytest.approx(0.49 * 800 + 0.49 * 900)
+    assert trade.commissions == pytest.approx((70.01 * 800 + 69.99 * 900) * fee)
+    # Две ноги проскальзывания по $0.01 и две комиссии — всё при 850.
+    expected_roll = 2 * 0.01 * 850 + (70.50 + 69.00) * 850 * fee
+    assert trade.roll_costs == pytest.approx(expected_roll)
+
+
+@pytest.mark.parametrize("name", ["cnyrub", "mix"])
+def test_rub_markets_keep_single_point_value_result(name):
+    # У рублёвых рынков рубли за пункт постоянны (CNY 1000 ₽, MIX 1 ₽):
+    # результат по барам совпадает с прежней формулой «одно число k».
+    # Шаг цены условный.
+    market = MARKETS[name]
+    k = market.quote_point_value
+    fee = market.exchange_fee_rate
+    bars = add_point_value(
+        make_bars(
+            [
+                bar(0, 99.5, 100.5, 99.0, 100.0),
+                bar(15, 100.0, 100.5, 99.5, 100.0),
+                bar(30, 13.0, 14.5, 12.5, 14.0, adjustment=90.0, roll=True),
+            ]
+        ),
+        market,
+    )
+    spec = ContractSpec(asset=name, tick_size=0.5, exchange_fee_rate=fee)
+    trade = simulate_position(spec, bars, 0, long_signal(contracts=3, max_bars=2))
+    assert trade.entry_price == pytest.approx(100.5)
+    assert trade.exit_price == pytest.approx(13.5)
+    assert trade.gross_pnl == pytest.approx((13.5 + 90.0 - 100.5) * k * 3)
+    assert trade.commissions == pytest.approx((100.5 + 13.5) * k * 3 * fee)
+    assert trade.roll_costs == pytest.approx(
+        2 * 0.5 * k * 3 + (100.0 + 13.0) * k * 3 * fee
+    )
+
+
+@pytest.mark.parametrize("point_value", [None, 0.0])
+def test_bar_without_point_value_is_rejected(point_value):
+    bars = make_bars(
+        [
+            bar(0, 99.0, 101.0, 98.0, 100.0),
+            bar(15, 101.0, 103.0, 100.0, 102.0, point_value=point_value),
+        ]
+    )
+    with pytest.raises(ValueError, match="point_value"):
+        simulate_position(SPEC, bars, 0, long_signal())
 
 
 # Бар задел и стоп, и цель: порядок касаний берётся из минуток того же контракта.

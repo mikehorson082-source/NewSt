@@ -4,6 +4,9 @@
 покупка по `цена + slippage`, продажа по `цена - slippage`.
 Перенос (ролл) — это закрытие старого контракта и открытие нового:
 две ноги проскальзывания плюс комиссии двух сделок.
+
+Рубли за пункт `point_value` передаются явно — те, что действуют на баре
+сделки: у долларовых контрактов они меняются вместе с курсом клиринга.
 """
 
 from __future__ import annotations
@@ -12,6 +15,11 @@ from backtest.specs import ContractSpec
 
 BUY = 1
 SELL = -1
+
+
+def _check_point_value(point_value: float) -> None:
+    if not point_value > 0:
+        raise ValueError("Рубли за пункт должны быть > 0")
 
 
 def fill_price(
@@ -30,19 +38,26 @@ def fill_price(
     return price + order_side * spec.slippage
 
 
-def commission(spec: ContractSpec, price: float, contracts: int = 1) -> float:
-    """Комиссия одной сделки в рублях: доля ноционала."""
+def commission(
+    spec: ContractSpec,
+    price: float,
+    point_value: float,
+    contracts: int = 1,
+) -> float:
+    """Комиссия одной сделки в рублях: доля стоимости контрактов."""
     if price <= 0:
         raise ValueError("Цена сделки должна быть > 0")
+    _check_point_value(point_value)
     if contracts < 1:
         raise ValueError("Число контрактов должно быть >= 1")
-    return spec.notional(price, contracts) * spec.fee_rate
+    return price * point_value * contracts * spec.fee_rate
 
 
 def roll_cost(
     spec: ContractSpec,
     old_price: float,
     new_price: float,
+    point_value: float,
     contracts: int = 1,
 ) -> float:
     """Стоимость переноса позиции из старого контракта в новый.
@@ -53,10 +68,11 @@ def roll_cost(
     """
     if old_price <= 0 or new_price <= 0:
         raise ValueError("Цены переноса должны быть > 0")
+    _check_point_value(point_value)
     if contracts < 1:
         raise ValueError("Число контрактов должно быть >= 1")
-    slippage = 2 * spec.slippage * spec.point_value * contracts
-    fees = commission(spec, old_price, contracts) + commission(
-        spec, new_price, contracts
+    slippage = 2 * spec.slippage * point_value * contracts
+    fees = commission(spec, old_price, point_value, contracts) + commission(
+        spec, new_price, point_value, contracts
     )
     return slippage + fees

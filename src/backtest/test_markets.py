@@ -11,6 +11,7 @@ import pytest
 from backtest.markets import (
     MARKETS,
     Market,
+    MarketParams,
     add_margin_rate,
     add_point_value,
     check_tick,
@@ -157,6 +158,17 @@ def test_snapshot_params_take_latest_most_liquid_contract():
     assert params.snapshot_date == date(2026, 9, 15)
     assert params.margin_factor == pytest.approx(1.21)
     assert params.tick_size == pytest.approx(0.01)
+
+
+def test_contract_spec_keeps_only_constant_rules():
+    # Рубли за пункт и ГО меняются по датам — они в барах, а не в спецификации.
+    params = MarketParams(BRENT, 0.01, 1.21, date(2026, 9, 15), "BRX6")
+    spec = params.contract_spec()
+    assert spec.asset == "brent"
+    assert spec.tick_size == pytest.approx(0.01)
+    assert spec.slippage == pytest.approx(0.01)
+    assert spec.exchange_fee_rate == pytest.approx(BRENT.exchange_fee_rate)
+    assert spec.broker_fee_rate == 0.0
 
 
 def test_snapshot_params_reject_wrong_point_value():
