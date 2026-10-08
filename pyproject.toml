@@ -23,6 +23,7 @@ dependencies = [
     "akshare>=1.18.94",
     "t-tech-investments>=1.49.3",
     "moexalgo>=2.4.1",
+    "matplotlib>=3.11.1",
 ]
 
 [dependency-groups]

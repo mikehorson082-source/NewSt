@@ -9,7 +9,9 @@
 - рубли за пункт по свече — стоимость пункта × курс клиринга, который
   рассчитывает эту свечу (у рублёвых контрактов курс = 1);
 - доля ГО по дате — минимальная ставка mr1 на дату × коэффициент ГО
-  самого ликвидного контракта из последнего снимка.
+  самого ликвидного контракта из последнего снимка;
+- обычный объём свечи — медиана объёма в то же время суток за прошлые
+  20 дней (`usual_volume`), для лимита ликвидности в `sizing.py`.
 
 Факты контракта сверяются со снимком биржи: если стоимость шага в снимке
 не сходится с записанной, паспорт не загружается.
@@ -44,6 +46,11 @@ COMMODITY_FEE = 0.0001320
 
 # Допуск сверки стоимости шага со снимком биржи.
 POINT_VALUE_TOLERANCE = 0.005
+# Обычный объём свечи — медиана за 20 прошлых дней в то же время суток;
+# меньше 5 дней истории — неизвестен.
+USUAL_VOLUME_DAYS = 20
+USUAL_VOLUME_MIN_DAYS = 5
+SATURDAY = 6
 TICK_TOLERANCE = 1e-6
 
 
@@ -273,8 +280,35 @@ def add_margin_rate(
     ).drop("_rate_date", "mr1")
 
 
+def add_usual_volume(
+    bars: pl.DataFrame,
+    days: int = USUAL_VOLUME_DAYS,
+    min_days: int = USUAL_VOLUME_MIN_DAYS,
+) -> pl.DataFrame:
+    """Обычный объём свечи: медиана объёма в то же время суток за прошлые дни.
+
+    Будни и выходные считаются отдельно. Сам день свечи в медиану не входит,
+    поэтому значение известно заранее: «последние 20 дней в 08:45 торговали
+    1–3 контракта». Меньше `min_days` прошлых дней — значение пустое.
+    Дни без сделок в это время свечи не имеют и в медиану не попадают:
+    у самых тонких свечей обычный объём немного завышен.
+    """
+    slot = [
+        pl.col("timestamp").dt.time(),
+        pl.col("timestamp").dt.weekday() >= SATURDAY,
+    ]
+    return bars.sort("timestamp").with_columns(
+        pl.col("volume")
+        .cast(pl.Float64)
+        .shift(1)
+        .rolling_median(window_size=days, min_samples=min_days)
+        .over(slot)
+        .alias("usual_volume")
+    )
+
+
 def load_market(name: str) -> tuple[MarketParams, pl.DataFrame]:
-    """Паспорт рынка и его 15-минутный ряд с point_value и margin_rate."""
+    """Паспорт рынка и его 15-минутный ряд с point_value, margin_rate, usual_volume."""
     if name not in MARKETS:
         raise ValueError(f"Нет паспорта рынка {name}. Есть: {', '.join(MARKETS)}")
     market = MARKETS[name]
@@ -292,4 +326,4 @@ def load_market(name: str) -> tuple[MarketParams, pl.DataFrame]:
     bars = add_point_value(bars, market, clearing_rates)
     margin_rates = pl.read_parquet(REFERENCE_DIR / "margin_rates.parquet")
     bars = add_margin_rate(bars, market, margin_rates, params.margin_factor)
-    return params, bars
+    return params, add_usual_volume(bars)

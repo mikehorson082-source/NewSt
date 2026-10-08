@@ -4,13 +4,13 @@
 # ruff: noqa: DTZ001
 
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import polars as pl
 import pytest
 
 from backtest.position import LONG, SHORT, Signal
-from backtest.sizing import MARGIN, RISK, SizingRules, size_position
+from backtest.sizing import MARGIN, RISK, VOLUME, SizingRules, size_position
 from backtest.specs import ContractSpec
 
 # Brent: шаг $0.01, проскальзывание 1 шаг, сбор 0.0132%.
@@ -24,20 +24,33 @@ def signal_bar(
     point_value_known: float | None = 850.0,
     margin_rate: float | None = 0.25,
     point_value: float = 860.0,
+    usual_volume: float | None = 10_000.0,
 ) -> pl.DataFrame:
-    """Свеча сигнала: курс 85 известен, свечу рассчитает курс 86."""
-    return pl.DataFrame(
-        [
-            {
-                "timestamp": datetime(2026, 9, 10, 10),
-                "close": close,
-                "point_value": point_value,
-                "point_value_known": point_value_known,
-                "margin_rate": margin_rate,
-            }
-        ],
-        infer_schema_length=None,
-    )
+    """Свеча сигнала и свеча входа после неё.
+
+    Курс 85 известен, свечу рассчитает курс 86. Обычный объём свечи входа
+    10 000 контрактов: лимит ликвидности 1 000, ни на что не влияет.
+    """
+    start = datetime(2026, 9, 10, 10)
+    rows = [
+        {
+            "timestamp": start,
+            "close": close,
+            "point_value": point_value,
+            "point_value_known": point_value_known,
+            "margin_rate": margin_rate,
+            "usual_volume": 10_000.0,
+        },
+        {
+            "timestamp": start + timedelta(minutes=15),
+            "close": close,
+            "point_value": point_value,
+            "point_value_known": point_value,
+            "margin_rate": margin_rate,
+            "usual_volume": usual_volume,
+        },
+    ]
+    return pl.DataFrame(rows, infer_schema_length=None)
 
 
 def long_signal(stop: float, target: float = 80.0) -> Signal:
@@ -63,6 +76,19 @@ def test_plan_example_risk_limit():
     assert size.margin_per_contract == pytest.approx(14_875.0)
     assert size.margin == pytest.approx(163_625.0)
     assert size.contracts_by_margin == 33
+
+
+def test_cost_share_of_risk():
+    # Издержки контракта: 2 шага по 850 ₽ = 17 ₽ плюс сборы ≈ 15.6 ₽ — 3.7% риска.
+    size = size_position(BRENT, signal_bar(), 0, long_signal(69.0), CAPITAL)
+    costs = 2 * 0.01 * 850.0 + (70.0 + 69.0) * 850.0 * FEE
+    assert size.costs_per_contract == pytest.approx(costs)
+    assert size.risk_per_contract == pytest.approx(1.0 * 850.0 + costs)
+    assert size.cost_share == pytest.approx(costs / size.risk_per_contract)
+    assert size.cost_share == pytest.approx(0.0369, abs=1e-4)
+    # Дальний стоп — та же цена издержек, но меньшая доля риска.
+    wide = size_position(BRENT, signal_bar(), 0, long_signal(65.0), CAPITAL)
+    assert wide.cost_share < size.cost_share
 
 
 def test_short_mirrors_long():
@@ -175,7 +201,7 @@ def test_missing_columns_rejected():
 @pytest.mark.parametrize(
     ("signal_index", "capital", "message"),
     [
-        (1, CAPITAL, "свечи сигнала"),
+        (2, CAPITAL, "свечи сигнала"),
         (-1, CAPITAL, "свечи сигнала"),
         (0, 0.0, "Капитал"),
     ],
@@ -185,9 +211,73 @@ def test_bad_inputs_rejected(signal_index, capital, message):
         size_position(BRENT, signal_bar(), signal_index, long_signal(69.0), capital)
 
 
+def test_volume_limit_on_thin_entry_bar():
+    # Обычно в это время свечи входа торгуют 50 контрактов (у свечи сигнала —
+    # 10 000, но решает вход): 10% — 5, а по риску можно 11.
+    size = size_position(
+        BRENT, signal_bar(usual_volume=50.0), 0, long_signal(69.0), CAPITAL
+    )
+    assert size.contracts_by_risk == 11
+    assert size.usual_volume == 50.0
+    assert size.contracts_by_volume == 5
+    assert size.contracts == 5
+    assert size.limit == VOLUME
+    # Риск плановый — по 5 контрактам, а не по 11.
+    assert size.risk == pytest.approx(5 * size.risk_per_contract)
+
+
+def test_skip_when_entry_bar_is_usually_empty():
+    # MIX в 08:45: обычно 2 контракта, 10% — это 0.
+    size = size_position(
+        BRENT, signal_bar(usual_volume=2.0), 0, long_signal(69.0), CAPITAL
+    )
+    assert size.skipped
+    assert size.limit == VOLUME
+
+
+def test_unknown_usual_volume_skips_signal():
+    # Меньше 5 дней истории — обычный объём неизвестен, ликвидность не доказана.
+    size = size_position(
+        BRENT, signal_bar(usual_volume=None), 0, long_signal(69.0), CAPITAL
+    )
+    assert size.usual_volume is None
+    assert size.contracts_by_volume == 0
+    assert size.skipped
+    assert size.limit == VOLUME
+
+
+def test_equal_limits_report_risk_first():
+    # 110 контрактов обычного объёма → 11 по ликвидности, столько же по риску.
+    size = size_position(
+        BRENT, signal_bar(usual_volume=110.0), 0, long_signal(69.0), CAPITAL
+    )
+    assert size.contracts_by_risk == size.contracts_by_volume == 11
+    assert size.limit == RISK
+
+
+def test_volume_limit_can_be_switched_off():
+    bars = signal_bar(usual_volume=2.0).drop("usual_volume").head(1)
+    rules = SizingRules(max_volume_share=None)
+    size = size_position(BRENT, bars, 0, long_signal(69.0), CAPITAL, rules)
+    assert size.contracts == 11
+    assert size.contracts_by_volume is None
+    assert size.usual_volume is None
+
+
+def test_volume_limit_needs_entry_bar_and_column():
+    with pytest.raises(ValueError, match="свечи входа"):
+        size_position(BRENT, signal_bar(), 1, long_signal(69.0), CAPITAL)
+    with pytest.raises(ValueError, match="usual_volume"):
+        size_position(
+            BRENT, signal_bar().drop("usual_volume"), 0, long_signal(69.0), CAPITAL
+        )
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
+        {"max_volume_share": 0.0},
+        {"max_volume_share": 1.5},
         {"risk_fraction": 0.0},
         {"risk_fraction": 1.0},
         {"max_margin_fraction": 0.0},

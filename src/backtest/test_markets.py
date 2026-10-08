@@ -3,7 +3,7 @@
 # бары и курсы — naive timestamp MSK, как в data/continuous_15m и data/reference.
 # ruff: noqa: DTZ001
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import polars as pl
 import pytest
@@ -14,6 +14,7 @@ from backtest.markets import (
     MarketParams,
     add_margin_rate,
     add_point_value,
+    add_usual_volume,
     check_tick,
     snapshot_params,
 )
@@ -198,3 +199,48 @@ def test_check_tick_accepts_grid_and_rejects_off_grid_price():
 def test_market_rejects_unknown_currency():
     with pytest.raises(ValueError, match="RUB или USD"):
         Market("test", "TST", "EUR", 1.0, 0.0)
+
+
+def volume_bars(rows: list[tuple[datetime, int]]) -> pl.DataFrame:
+    return pl.DataFrame([{"timestamp": ts, "volume": volume} for ts, volume in rows])
+
+
+def usual(bars: pl.DataFrame, ts: datetime) -> float | None:
+    return bars.filter(pl.col("timestamp") == ts)["usual_volume"][0]
+
+
+def test_usual_volume_uses_only_past_days_at_same_time():
+    # Пн 07.09.2026 — пт 11.09: в 08:45 торгуют 1, 2, 3, 4, 5, 6 контрактов
+    # (6-й день — пн 14.09), днём в 12:00 — по 1 000.
+    days = [date(2026, 9, d) for d in (7, 8, 9, 10, 11, 14)]
+    rows = []
+    for i, day in enumerate(days):
+        rows.append(
+            (
+                datetime(day.year, day.month, day.day, 8, 45),
+                i + 1,
+            )
+        )
+        rows.append((datetime(day.year, day.month, day.day, 12), 1_000))
+    bars = add_usual_volume(volume_bars(rows), days=20, min_days=5)
+
+    # Шестой день: медиана пяти прошлых дней 1..5 = 3, свой объём 6 не входит.
+    assert usual(bars, datetime(2026, 9, 14, 8, 45)) == 3.0
+    assert usual(bars, datetime(2026, 9, 14, 12)) == 1_000.0
+    # Пятый день: прошлых дней 4 — меньше min_days, значение неизвестно.
+    assert usual(bars, datetime(2026, 9, 11, 8, 45)) is None
+
+
+def test_usual_volume_window_and_weekends():
+    # Будни в 12:00 по 1 000, выходные в 12:00 по 10. Окно 2 дня.
+    start = datetime(2026, 9, 7, 12)  # понедельник
+    rows = []
+    for i in range(14):
+        ts = start + timedelta(days=i)
+        rows.append((ts, 10 if ts.weekday() >= 5 else 1_000 + i))
+    bars = add_usual_volume(volume_bars(rows), days=2, min_days=1)
+
+    # Сб 19.09: прошлые выходные — сб 12.09 и вс 13.09, будни не мешают.
+    assert usual(bars, datetime(2026, 9, 19, 12)) == 10.0
+    # Пт 18.09: медиана двух прошлых будних дней — чт 17.09 (1 010) и ср 16.09 (1 009).
+    assert usual(bars, datetime(2026, 9, 18, 12)) == 1_009.5

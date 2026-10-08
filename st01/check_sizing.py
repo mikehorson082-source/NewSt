@@ -1,9 +1,11 @@
 """Размер позиции на реальных данных: сколько контрактов и какой лимит сработал.
 
-Капитал 1 000 000 ₽, риск 1% (10 000 ₽), ГО позиции не больше 50% капитала.
-Для каждого рынка — лонг по закрытию первой и последней свечи ряда со
-стопом на 0.25%, 0.5%, 1% и 2% ниже закрытия. Близкий стоп даёт много
-контрактов, и тогда ограничивает уже ГО, а не риск. Ничего не записывает.
+Капитал 1 000 000 ₽, риск 1% (10 000 ₽), ГО позиции не больше 50% капитала,
+не больше 10% обычного объёма свечи входа. Для каждого рынка — лонг по
+закрытию первой свечи, у свечи входа которой уже известен обычный объём,
+и предпоследней свечи ряда, со стопом на 0.25%, 0.5%, 1% и 2% ниже
+закрытия. Близкий стоп даёт много контрактов, и тогда ограничивает уже ГО
+или ликвидность, а не риск. Ничего не записывает.
 Запуск: uv run python st01/check_sizing.py
 """
 
@@ -17,7 +19,7 @@ from backtest.sizing import size_position
 
 CAPITAL = 1_000_000.0
 STOP_DISTANCES = (0.0025, 0.005, 0.01, 0.02)
-LIMIT_NAMES = {"risk": "риск", "margin": "ГО"}
+LIMIT_NAMES = {"risk": "риск", "margin": "ГО", "volume": "объём"}
 
 
 def main() -> None:
@@ -32,7 +34,10 @@ def main() -> None:
     for name in MARKETS:
         params, bars = load_market(name)
         spec = params.contract_spec()
-        for signal_bar in (0, bars.height - 1):
+        known = bars.with_row_index().filter(
+            pl.col("usual_volume").shift(-1).is_not_null()
+        )
+        for signal_bar in (known["index"][0], bars.height - 2):
             bar = bars.row(signal_bar, named=True)
             close = bar["close"]
             for distance in STOP_DISTANCES:
@@ -50,6 +55,7 @@ def main() -> None:
                         "риск контракта ₽": round(size.risk_per_contract),
                         "по риску": size.contracts_by_risk,
                         "по ГО": size.contracts_by_margin,
+                        "по объёму": size.contracts_by_volume,
                         "контрактов": size.contracts,
                         "лимит": LIMIT_NAMES[size.limit],
                         "риск ₽": round(size.risk),

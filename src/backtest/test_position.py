@@ -766,3 +766,161 @@ def test_minute_resolution_matches_full_minute_simulation(tmp_path):
         resolutions.add(by_minutes.exit_resolution)
         checked += 1
     assert resolutions == {"minutes", "same_minute"}
+
+
+def test_path_mae_mfe_and_slippage_of_target_trade():
+    # Вход 101 + 0.5 проскальзывания = 101.5, выход по цели 110 − 0.5 = 109.5.
+    bars = make_bars(
+        [
+            bar(0, 99.0, 101.0, 98.0, 100.0),
+            bar(15, 101.0, 103.0, 100.0, 102.0),
+            bar(30, 102.0, 106.0, 101.0, 105.0),
+            bar(45, 108.0, 111.0, 107.0, 110.0),
+        ]
+    )
+    trade = simulate_position(SPEC, bars, 0, long_signal())
+    # Проскальзывание отдельной строкой: по 0.5 на вход и выход.
+    assert trade.slippage == pytest.approx(1.0)
+    # По ценам рынка 101 → 110: 9 пунктов; по ценам исполнения 8.
+    assert trade.pnl_before_costs == pytest.approx(9.0)
+    assert trade.costs == pytest.approx(1.0 + 0.0211)
+    assert trade.pnl_before_costs - trade.costs == pytest.approx(trade.net_pnl)
+    # Путь: результат после издержек на закрытии каждого бара, на выходе — итог.
+    assert [ts for ts, _ in trade.path] == [
+        START + timedelta(minutes=m) for m in (15, 30, 45)
+    ]
+    entry_fee = 101.5 * 0.0001
+    assert [value for _, value in trade.path] == pytest.approx(
+        [0.5 - entry_fee, 3.5 - entry_fee, trade.net_pnl]
+    )
+    # Худшее — low 100 бара входа: 100 − 101.5. Лучшее — цель 110 в баре
+    # выхода: high 111 мог случиться уже после выхода и не считается.
+    assert trade.mae == pytest.approx(-1.5)
+    assert trade.mfe == pytest.approx(8.5)
+
+
+def test_mfe_ignores_high_of_stop_bar():
+    # Бар выхода: high 104, потом стоп 95. Был ли high до стопа — неизвестно.
+    bars = make_bars(
+        [
+            bar(0, 99.0, 101.0, 98.0, 100.0),
+            bar(15, 100.0, 101.0, 99.0, 100.0),
+            bar(30, 100.0, 104.0, 94.0, 96.0),
+        ]
+    )
+    trade = simulate_position(SPEC, bars, 0, long_signal())
+    assert trade.exit_reason == "stop"
+    # Вход 100.5: лучшее — high 101 бара входа, худшее — стоп 95.
+    assert trade.mfe == pytest.approx(0.5)
+    assert trade.mae == pytest.approx(-5.5)
+
+
+def test_time_exit_counts_whole_last_bar():
+    bars = make_bars(
+        [
+            bar(0, 99.0, 101.0, 98.0, 100.0),
+            bar(15, 100.0, 101.0, 99.0, 100.0),
+            bar(30, 100.0, 104.0, 96.0, 100.0),
+        ]
+    )
+    trade = simulate_position(SPEC, bars, 0, long_signal(max_bars=2))
+    assert trade.exit_reason == "time"
+    # Выход по закрытию: весь бар прошёл при открытой позиции.
+    assert trade.mfe == pytest.approx(3.5)
+    assert trade.mae == pytest.approx(-4.5)
+
+
+def test_short_excursions_mirror_long():
+    bars = make_bars(
+        [
+            bar(0, 99.0, 101.0, 98.0, 100.0),
+            bar(15, 100.0, 103.0, 97.0, 100.0),
+            bar(30, 100.0, 101.0, 99.0, 100.0),
+        ]
+    )
+    signal = Signal(side=SHORT, stop=105.0, target=90.0, max_bars=2)
+    trade = simulate_position(SPEC, bars, 0, signal)
+    # Шорт по 99.5: рост до 103 — против нас, падение до 97 — в нашу пользу.
+    assert trade.mae == pytest.approx(-3.5)
+    assert trade.mfe == pytest.approx(2.5)
+
+
+def test_mae_uses_point_value_of_each_bar():
+    # 2 ₽ за пункт в баре входа, 3 ₽ — в следующем: просадка до 97 во втором
+    # баре = (100 − 100.5) × 2 + (97 − 100) × 3 = −10 ₽.
+    bars = make_bars(
+        [
+            bar(0, 99.0, 101.0, 98.0, 100.0, point_value=2.0),
+            bar(15, 100.0, 100.0, 100.0, 100.0, point_value=2.0),
+            bar(30, 100.0, 100.0, 97.0, 100.0, point_value=3.0),
+        ]
+    )
+    trade = simulate_position(SPEC, bars, 0, long_signal(max_bars=2))
+    assert trade.mae == pytest.approx(-10.0)
+
+
+def random_trade_bars(rng: random.Random) -> pl.DataFrame:
+    """Случайный ряд с переносами и рублями за пункт, меняющимися по барам."""
+    rows = [bar(0, 99.5, 100.5, 99.0, 100.0)]
+    adjusted = 100.0
+    adjustment = 0.0
+    for k in range(1, 40):
+        roll = rng.random() < 0.1
+        if roll:
+            adjustment = rng.choice([-30.0, 0.0, 30.0])
+        open_ = adjusted + rng.uniform(-1.5, 1.5)
+        close = open_ + rng.uniform(-2.0, 2.0)
+        high = max(open_, close) + rng.uniform(0.0, 1.5)
+        low = min(open_, close) - rng.uniform(0.0, 1.5)
+        rows.append(
+            bar(
+                15 * k,
+                open_ - adjustment,
+                high - adjustment,
+                low - adjustment,
+                close - adjustment,
+                adjustment=adjustment,
+                roll=roll,
+                point_value=rng.choice([1.0, 2.0, 3.0]),
+            )
+        )
+        adjusted = close
+    return make_bars(rows)
+
+
+def test_costs_are_charged_exactly_once():
+    # Каждая издержка учтена ровно один раз: результат «до издержек» равен
+    # результату той же сделки на рынке без издержек (выходы от издержек не
+    # зависят). Путь кончается на net_pnl, MAE <= 0 <= MFE.
+    free = ContractSpec(
+        asset="TEST", tick_size=0.5, exchange_fee_rate=0.0, slippage_ticks=0.0
+    )
+    rng = random.Random(11)
+    reasons = set()
+    for _ in range(300):
+        bars = random_trade_bars(rng)
+        side = rng.choice((LONG, SHORT))
+        distance = rng.uniform(1.0, 6.0)
+        signal = Signal(
+            side=side,
+            stop=100.0 - side * distance,
+            target=100.0 + side * rng.uniform(1.0, 8.0),
+            contracts=rng.randint(1, 5),
+            max_bars=rng.choice([None, 3, 10]),
+        )
+        trade = simulate_position(SPEC, bars, 0, signal)
+        no_costs = simulate_position(free, bars, 0, signal)
+
+        assert no_costs.costs == 0.0
+        assert trade.exit_time == no_costs.exit_time
+        assert trade.pnl_before_costs == pytest.approx(no_costs.net_pnl)
+        assert trade.pnl_before_costs - trade.costs == pytest.approx(trade.net_pnl)
+        assert len(trade.path) == trade.bars_held
+        assert trade.path[0][0] == trade.entry_time
+        assert trade.path[-1][0] == trade.exit_time
+        assert trade.path[-1][1] == pytest.approx(trade.net_pnl)
+        assert trade.mae <= 0.0 <= trade.mfe
+        # После издержек результат ни в одной точке не лучше MFE.
+        assert max(value for _, value in trade.path) <= trade.mfe + 1e-9
+        reasons.add(trade.exit_reason)
+    assert reasons == {"stop", "target", "time", "end"}

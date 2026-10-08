@@ -25,6 +25,12 @@ P&L начисляется по барам, как биржа начисляет
 1 × 10 × 80 + 1 × 10 × 90 = 1 700 ₽, а не 2 × 10 × 90 = 1 800 ₽. Изменения
 берутся по adjusted-ценам: внутри контракта они равны изменениям реальных
 цен. Комиссии и стоимость переноса тоже по рублям за пункт своего бара.
+
+Для отчёта сделка отдаёт путь — результат после издержек на закрытии
+каждого бара (`path`, из него кривая капитала и просадка внутри сделки),
+MAE и MFE — худший и лучший незакрытый результат, и проскальзывание
+отдельной строкой: результат по ценам рынка − проскальзывание − сборы −
+переносы = net_pnl, каждая издержка ровно один раз.
 """
 
 from __future__ import annotations
@@ -95,14 +101,36 @@ class ClosedTrade:
     # совпали с баром.
     exit_resolution: str
     bars_held: int
+    # По ценам исполнения: проскальзывание входа и выхода уже внутри.
     gross_pnl: float
     commissions: float
-    roll_costs: float
+    roll_costs: float  # проскальзывание и сборы переносов
+    # Проскальзывание входа и выхода в рублях, отдельной строкой.
+    slippage: float
+    # Худший и лучший незакрытый результат от цены исполнения входа, без
+    # сборов и переносов: MAE <= 0 <= MFE. По high/low баров; в баре выхода по стопу
+    # или цели — только открытие и уровень выхода: что было после выхода,
+    # неизвестно.
+    mae: float
+    mfe: float
+    # Результат после издержек на закрытии каждого бара сделки (в баре
+    # выхода — на выходе): (метка бара, рубли). Последняя точка = net_pnl.
+    path: tuple[tuple[datetime, float], ...]
 
     @property
     def net_pnl(self) -> float:
         """Результат после всех издержек."""
         return self.gross_pnl - self.commissions - self.roll_costs
+
+    @property
+    def pnl_before_costs(self) -> float:
+        """Результат по ценам рынка, до проскальзывания, сборов и переносов."""
+        return self.gross_pnl + self.slippage
+
+    @property
+    def costs(self) -> float:
+        """Все издержки сделки: каждая учтена ровно один раз."""
+        return self.slippage + self.commissions + self.roll_costs
 
 
 def _validate_bars(bars: pl.DataFrame) -> None:
@@ -271,6 +299,10 @@ def simulate_position(
     gross_pnl = 0.0
     commissions = 0.0
     roll_costs = 0.0
+    slippage = 0.0
+    mae = 0.0
+    mfe = 0.0
+    path: list[tuple[datetime, float]] = []
 
     for i in range(signal_bar + 1, bars.height):
         row = bars.row(i, named=True)
@@ -286,6 +318,7 @@ def simulate_position(
             entry_adj = entry_price + adjustment
             entry_time = row["timestamp"]
             commissions += commission(spec, entry_price, point_value, quantity)
+            slippage += spec.slippage * point_value * quantity
             mark = entry_adj
             bars_held = 1
         else:
@@ -315,6 +348,17 @@ def simulate_position(
         if exit_adj is None and exit_at_end and i == bars.height - 1:
             exit_adj, reason = close_adj, "end"
 
+        # Цены бара, через которые позиция точно прошла. Выход по стопу или
+        # цели внутри бара: high/low могли случиться уже после выхода.
+        if exit_adj is not None and reason in ("stop", "target"):
+            seen = (open_adj, exit_adj)
+        else:
+            seen = (low_adj, high_adj)
+        for price in seen:
+            excursion = gross_pnl + side * (price - mark) * point_value * quantity
+            mae = min(mae, excursion)
+            mfe = max(mfe, excursion)
+
         if exit_adj is not None:
             assert entry_time is not None
             assert entry_price is not None
@@ -323,6 +367,8 @@ def simulate_position(
             exit_fill_adj = exit_price + adjustment
             gross_pnl += side * (exit_fill_adj - mark) * point_value * quantity
             commissions += commission(spec, exit_price, point_value, quantity)
+            slippage += spec.slippage * point_value * quantity
+            path.append((row["timestamp"], gross_pnl - commissions - roll_costs))
             return ClosedTrade(
                 asset=spec.asset,
                 side=side,
@@ -338,9 +384,14 @@ def simulate_position(
                 gross_pnl=gross_pnl,
                 commissions=commissions,
                 roll_costs=roll_costs,
+                slippage=slippage,
+                mae=mae,
+                mfe=mfe,
+                path=tuple(path),
             )
 
         gross_pnl += side * (close_adj - mark) * point_value * quantity
+        path.append((row["timestamp"], gross_pnl - commissions - roll_costs))
         mark = close_adj
         prev_close = float(row["close"])
 
