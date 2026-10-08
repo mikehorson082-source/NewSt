@@ -5,7 +5,7 @@
 не дольше 32 свечей (8 часов). Результат по деньгам смысла не имеет —
 сигналы случайные. Смотрим другое: правило, которое ни разу не сработало,
 не проверено. Ничего не записывает.
-Запуск: uv run python st01/check_portfolio.py
+Запуск: uv run python -m backtest.checks.portfolio
 """
 
 from __future__ import annotations

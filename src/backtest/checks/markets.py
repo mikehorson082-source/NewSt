@@ -2,7 +2,7 @@
 
 Печатает шаг цены и коэффициент ГО из снимка биржи, а по годам — рубли
 за пункт и ГО одного контракта. Ничего не записывает.
-Запуск: uv run python st01/check_markets.py
+Запуск: uv run python -m backtest.checks.markets
 """
 
 from __future__ import annotations

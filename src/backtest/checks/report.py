@@ -1,11 +1,11 @@
 """Отчёт по портфелю на случайных сигналах: метрики, годы и графики.
 
-Те же случайные сигналы, что в check_portfolio.py (seed 7, стоп 0.5%,
+Те же случайные сигналы, что в backtest.checks.portfolio (seed 7, стоп 0.5%,
 цель 1%). Стратегии в них нет, и отчёт должен сам это показать: Sharpe
 ниже нуля, вероятность «Sharpe > 0» маленькая, запас по издержкам меньше
 1 раза или пустой (до издержек тоже убыток). Печатает таблицу метрик за весь
-период и по годам, рисует st01/reports/random_signals.png.
-Запуск: uv run python st01/check_report.py
+период и по годам, рисует src/backtest/checks/reports/random_signals.png.
+Запуск: uv run python -m backtest.checks.report
 """
 
 from __future__ import annotations
@@ -13,9 +13,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import polars as pl
-from check_portfolio import CAPITAL, random_signals
 
 from backtest.charts import save_report_chart
+from backtest.checks.portfolio import CAPITAL, random_signals
 from backtest.portfolio import load_markets, run_portfolio
 from backtest.report import LABELS, build_report, format_value, market_timeline
 

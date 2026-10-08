@@ -11,7 +11,7 @@
 с первой свечи недели до закрытия последней. Стоп и цель далеко (±50%
 от цены), поэтому выход по времени. У CNY и MIX все три способа должны
 совпасть: рубли за пункт у них постоянны. Ничего не записывает.
-Запуск: uv run python st01/check_point_value.py
+Запуск: uv run python -m backtest.checks.point_value
 """
 
 from __future__ import annotations
