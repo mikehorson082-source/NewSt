@@ -18,6 +18,7 @@ from backtest.charts import save_report_chart
 from backtest.checks.portfolio import CAPITAL, random_signals
 from backtest.portfolio import load_markets, run_portfolio
 from backtest.report import LABELS, build_report, format_value, market_timeline
+from backtest.sensitivity import by_session
 
 CHART = Path(__file__).resolve().parent / "reports" / "random_signals.png"
 GAP_R = 1.5
@@ -61,6 +62,23 @@ def main() -> None:
             "bars_held",
             pl.col("mae_r").round(2).alias("MAE, R"),
             pl.col("r_multiple").round(2).alias("итог, R"),
+        )
+    )
+
+    print(
+        "\nСделки по сессии входа (спред везде 1 шаг — настоящего спреда нет, "
+        "смотрим результат, объём свечи и гэпы):"
+    )
+    print(
+        by_session(report.trades).select(
+            pl.col("session").alias("сессия"),
+            pl.col("trades").alias("сделок"),
+            (pl.col("win_rate") * 100).round(1).alias("выигрышных %"),
+            pl.col("expectancy_r").round(3).alias("expectancy, R"),
+            pl.col("costs_per_trade_r").round(3).alias("издержки, R"),
+            (pl.col("volume_share_median") * 100).round(2).alias("доля в свече %"),
+            pl.col("over_10pct").alias("> 10% свечи"),
+            pl.col("gaps_over_1_5r").alias("гэпов > 1.5R"),
         )
     )
 

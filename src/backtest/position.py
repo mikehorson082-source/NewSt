@@ -41,7 +41,7 @@ from typing import Any
 
 import polars as pl
 
-from backtest.costs import commission, fill_price, roll_cost
+from backtest.costs import commission, fill_price, impact_points, roll_cost
 from backtest.minutes import RawMinutes
 from backtest.specs import ContractSpec
 
@@ -58,6 +58,8 @@ REQUIRED_COLUMNS = {
     "is_first_bar_after_roll",
     "point_value",
 }
+# Нужны, только если включено влияние на рынок (`ContractSpec.impact`).
+IMPACT_COLUMNS = {"volume", "bar_sigma"}
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,10 @@ class ClosedTrade:
     # Результат после издержек на закрытии каждого бара сделки (в баре
     # выхода — на выходе): (метка бара, рубли). Последняя точка = net_pnl.
     path: tuple[tuple[datetime, float], ...]
+    # Влияние на рынок входа и выхода в рублях (`ContractSpec.impact`), сверх
+    # обычного проскальзывания. Переносы его не платят: они редки и идут в
+    # ликвидное время.
+    impact: float = 0.0
 
     @property
     def net_pnl(self) -> float:
@@ -125,12 +131,12 @@ class ClosedTrade:
     @property
     def pnl_before_costs(self) -> float:
         """Результат по ценам рынка, до проскальзывания, сборов и переносов."""
-        return self.gross_pnl + self.slippage
+        return self.gross_pnl + self.slippage + self.impact
 
     @property
     def costs(self) -> float:
         """Все издержки сделки: каждая учтена ровно один раз."""
-        return self.slippage + self.commissions + self.roll_costs
+        return self.slippage + self.impact + self.commissions + self.roll_costs
 
 
 def _validate_bars(bars: pl.DataFrame) -> None:
@@ -260,6 +266,15 @@ def _exit_by_minutes(
     raise AssertionError("Минутки совпали с баром, но не задели ни одного уровня")
 
 
+def _impact(
+    spec: ContractSpec, row: dict[str, Any], price: float, quantity: int
+) -> float:
+    """Влияние заявки на цену в пунктах по объёму и σ свечи исполнения."""
+    if spec.impact == 0:
+        return 0.0
+    return impact_points(spec, price, quantity, row["volume"], row["bar_sigma"])
+
+
 def simulate_position(
     spec: ContractSpec,
     bars: pl.DataFrame,
@@ -275,6 +290,12 @@ def simulate_position(
     такой бар закрывается по стопу.
     """
     _validate_bars(bars)
+    missing_impact = IMPACT_COLUMNS - set(bars.columns)
+    if spec.impact > 0 and missing_impact:
+        raise ValueError(
+            "Для влияния на рынок в барах нужны столбцы: "
+            + ", ".join(sorted(missing_impact))
+        )
     if minutes is not None and "contract" not in bars.columns:
         raise ValueError("Для разбора по минуткам в барах нужен столбец contract")
     if not 0 <= signal_bar < bars.height - 1:
@@ -300,6 +321,7 @@ def simulate_position(
     commissions = 0.0
     roll_costs = 0.0
     slippage = 0.0
+    impact = 0.0
     mae = 0.0
     mfe = 0.0
     path: list[tuple[datetime, float]] = []
@@ -314,11 +336,15 @@ def simulate_position(
         close_adj = float(row["close"]) + adjustment
 
         if entry_adj is None:
-            entry_price = fill_price(spec, float(row["open"]), side, quantity)
+            entry_impact = _impact(spec, row, float(row["open"]), quantity)
+            entry_price = fill_price(
+                spec, float(row["open"]), side, quantity, entry_impact
+            )
             entry_adj = entry_price + adjustment
             entry_time = row["timestamp"]
             commissions += commission(spec, entry_price, point_value, quantity)
             slippage += spec.slippage * point_value * quantity
+            impact += entry_impact * point_value * quantity
             mark = entry_adj
             bars_held = 1
         else:
@@ -363,11 +389,15 @@ def simulate_position(
             assert entry_time is not None
             assert entry_price is not None
             assert reason is not None
-            exit_price = fill_price(spec, exit_adj - adjustment, -side, quantity)
+            exit_impact = _impact(spec, row, exit_adj - adjustment, quantity)
+            exit_price = fill_price(
+                spec, exit_adj - adjustment, -side, quantity, exit_impact
+            )
             exit_fill_adj = exit_price + adjustment
             gross_pnl += side * (exit_fill_adj - mark) * point_value * quantity
             commissions += commission(spec, exit_price, point_value, quantity)
             slippage += spec.slippage * point_value * quantity
+            impact += exit_impact * point_value * quantity
             path.append((row["timestamp"], gross_pnl - commissions - roll_costs))
             return ClosedTrade(
                 asset=spec.asset,
@@ -388,6 +418,7 @@ def simulate_position(
                 mae=mae,
                 mfe=mfe,
                 path=tuple(path),
+                impact=impact,
             )
 
         gross_pnl += side * (close_adj - mark) * point_value * quantity

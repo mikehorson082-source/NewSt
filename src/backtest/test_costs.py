@@ -2,7 +2,7 @@
 
 import pytest
 
-from backtest.costs import BUY, SELL, commission, fill_price, roll_cost
+from backtest.costs import BUY, SELL, commission, fill_price, impact_points, roll_cost
 from backtest.specs import ContractSpec
 
 SPEC = ContractSpec(
@@ -65,3 +65,33 @@ def test_roll_cost_is_two_legs_slippage_plus_two_commissions():
 def test_invalid_cost_inputs_rejected(function, args):
     with pytest.raises(ValueError):
         function(*args)
+
+
+def test_impact_points_square_root_of_share():
+    spec = ContractSpec(asset="TEST", tick_size=0.01, exchange_fee_rate=0.0, impact=1.0)
+    # Пример из описания: Brent $70, σ 0.22%, 25 контрактов в свечу на 50.
+    assert impact_points(spec, 70.0, 25, 50, 0.0022) == pytest.approx(
+        0.0022 * 70.0 * 0.5**0.5
+    )
+    # Вчетверо больше доля — вдвое больше влияние.
+    assert impact_points(spec, 70.0, 100, 50, 0.0022) == pytest.approx(
+        2 * impact_points(spec, 70.0, 25, 50, 0.0022)
+    )
+
+
+def test_impact_off_or_unknown_sigma_is_zero():
+    assert impact_points(SPEC, 70.0, 25, 50, 0.0022) == 0.0
+    on = ContractSpec(asset="TEST", tick_size=0.01, exchange_fee_rate=0.0, impact=1.0)
+    assert impact_points(on, 70.0, 25, 50, None) == 0.0
+    with pytest.raises(ValueError, match="объём"):
+        impact_points(on, 70.0, 25, 0, 0.0022)
+
+
+def test_fill_price_adds_impact_against_order():
+    assert fill_price(SPEC, 100.0, BUY, impact=0.3) == pytest.approx(100.8)
+    assert fill_price(SPEC, 100.0, SELL, impact=0.3) == pytest.approx(99.2)
+
+
+def test_negative_impact_rejected():
+    with pytest.raises(ValueError, match="impact"):
+        ContractSpec(asset="TEST", tick_size=0.5, exchange_fee_rate=0.0, impact=-1.0)

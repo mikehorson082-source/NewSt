@@ -4,6 +4,7 @@
 # ruff: noqa: DTZ001
 
 import random
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -888,17 +889,25 @@ def random_trade_bars(rng: random.Random) -> pl.DataFrame:
     return make_bars(rows)
 
 
-def test_costs_are_charged_exactly_once():
+@pytest.mark.parametrize("impact", [0.0, 1.0])
+def test_costs_are_charged_exactly_once(impact):
     # Каждая издержка учтена ровно один раз: результат «до издержек» равен
     # результату той же сделки на рынке без издержек (выходы от издержек не
-    # зависят). Путь кончается на net_pnl, MAE <= 0 <= MFE.
+    # зависят). Путь кончается на net_pnl, MAE <= 0 <= MFE. С влиянием на
+    # рынок — то же самое, влияние идёт отдельной строкой.
+    spec = replace(SPEC, impact=impact)
     free = ContractSpec(
         asset="TEST", tick_size=0.5, exchange_fee_rate=0.0, slippage_ticks=0.0
     )
     rng = random.Random(11)
+    # Объёмы — из отдельного генератора: сделки те же, что и без влияния.
+    volumes = random.Random(3)
     reasons = set()
     for _ in range(300):
-        bars = random_trade_bars(rng)
+        bars = random_trade_bars(rng).with_columns(
+            pl.Series("volume", [volumes.randint(5, 500) for _ in range(40)]),
+            pl.lit(0.003).alias("bar_sigma"),
+        )
         side = rng.choice((LONG, SHORT))
         distance = rng.uniform(1.0, 6.0)
         signal = Signal(
@@ -908,9 +917,10 @@ def test_costs_are_charged_exactly_once():
             contracts=rng.randint(1, 5),
             max_bars=rng.choice([None, 3, 10]),
         )
-        trade = simulate_position(SPEC, bars, 0, signal)
+        trade = simulate_position(spec, bars, 0, signal)
         no_costs = simulate_position(free, bars, 0, signal)
 
+        assert (trade.impact > 0) == (impact > 0)
         assert no_costs.costs == 0.0
         assert trade.exit_time == no_costs.exit_time
         assert trade.pnl_before_costs == pytest.approx(no_costs.net_pnl)
@@ -924,3 +934,56 @@ def test_costs_are_charged_exactly_once():
         assert max(value for _, value in trade.path) <= trade.mfe + 1e-9
         reasons.add(trade.exit_reason)
     assert reasons == {"stop", "target", "time", "end"}
+
+
+def impact_bars(volume: int, sigma: float | None = 0.002) -> pl.DataFrame:
+    """Вход по 100 на свече 15, выход по цели 110 на свече 30."""
+    return make_bars(
+        [
+            bar(0, 99.0, 101.0, 98.0, 100.0),
+            bar(15, 100.0, 103.0, 99.0, 102.0),
+            bar(30, 102.0, 111.0, 101.0, 110.0),
+        ]
+    ).with_columns(pl.lit(volume).alias("volume"), pl.lit(sigma).alias("bar_sigma"))
+
+
+def test_impact_worsens_entry_and_exit():
+    # η = 1, σ 0.2%, 25 контрактов в свечу на 100: 0.002 × цена × √0.25.
+    spec = replace(SPEC, impact=1.0)
+    signal = long_signal(contracts=25)
+    trade = simulate_position(spec, impact_bars(volume=100), 0, signal)
+    entry_impact = 0.002 * 100.0 * 0.5
+    exit_impact = 0.002 * 110.0 * 0.5
+    assert trade.entry_price == pytest.approx(100.0 + 0.5 + entry_impact)
+    assert trade.exit_price == pytest.approx(110.0 - 0.5 - exit_impact)
+    assert trade.impact == pytest.approx((entry_impact + exit_impact) * 25)
+    assert trade.slippage == pytest.approx(2 * 0.5 * 25)
+
+
+def test_impact_shrinks_with_bar_volume():
+    spec = replace(SPEC, impact=1.0)
+    signal = long_signal(contracts=25)
+    thin = simulate_position(spec, impact_bars(volume=50), 0, signal)
+    deep = simulate_position(spec, impact_bars(volume=5_000), 0, signal)
+    # √(25/50) против √(25/5 000): в 10 раз меньше.
+    assert deep.impact == pytest.approx(thin.impact / 10)
+
+
+def test_impact_off_needs_no_columns():
+    trade = simulate_position(
+        SPEC, impact_bars(volume=50).drop("volume"), 0, long_signal()
+    )
+    assert trade.impact == 0.0
+
+
+def test_impact_needs_volume_and_sigma():
+    spec = replace(SPEC, impact=1.0)
+    with pytest.raises(ValueError, match="bar_sigma"):
+        simulate_position(spec, impact_bars(50).drop("bar_sigma"), 0, long_signal())
+
+
+def test_no_sigma_history_means_no_impact():
+    # В начале ряда σ ещё нет — влияние 0, а не ошибка.
+    spec = replace(SPEC, impact=1.0)
+    trade = simulate_position(spec, impact_bars(50, sigma=None), 0, long_signal())
+    assert trade.impact == 0.0

@@ -11,7 +11,9 @@
 - доля ГО по дате — минимальная ставка mr1 на дату × коэффициент ГО
   самого ликвидного контракта из последнего снимка;
 - обычный объём свечи — медиана объёма в то же время суток за прошлые
-  20 дней (`usual_volume`), для лимита ликвидности в `sizing.py`.
+  20 дней (`usual_volume`), для лимита ликвидности в `sizing.py`;
+- σ свечи — стандартное отклонение 15-минутной доходности NAV за прошлые
+  20 дней (`bar_sigma`), для влияния на рынок в `costs.impact_points`.
 
 Факты контракта сверяются со снимком биржи: если стоимость шага в снимке
 не сходится с записанной, паспорт не загружается.
@@ -50,6 +52,10 @@ POINT_VALUE_TOLERANCE = 0.005
 # меньше 5 дней истории — неизвестен.
 USUAL_VOLUME_DAYS = 20
 USUAL_VOLUME_MIN_DAYS = 5
+# σ свечи — по 15-минутным доходностям NAV за 20 прошлых календарных дней;
+# меньше 100 свечей истории — неизвестна.
+BAR_SIGMA_WINDOW = "20d"
+BAR_SIGMA_MIN_BARS = 100
 SATURDAY = 6
 TICK_TOLERANCE = 1e-6
 
@@ -307,6 +313,30 @@ def add_usual_volume(
     )
 
 
+def add_bar_sigma(
+    bars: pl.DataFrame,
+    window: str = BAR_SIGMA_WINDOW,
+    min_bars: int = BAR_SIGMA_MIN_BARS,
+) -> pl.DataFrame:
+    """Обычное движение 15-минутной свечи в долях цены: σ доходности NAV.
+
+    Окно — прошлые `window` календарных дней, сама свеча в него не входит:
+    значение известно до её начала. Доходность — по NAV, поэтому переносы
+    контрактов не дают ложных скачков.
+    """
+    ordered = bars.sort("timestamp")
+    returns = ordered.select(
+        "timestamp", (pl.col("nav") / pl.col("nav").shift(1)).log().alias("_r")
+    )
+    sigma = returns.rolling("timestamp", period=window, closed="left").agg(
+        pl.when(pl.col("_r").drop_nulls().len() >= min_bars)
+        .then(pl.col("_r").std())
+        .otherwise(None)
+        .alias("bar_sigma")
+    )
+    return ordered.with_columns(sigma["bar_sigma"])
+
+
 def load_market(name: str) -> tuple[MarketParams, pl.DataFrame]:
     """Паспорт рынка и его 15-минутный ряд с point_value, margin_rate, usual_volume."""
     if name not in MARKETS:
@@ -326,4 +356,4 @@ def load_market(name: str) -> tuple[MarketParams, pl.DataFrame]:
     bars = add_point_value(bars, market, clearing_rates)
     margin_rates = pl.read_parquet(REFERENCE_DIR / "margin_rates.parquet")
     bars = add_margin_rate(bars, market, margin_rates, params.margin_factor)
-    return params, add_usual_volume(bars)
+    return params, add_bar_sigma(add_usual_volume(bars))

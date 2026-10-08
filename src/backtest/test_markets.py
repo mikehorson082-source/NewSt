@@ -3,6 +3,7 @@
 # бары и курсы — naive timestamp MSK, как в data/continuous_15m и data/reference.
 # ruff: noqa: DTZ001
 
+import math
 from datetime import date, datetime, timedelta
 
 import polars as pl
@@ -12,6 +13,7 @@ from backtest.markets import (
     MARKETS,
     Market,
     MarketParams,
+    add_bar_sigma,
     add_margin_rate,
     add_point_value,
     add_usual_volume,
@@ -244,3 +246,42 @@ def test_usual_volume_window_and_weekends():
     assert usual(bars, datetime(2026, 9, 19, 12)) == 10.0
     # Пт 18.09: медиана двух прошлых будних дней — чт 17.09 (1 010) и ср 16.09 (1 009).
     assert usual(bars, datetime(2026, 9, 18, 12)) == 1_009.5
+
+
+def test_bar_sigma_uses_only_past_bars():
+    start = datetime(2026, 9, 10, 10)
+    navs = [1.0, 1.01, 0.99, 1.02, 1.0]
+    bars = pl.DataFrame(
+        {
+            "timestamp": [start + timedelta(minutes=15 * k) for k in range(5)],
+            "nav": navs,
+        }
+    )
+    sigma = add_bar_sigma(bars, window="20d", min_bars=2)["bar_sigma"].to_list()
+    r1 = math.log(1.01)
+    r2 = math.log(0.99 / 1.01)
+    # Свеча 3: доходности свечей 1 и 2; своя доходность (1.02 / 0.99) не входит.
+    mean = (r1 + r2) / 2
+    expected = math.sqrt(((r1 - mean) ** 2 + (r2 - mean) ** 2) / 1)
+    assert sigma[3] == pytest.approx(expected)
+    # Свеча 2: в прошлом одна доходность — меньше min_bars, σ неизвестна.
+    assert sigma[2] is None
+
+
+def test_bar_sigma_window_drops_old_bars():
+    days = [0, 1, 2, 30, 31, 32]
+    bars = pl.DataFrame(
+        {
+            "timestamp": [datetime(2026, 1, 1) + timedelta(days=d) for d in days],
+            "nav": [1.0, 1.5, 0.5, 1.0, 1.01, 1.0],
+        }
+    )
+    sigma = add_bar_sigma(bars, window="20d", min_bars=2)["bar_sigma"].to_list()
+    # День 32: окно 12–32 — только доходности дней 30 и 31, огромные
+    # движения дней 1 и 2 в него не попадают.
+    r30 = math.log(1.0 / 0.5)
+    r31 = math.log(1.01)
+    mean = (r30 + r31) / 2
+    assert sigma[5] == pytest.approx(
+        math.sqrt(((r30 - mean) ** 2 + (r31 - mean) ** 2) / 1)
+    )

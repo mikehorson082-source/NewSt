@@ -138,6 +138,7 @@ class PortfolioResult:
                     "bars_held": trade.bars_held,
                     "pnl_before_costs": trade.pnl_before_costs,
                     "slippage": trade.slippage,
+                    "impact": trade.impact,
                     "commissions": trade.commissions,
                     "roll_costs": trade.roll_costs,
                     "costs": trade.costs,

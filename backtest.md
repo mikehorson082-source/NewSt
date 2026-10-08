@@ -5,10 +5,12 @@
 В этом уроке мы разберем:
 1. Зачем вообще нужен отдельный модуль бэктеста и почему нельзя просто считать прибыль в Excel или через `df["close"].pct_change()`.
 2. Главный принцип честного квант-трейдинга: почему нет заглядывания в будущее.
-3. Анатомию модуля: что делает каждый скрипт ([specs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/specs.py), [costs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/costs.py), [position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py)).
-4. Как моделируются реальные биржевые издержки: проскальзывание, комиссии и перенос фьючерса (ролл).
+3. Анатомию модуля: что делает каждый скрипт — от спецификации контракта до портфеля и отчёта.
+4. Как моделируются реальные биржевые издержки: проскальзывание, комиссии, перенос фьючерса (ролл) и влияние на рынок.
 5. Как позиция живет во времени: вход, жизнь внутри свечи, гэпы и выход.
-6. Как автоматические тесты гарантируют математическую честность симулятора.
+6. Как из сделок получаются портфель, кривая капитала и отчёт.
+7. Какие контрольные проверки нужно пройти, прежде чем верить результату стратегии.
+8. Как автоматические тесты гарантируют математическую честность симулятора.
 
 ---
 
@@ -30,29 +32,34 @@
 
 ## 2. Общая архитектура модуля
 
-Модуль состоит из трех основных кирпичиков и набора юнит-тестов:
+Модуль собран из небольших кирпичиков, у каждого свои тесты:
 
 ```text
 src/backtest/
 ├── specs.py          # Постоянные правила контракта (шаг цены, тарифы, проскальзывание)
 ├── costs.py          # Калькулятор издержек (проскальзывание, комиссии, стоимость переноса)
-├── markets.py        # Паспорта рынков st01: рубли за пункт и ГО по датам из данных биржи
+├── markets.py        # Паспорта рынков: рубли за пункт, ГО, обычный объём и σ свечи
 ├── minutes.py        # Минутки контрактов из raw: что задето раньше внутри 15-минутной свечи
 ├── position.py       # Движок симуляции одной сделки (вход, стоп, тейк, ролл, выход)
 ├── sizing.py         # Размер позиции: контракты от риска, предел ГО и ликвидность
 ├── portfolio.py      # Портфель: одна позиция на все рынки, выбор между сигналами
 ├── report.py         # Отчёт: кривая капитала, метрики, разбивка по годам
-├── charts.py         # Графики отчёта: шесть панелей в один PNG
+├── charts.py         # Графики: отчёт (шесть панелей) и сетка издержек
+├── baseline.py       # «Купил и держи»: сверка с NAV, стоимость переноса, базовая линия
+├── sensitivity.py    # Сетка издержек и разбивка сделок по сессиям
 ├── checks/           # Проверки на реальных данных: uv run python -m backtest.checks.<имя>
 │   ├── markets.py, point_value.py, sizing.py, portfolio.py, report.py
+│   ├── buy_and_hold.py, costs.py
 │   └── reports/      # Картинки проверок (хранятся в git)
-├── test_charts.py    # 1 тест: графики рисуются
-├── test_costs.py     # Тесты спецификаций и формул издержек
-├── test_markets.py   # 21 тест паспортов рынков и обычного объёма
+├── test_baseline.py  # 5 тестов «купил и держи» (NAV считает функция склейки)
+├── test_charts.py    # 2 теста: графики рисуются
+├── test_costs.py     # 20 тестов спецификаций и формул издержек
+├── test_markets.py   # 23 теста паспортов рынков, обычного объёма и σ свечи
 ├── test_minutes.py   # 6 тестов чтения минуток
-├── test_position.py  # 47 тестов на все жизненные ситуации и краевые случаи
+├── test_position.py  # 53 теста на все жизненные ситуации и краевые случаи
 ├── test_portfolio.py # 20 тестов портфеля
 ├── test_report.py    # 18 тестов отчёта на сделках, посчитанных вручную
+├── test_sensitivity.py # 11 тестов сетки издержек и сессий
 └── test_sizing.py    # 32 теста размера позиции
 ```
 
@@ -65,6 +72,7 @@ src/backtest/
 * [position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py) берет свечи вместе с их рублями за пункт, параметры издержек и честно проводит позицию от момента сигнала до закрытия.
 * [portfolio.py](file:///Users/anton/Documents/app/NewSt/src/backtest/portfolio.py) получает сигналы всех рынков, решает, какой исполнить, и для него вызывает `size_position` и `simulate_position`.
 * [report.py](file:///Users/anton/Documents/app/NewSt/src/backtest/report.py) превращает результат портфеля в кривую капитала и метрики, [charts.py](file:///Users/anton/Documents/app/NewSt/src/backtest/charts.py) рисует их.
+* [baseline.py](file:///Users/anton/Documents/app/NewSt/src/backtest/baseline.py) и [sensitivity.py](file:///Users/anton/Documents/app/NewSt/src/backtest/sensitivity.py) — контрольные проверки: согласен ли симулятор со склейкой, что даёт просто держать рынок и насколько результат зависит от издержек.
 
 ---
 
@@ -74,8 +82,9 @@ src/backtest/
 * Шаг цены (`tick_size`): минимальное изменение цены (например, 0.5 пункта или 1 пункт).
 * Комиссии биржи и брокера (`exchange_fee_rate`, `broker_fee_rate`).
 * Проскальзывание в шагах цены (`slippage_ticks`).
+* Влияние на рынок (`impact`, η): насколько хуже цена, когда заявка забирает большую долю объёма свечи. По умолчанию 0 — выключено (подробнее в разделе 4).
 
-Эти правила не меняются по датам, поэтому собраны в неизменяемый объект [ContractSpec](file:///Users/anton/Documents/app/NewSt/src/backtest/specs.py#L15):
+Эти правила не меняются по датам, поэтому собраны в неизменяемый объект [ContractSpec](file:///Users/anton/Documents/app/NewSt/src/backtest/specs.py):
 
 ```python
 @dataclass(frozen=True)
@@ -85,6 +94,7 @@ class ContractSpec:
     exchange_fee_rate: float   # Ставка комиссии биржи (доля от стоимости контракта)
     broker_fee_rate: float     # Ставка комиссии брокера (по умолчанию 0.0)
     slippage_ticks: float      # Проскальзывание в шагах цены (по умолчанию 1 тик)
+    impact: float              # Влияние на рынок η (по умолчанию 0 — выключено)
 ```
 
 Класс автоматически валидирует параметры при создании: нельзя задать отрицательную комиссию или нулевой шаг цены.
@@ -108,6 +118,8 @@ Brent с шагом цены $0.01 и стоимостью пункта $10, к�
 | Шаг цены | Снимок биржи `margin_snapshot.parquet`, самый ликвидный контракт |
 | Рубли за пункт на свече | Стоимость пункта × курс клиринга (`rates_moex_clearing.parquet`) |
 | Доля ГО на дату | Минимальная ставка `mr1` на дату (`margin_rates.parquet`) × коэффициент ГО из снимка |
+| Обычный объём свечи (`usual_volume`) | Медиана объёма в то же время суток за прошлые 20 дней — для лимита ликвидности (раздел 6) |
+| σ свечи (`bar_sigma`) | Стандартное отклонение 15-минутной доходности NAV за прошлые 20 дней — для влияния на рынок (раздел 4) |
 
 Записанное руками сверяется со снимком биржи. Если, например, в паспорте Brent по ошибке записать $100 за пункт, загрузка остановится с ошибкой «не сходится». Цены ряда проверяются на сетку шага цены.
 
@@ -130,7 +142,7 @@ Brent с шагом цены $0.01 и стоимостью пункта $10, к�
 ```python
 from backtest.markets import load_market
 
-params, bars = load_market("brent")   # свечи с point_value и margin_rate
+params, bars = load_market("brent")   # свечи с point_value, margin_rate, usual_volume, bar_sigma
 spec = params.contract_spec()         # шаг цены, сбор, проскальзывание
 trade = simulate_position(spec, bars, signal_bar, signal, minutes=minutes)
 ```
@@ -143,7 +155,7 @@ trade = simulate_position(spec, bars, signal_bar, signal, minutes=minutes)
 1. **Проскальзывание (Slippage):** рыночная заявка «съедает» лучшую цену в стакане.
 2. **Комиссия биржи и брокера (Fee):** платится с оборота каждой сделки.
 
-В [costs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/costs.py) реализованы три функции:
+В [costs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/costs.py) реализованы четыре функции:
 
 ### 1. `fill_price` — цена исполнения заявки
 Покупатель всегда покупает чуть дороже рынка, а продавец продает чуть дешевле:
@@ -172,7 +184,7 @@ trade = simulate_position(spec, bars, signal_bar, signal, minutes=minutes)
 * Комиссию за закрытие старого контракта.
 * Комиссию за открытие нового контракта.
 
-Формула из [costs.py:L58-L62](file:///Users/anton/Documents/app/NewSt/src/backtest/costs.py#L58-L62):
+Формула из [costs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/costs.py):
 ```python
 slippage = 2 * spec.slippage * point_value * contracts
 fees = commission(spec, old_price, point_value, contracts) + commission(
@@ -181,13 +193,26 @@ fees = commission(spec, old_price, point_value, contracts) + commission(
 roll_cost = slippage + fees
 ```
 
+### 4. `impact_points` — влияние на рынок
+Чем большую долю объёма свечи забирает заявка, тем хуже цена (книга ML4T, глава 18). К обычному проскальзыванию добавляется:
+
+`влияние = η × σ свечи × цена × √(контракты ÷ объём свечи)`
+
+* **σ свечи** — обычное 15-минутное движение за прошлые 20 дней (`bar_sigma`). У Brent медиана 0.22% цены.
+* **Объём** — фактический объём свечи, в которой исполнилась заявка. Здесь его брать можно: на решение о входе он не влияет, а показывает, как рынок исполнил заявку.
+* **η** — коэффициент. Оценить его можно только по своим сделкам, а их нет, поэтому он **задаётся**: в обычном отчёте 0, в сетке издержек — стресс 0.5 и 1.
+
+Пример: Brent по $70, η = 1. 25 контрактов в свечу, где торговали 50: `0.0022 × 70 × √0.5 ≈ $0.11` — 11 шагов сверх обычного. Те же 25 контрактов в дневную свечу на 4 000 — чуть больше 1 шага.
+
+Ограничения: модель придумана для доли **дневного** объёма, к 15-минутным свечам это экстраполяция; переносы влияния не платят; размер позиции его не учитывает — в момент сигнала фактический объём неизвестен. Для влияния в свечах нужны столбцы `volume` и `bar_sigma`, их даёт `load_market`.
+
 ---
 
 ## 5. Скрипт №3: `position.py` — Движок жизни сделки
 
 Это сердце бэктестера. Здесь моделируется весь жизненный цикл торговой позиции.
 
-### Входные данные: сигнал [Signal](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py#L58-L76)
+### Входные данные: сигнал [Signal](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py)
 Когда стратегия решает открыть сделку, она создает объект `Signal`:
 * `side`: направление (+1 для Long, -1 для Short).
 * `stop`: уровень стоп-лосса в реальных ценах (например, 95.0).
@@ -199,7 +224,7 @@ roll_cost = slippage + fees
 
 ### Хронология сделки: как идет время
 
-Разберем пошагово, как функция [simulate_position](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py#L235) обрабатывает сделку.
+Разберем пошагово, как функция [simulate_position](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py) обрабатывает сделку.
 
 ```text
 Бар T (сигнальный)        Бар T+1 (вход)             Бар T+2 ... T+N           Выход
@@ -221,12 +246,13 @@ Close = 100.0             Open = 100.5               Свечи развиваю
 * Цикл симулятора начинается строго с бара `signal_bar + 1`:
   `for i in range(signal_bar + 1, bars.height):`
 * Вход выполняется **по цене Open** этого бара с учетом проскальзывания:
-  `entry_price = fill_price(spec, float(row["open"]), side, quantity)`
+  `entry_price = fill_price(spec, float(row["open"]), side, quantity, entry_impact)`
+  `entry_impact` — влияние на рынок в пунктах (0, если η = 0; раздел 4).
 * Заявка исполняется в реальных ценах, а затем переводится в скорректированные: `entry_adj = entry_price + adjustment`. Скорректированные цены могут быть отрицательными (так бывает у NG при аддитивной склейке), а реальные — всегда больше нуля.
 * Списывается комиссия за вход.
 * **Никакого заглядывания в будущее:** решение принято в момент T, исполнение произошло на первом доступном тике в момент T+1.
 
-#### Шаг 3: Проверка выхода внутри бара ([_intrabar_exit](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py#L131-L164))
+#### Шаг 3: Проверка выхода внутри бара ([_intrabar_exit](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py))
 На каждом баре (включая бар входа!) цена двигается. Симулятор проверяет, не пора ли закрыть позицию:
 
 **1. Сначала проверяется гэп на открытии бара (`open`):**
@@ -240,7 +266,7 @@ Close = 100.0             Open = 100.5               Свечи развиваю
 * Если `low` опустился до стопа (`low_adj <= stop_adj`) -> выход по `stop`.
 * Если `high` поднялся до цели (`high_adj >= target_adj`) -> выход по `target`.
 
-**3. Свеча задела и стоп, и цель — смотрим минутки ([_exit_by_minutes](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py#L201-L232)):**
+**3. Свеча задела и стоп, и цель — смотрим минутки ([_exit_by_minutes](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py)):**
 Что если за 15 минут произошла огромная волатильность («вертолёт»), и свеча открылась между уровнями, а потом коснулась **и стопа, и цели**?
 По одной 15-минутной свече не узнать, что было раньше — рост или падение. Но свеча собрана из минуток, а минутки лежат в `data/raw`. Симулятор открывает минутки того же контракта за эти 15 минут и проходит их по порядку тем же правилом, что и свечи: сначала гэп открытия минутки, потом её минимум и максимум.
 
@@ -300,7 +326,7 @@ trade = simulate_position(spec, bars, signal_bar, signal, minutes=minutes)
 
 ---
 
-### Выходные данные: отчет о сделке [ClosedTrade](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py#L79-L105)
+### Выходные данные: отчет о сделке [ClosedTrade](file:///Users/anton/Documents/app/NewSt/src/backtest/position.py)
 
 Когда сделка завершена, симулятор возвращает датакласс со всеми деталями:
 * `asset`: имя инструмента.
@@ -315,7 +341,8 @@ trade = simulate_position(spec, bars, signal_bar, signal, minutes=minutes)
 * `commissions`: суммарные комиссии в рублях (вход + выход).
 * `roll_costs`: затраты на переносы через экспирации (их проскальзывание и сборы).
 * `net_pnl`: чистая прибыль в рублях в кармане трейдера (`gross_pnl - commissions - roll_costs`).
-* `pnl_before_costs` и `costs`: результат по ценам рынка и все издержки. `pnl_before_costs − costs = net_pnl` — каждая издержка учтена ровно один раз.
+* `impact`: влияние на рынок входа и выхода в рублях, сверх обычного проскальзывания (0, если η = 0).
+* `pnl_before_costs` и `costs`: результат по ценам рынка и все издержки (проскальзывание, влияние, сборы, переносы). `pnl_before_costs − costs = net_pnl` — каждая издержка учтена ровно один раз.
 * `mae`, `mfe`: насколько сделка уходила против нас и в нашу пользу (₽, от цены исполнения входа, без сборов). Считаются по high/low свечей; в свече выхода по стопу или цели — только открытие и уровень выхода: что было в свече после выхода, неизвестно.
 * `path`: результат после издержек на закрытии каждой свечи сделки. Пример: лонг на 5 свечей, −1 200, −3 400, −800, +2 100, +4 500 ₽ — итог +4 500 ₽, но внутри сделки капитал был на 3 400 ₽ ниже. Из пути строится кривая капитала.
 
@@ -355,10 +382,10 @@ trade = simulate_position(spec, bars, signal_bar, signal, minutes=minutes)
 * `contracts` — сколько контрактов; `limit` — какой лимит сработал: `"risk"`, `"margin"` или `"volume"` (при равенстве — первый в этом порядке).
 * `cost_share` — доля издержек в риске контракта; по ней портфель выбирает между одновременными сигналами.
 * `contracts == 0` (`skipped`) — **сигнал пропускается**, `limit` — причина: даже 1 контракт рискует больше бюджета (стоп слишком далеко) или требует больше ГО, чем разрешено.
-* `risk` — плановый риск позиции до стопа в рублях. Это **1R** сделки: на шаге 3.5 по нему считается expectancy в R.
+* `risk` — плановый риск позиции до стопа в рублях. Это **1R** сделки: по нему отчёт считает expectancy, MAE и MFE в R.
 * `margin` — ГО позиции на момент сигнала.
 
-Капитал передаётся в функцию: на шаге 3.4 портфель будет передавать текущий капитал на момент сигнала.
+Капитал передаётся в функцию: портфель передаёт текущий капитал на момент сигнала.
 
 В риск **не входят**: вход по открытию следующей свечи вместо закрытия сигнальной, выход хуже стопа при гэпе и стоимость переноса контракта. Поэтому реальный убыток по стопу иногда больше плана.
 
@@ -457,34 +484,91 @@ save_report_chart(report, Path("src/backtest/checks/reports/x.png"), "Назва
 ### Графики
 Один PNG, шесть панелей: капитал, просадка, Sharpe в окне полгода, доходность по месяцам, распределение дневных доходностей, MAE против MFE каждой сделки в R.
 
-Проверка на реальных данных: `uv run python -m backtest.checks.report` — те же случайные сигналы, что в `check_portfolio.py`. Стратегии в них нет, и отчёт должен сам это показать: Sharpe ниже нуля, вероятность «Sharpe > 0» маленькая.
+Если у портфеля есть сделка, закрытая концом данных, на панели MAE/MFE она серая и крупнее, а заголовок пишет «сделок N (+1 закрыта концом данных)».
+
+Проверка на реальных данных: `uv run python -m backtest.checks.report` — те же случайные сигналы, что в `backtest.checks.portfolio`. Стратегии в них нет, и отчёт должен сам это показать: Sharpe ниже нуля, вероятность «Sharpe > 0» маленькая. Там же — сделки, ушедшие против нас дальше 1.5R (гэп через стоп), и разбивка сделок по сессиям (раздел 9).
 
 ---
 
-## 9. Как тесты подтверждают корректность бэктестера
+## 9. Скрипты №8 и №9: `baseline.py` и `sensitivity.py` — Контрольные проверки
 
-В модуле написан 161 юнит-тест ([test_position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py), [test_markets.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_markets.py), [test_minutes.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_minutes.py), [test_sizing.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sizing.py), [test_portfolio.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_portfolio.py), [test_report.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_report.py) и [test_costs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_costs.py)), которые проверяют каждую нестандартную ситуацию:
+Прежде чем верить результату стратегии, нужно ответить на три вопроса: считает ли симулятор то же, что склейка; что дало бы просто держать рынок; насколько результат держится на предположениях об издержках.
 
-1. **Тест на проскальзывание и комиссии** ([test_long_target_fills_by_next_open_with_costs](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L57)): проверяет, что при входе и выходе по цели чистая прибыль строго меньше грязной на величину двух комиссий и двух проскальзываний.
+### «Купил и держи»: симулятор против NAV
+NAV склейки (`build_continuous_futures.add_etf_nav`) — основа признаков и таргетов, симулятор — то, что платит рубли. Если они расходятся, модель учится на одном, а бэктест платит по другому.
+
+[baseline.py](file:///Users/anton/Documents/app/NewSt/src/backtest/baseline.py) держит 1 контракт с первой свечи до последней без издержек и на **каждой** свече сравнивает:
+
+`прибыль симулятора за свечу ÷ (контракты × рубли за пункт × прошлое закрытие) = доходность NAV за свечу`
+
+На свече переноса прошлое закрытие пересчитывается в цены нового контракта поправкой — так NAV не видит базиса, а ночное движение оставляет.
+
+Результат на реальных данных (08.10.2026): 278 тыс. свечей, 107 переносов, расхождение не больше 4.5e-16 — предел точности вычислений. Перенос стоит 2.6–5.1 б.п. NAV оставлен без издержки переноса (`--roll-cost-bps 0`): NAV — чистое движение цены, все издержки считает только симулятор, чтобы их нельзя было учесть дважды.
+
+### Базовая линия: что дало бы просто держать рынок
+`buy_and_hold_result(spec, bars, capital)`: на 1 000 000 ₽ покупается столько контрактов, чтобы их стоимость равнялась капиталу (плечо 1×), и держится до конца — через тот же симулятор и отчёт, что у стратегий, переносы платные (книга ML4T, 16 `09`: базовая линия проходит те же условия). 1R здесь — весь номинал на входе: стопа нет.
+
+| Рынок | Доходность | CAGR | Max DD | Sharpe |
+|---|---|---|---|---|
+| Золото | +107.8% | +18.0% | −30.9% | 0.91 ± 0.49 |
+| Brent | +37.1% | +7.4% | −51.9% | 0.38 ± 0.48 |
+| CNY | −24.9% | −6.3% | −53.9% | −0.15 ± 0.48 |
+| MIX | −38.5% | −10.4% | −67.4% | −0.26 ± 0.48 |
+
+Рубли расходятся с NAV (у золота NAV +85.8%): контракты не перекладываются, как NAV, а у Brent и золота рубли за пункт идут за курсом доллара. NAV — доходность сверх рублёвой ставки (ставка заложена в цену фьючерса), поэтому у CNY и MIX минус.
+
+Проверка: `uv run python -m backtest.checks.buy_and_hold` — сверка, стоимость переносов, таблица сравнения рынков, доходность по годам и картинки `checks/reports/buy_and_hold_<рынок>.png`.
+
+### Сетка издержек
+[sensitivity.py](file:///Users/anton/Documents/app/NewSt/src/backtest/sensitivity.py), `cost_grid`: те же сигналы прогоняются через **весь** портфель заново при проскальзывании 0, 1, 2, 3, 5 шагов и сборе ×0, ×1, ×2 (книга ML4T, 16 `14`). Именно заново: при больших издержках размер позиции меньше, а выбор между рынками может смениться. Этим сетка отличается от «запаса по издержкам» в отчёте, где сделки те же.
+
+`break_even` — проскальзывание, при котором expectancy после издержек = 0. Считается в R на сделку, а не в рублях: рубли упираются в «дно», когда капитал кончается.
+
+Что показали случайные сигналы (стоп 0.5%):
+* без издержек — 0.00R, как и должно быть;
+* каждый шаг проскальзывания ≈ 0.03R на сделку, сбор по тарифу ≈ 0.03R, сейчас всего 0.07R;
+* влияние на рынок η = 1 ≈ +0.045R — примерно 1.5 шага.
+
+**Ориентир для стратегий** при стопе 0.5%: больше 0.07R до издержек на нынешних предположениях, больше 0.10R — чтобы выдержать 2 шага, больше 0.11R — со стрессом η = 1. При стопе 1% издержки в R вдвое меньше.
+
+Проверка: `uv run python -m backtest.checks.costs` (17 полных прогонов, несколько минут) → таблица и график `checks/reports/cost_grid_random.png`.
+
+### Сделки по сессиям
+`by_session`: сделки по сессии входа — утро (до 10:00), день, вечер (с 19:00), выходные: результат в R, издержки в R, доля в объёме свечи, гэпы через стоп. Таблица выводится в `backtest.checks.report`.
+
+**Настоящего спреда в данных нет**: бэктест везде считает 1 шаг. Статистики стакана фьючерсов (Algopack `fo/obstats`) в подписке нет. Что видно и без спреда: сделка забирает вечером 0.62% объёма свечи, в выходные 1.71%, днём 0.18% — вечером и в выходные рынок тоньше в 3–10 раз.
+
+**Ловушка множественных сравнений.** На случайных сигналах выходные дали +0.34R на 60 сделках. Если разбить случайные сделки на 4 группы, одна почти наверняка покажется «интересной». Решать «торговать только в выходные» по такой таблице нельзя, пока это не подтвердится на данных, которых стратегия не видела.
+
+---
+
+## 10. Как тесты подтверждают корректность бэктестера
+
+В модуле написано 190 юнит-тестов ([test_position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py), [test_markets.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_markets.py), [test_minutes.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_minutes.py), [test_sizing.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sizing.py), [test_portfolio.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_portfolio.py), [test_report.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_report.py), [test_baseline.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_baseline.py), [test_sensitivity.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sensitivity.py), [test_charts.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_charts.py) и [test_costs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_costs.py)), которые проверяют каждую нестандартную ситуацию:
+
+1. **Тест на проскальзывание и комиссии** ([test_long_target_fills_by_next_open_with_costs](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)): проверяет, что при входе и выходе по цели чистая прибыль строго меньше грязной на величину двух комиссий и двух проскальзываний.
 2. **Тесты на бар-«вертолёт»**: свеча задела и цель 110, и стоп 95.
-   * Минутки показали, что цель была раньше, — выход по цели ([test_minutes_show_target_was_first](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L541)); стоп раньше — выход по стопу ([test_minutes_show_stop_was_first](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L562)).
-   * Оба уровня в одной минутке или минуток нет — пессимистичный стоп ([test_both_levels_in_one_minute_fall_back_to_stop](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L583), [test_stop_has_priority_in_bar_with_both_levels_without_minutes](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L78)).
-   * После ролла берутся минутки нового контракта, уровни пересчитываются через поправку ([test_minutes_after_roll_use_new_contract_and_adjustment](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L661)).
-   * На 200 случайных путях цены разбор по минуткам дает тот же выход, что и прогон симулятора прямо по минутным свечам ([test_minute_resolution_matches_full_minute_simulation](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L733)).
-3. **Тест на утренний гэп** ([test_gap_through_stop_fills_at_open](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L94)): бар открылся ниже стопа — выход зафиксирован по худшей цене открытия гэпа.
-4. **Тест на невидимость будущего** ([test_future_perturbation_does_not_change_result](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L239)): все цены будущих свечей после закрытия сделки умножаются на 2 — результат закрытой сделки остается неизменным с точностью до копейки.
-5. **Тест на честный ролл** ([test_roll_transfer_hides_gap_and_charges_cost](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L160)): перенос через контракт с ценовым прыжком на 90 пунктов не добавляет фальшивой прибыли, но корректно списывает затраты на перенос.
-6. **Тест на ночной гэп в день ролла** ([test_roll_keeps_overnight_gap_through_stop](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L181)): базис убран, но ночное падение рынка, выбившее стоп, остается в убытке.
+   * Минутки показали, что цель была раньше, — выход по цели ([test_minutes_show_target_was_first](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)); стоп раньше — выход по стопу ([test_minutes_show_stop_was_first](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)).
+   * Оба уровня в одной минутке или минуток нет — пессимистичный стоп ([test_both_levels_in_one_minute_fall_back_to_stop](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py), [test_stop_has_priority_in_bar_with_both_levels_without_minutes](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)).
+   * После ролла берутся минутки нового контракта, уровни пересчитываются через поправку ([test_minutes_after_roll_use_new_contract_and_adjustment](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)).
+   * На 200 случайных путях цены разбор по минуткам дает тот же выход, что и прогон симулятора прямо по минутным свечам ([test_minute_resolution_matches_full_minute_simulation](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)).
+3. **Тест на утренний гэп** ([test_gap_through_stop_fills_at_open](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)): бар открылся ниже стопа — выход зафиксирован по худшей цене открытия гэпа.
+4. **Тест на невидимость будущего** ([test_future_perturbation_does_not_change_result](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)): все цены будущих свечей после закрытия сделки умножаются на 2 — результат закрытой сделки остается неизменным с точностью до копейки.
+5. **Тест на честный ролл** ([test_roll_transfer_hides_gap_and_charges_cost](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)): перенос через контракт с ценовым прыжком на 90 пунктов не добавляет фальшивой прибыли, но корректно списывает затраты на перенос.
+6. **Тест на ночной гэп в день ролла** ([test_roll_keeps_overnight_gap_through_stop](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)): базис убран, но ночное падение рынка, выбившее стоп, остается в убытке.
 7. **Тесты на рубли за пункт по свечам**:
-   * Пример из плана: $1 при курсе 80 и $1 при курсе 90 дают 1 700 ₽, а одно число 900 — 1 800 ₽ ([test_profit_uses_point_value_of_each_bar](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L381)).
-   * Цена стоит, курс растёт — прибыль ноль ([test_flat_price_with_rising_rate_gives_zero_profit](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L401)).
-   * Комиссия входа, перенос и выход — каждый по рублям за пункт своей свечи ([test_costs_use_point_value_of_their_bar](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L419)).
-   * У CNY и MIX результат совпадает с прежней формулой «одно число» ([test_rub_markets_keep_single_point_value_result](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L465)).
+   * Пример из плана: $1 при курсе 80 и $1 при курсе 90 дают 1 700 ₽, а одно число 900 — 1 800 ₽ ([test_profit_uses_point_value_of_each_bar](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)).
+   * Цена стоит, курс растёт — прибыль ноль ([test_flat_price_with_rising_rate_gives_zero_profit](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)).
+   * Комиссия входа, перенос и выход — каждый по рублям за пункт своей свечи ([test_costs_use_point_value_of_their_bar](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)).
+   * У CNY и MIX результат совпадает с прежней формулой «одно число» ([test_rub_markets_keep_single_point_value_result](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)).
 8. **Тесты размера позиции** ([test_sizing.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sizing.py)): пример из плана (11 контрактов), лимит ГО при близком стопе, пропуск сигнала по риску и по ГО, размер по известному курсу, а не по курсу будущего клиринга, 10 контрактов, а не 9, когда бюджет делится нацело, но float дает 9.999999999999977, и лимит ликвидности: тонкая свеча входа урезает или пропускает сигнал, неизвестный обычный объём — 0 контрактов. Обычный объём не видит своего дня, будни и выходные считаются отдельно ([test_markets.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_markets.py)).
 9. **Тесты портфеля** ([test_portfolio.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_portfolio.py)): `busy` до свечи выхода и вход на ней, капитал переходит из сделки в сделку (2 000 контрактов, затем 2 040), дешевле по издержкам и ничья по порядку рынков, `zero_size` передаёт ход следующему, остановка при капитале ≤ 0 после гэпа, минутки и `max_bars` доходят до симулятора, порядок строк на входе не меняет результат.
 10. **Тесты отчёта** ([test_report.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_report.py)): три сделки, посчитанные вручную. Просадка внутри выигрышной сделки видна на кривой, Sharpe и Sortino совпадают с формулой, Profit Factor 40 400 / 10 400, сделка `end` есть в деньгах, но не в проценте выигрышных, годы передают капитал, запас по издержкам 5 раз.
-11. **Тест «каждая издержка ровно один раз»** ([test_costs_are_charged_exactly_once](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)): на 300 случайных сделках с переносами результат «до издержек» равен результату той же сделки на рынке без издержек, путь кончается на `net_pnl`, MAE ≤ 0 ≤ MFE.
-12. **Тест на отрицательные скорректированные цены** ([test_negative_adjusted_prices_do_not_change_result](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py#L214)): результат сделки не зависит от уровня поправки, даже если скорректированные цены ниже нуля.
+11. **Тест «каждая издержка ровно один раз»** ([test_costs_are_charged_exactly_once](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)): на 300 случайных сделках с переносами результат «до издержек» равен результату той же сделки на рынке без издержек, путь кончается на `net_pnl`, MAE ≤ 0 ≤ MFE. Повторён с включённым влиянием на рынок.
+12. **Тесты влияния на рынок** ([test_costs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_costs.py), [test_position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)): вчетверо большая доля объёма — вдвое большее влияние, цена входа и выхода хуже на влияние, без σ в начале ряда влияние 0, а не ошибка. σ свечи не видит своей свечи и свечей старше 20 дней ([test_markets.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_markets.py)).
+13. **Тесты «купил и держи»** ([test_baseline.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_baseline.py)): на ряду с двумя переносами и меняющимися рублями за пункт симулятор совпадает с NAV, который считает **настоящая** функция склейки `add_etf_nav`, на каждой свече; стоимость переносов в б.п. равна той, что платит симулятор.
+14. **Тесты сетки издержек** ([test_sensitivity.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sensitivity.py)): без издержек результат = результат до издержек, с ростом издержек результат только падает, при 20 шагах портфель берёт меньше контрактов (сетка пересчитывает размер, а не просто вычитает), точка безубыточности по R, границы сессий.
+15. **Тест на отрицательные скорректированные цены** ([test_negative_adjusted_prices_do_not_change_result](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)): результат сделки не зависит от уровня поправки, даже если скорректированные цены ниже нуля.
 
 Запустить все тесты модуля можно стандартной командой:
 ```bash
@@ -493,7 +577,7 @@ uv run pytest src/backtest
 
 ---
 
-## 10. Резюме: памятка разработчику стратегий
+## 11. Резюме: памятка разработчику стратегий
 
 Когда вы будете писать генератор сигналов (в папках `features/`, `models/` или `st01/`):
 * **Сигнал строится только по закрытому бару T.** Не используйте в расчете сигнала данные, которые станут известны только в момент T+1.
@@ -503,4 +587,8 @@ uv run pytest src/backtest
 * **Отдавайте сигналы в `run_portfolio`** одной таблицей по всем рынкам. Он сам посчитает число контрактов через `size_position`, выберет между одновременными сигналами и запишет пропущенные с причиной.
 * **Передавайте минутки рынка** (`minutes=RawMinutes.for_market("brent")`). Без них свеча, задевшая и стоп, и цель, всегда закрывается по стопу, и стратегии с близкими уровнями выглядят хуже, чем есть.
 * **Оценивайте стратегию по `build_report`**, а не по сумме сделок: просадка внутри сделок, погрешность Sharpe и запас по издержкам видны только там.
+* **Сравнивайте с «купил и держи»** (`buy_and_hold_result`) на тех же рынках: стратегия должна быть лучше, чем просто держать, — по доходности или хотя бы по просадке.
+* **Прогоните сетку издержек** (`cost_grid`): если заработок исчезает при 2 шагах проскальзывания или при η = 1, торговать стратегию опасно. Ориентир при стопе 0.5% — больше 0.07R на сделку до издержек.
+* **Смотрите на гэпы через стоп**: позиция через ночь и выходные может потерять в несколько раз больше 1R (худшая на случайных сигналах — −4.8R).
+* **Не верьте одному году и одной группе**: погрешность Sharpe за год ±1.0, а разбивка на сессии или рынки сама даёт «интересную» группу.
 * **Всегда проверяйте `net_pnl`.** Высокий `gross_pnl` при частых сделках может быть полностью съеден комиссиями и проскальзыванием. Бэктестер покажет реальный финансовый результат.

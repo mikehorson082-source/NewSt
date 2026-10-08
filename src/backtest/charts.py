@@ -36,7 +36,10 @@ GRID = "#e1e0d9"
 BASELINE = "#c3c2b7"
 BLUE = "#2a78d6"  # категория 1
 ORANGE = "#eb6834"  # категория 2
+AQUA = "#1baf7a"  # категория 3
 RED = "#e34948"  # категория 8: просадка
+# Первые три категории палитры проходят проверку на дальтонизм попарно.
+SERIES = (BLUE, ORANGE, AQUA)
 # Расходящаяся шкала: синий — плюс, красный — минус, серый — ноль.
 DIVERGING = LinearSegmentedColormap.from_list(
     "returns", ["#e34948", "#f0efec", "#2a78d6"]
@@ -207,10 +210,23 @@ def _monthly(ax, report: Report) -> None:
 
 
 def _excursions(ax, report: Report) -> None:
-    trades = report.trades.filter(pl.col("exit_reason") != "end")
-    wins = trades.filter(pl.col("net_pnl") > 0)
-    losses = trades.filter(pl.col("net_pnl") <= 0)
+    trades = report.trades
+    closed = trades.filter(pl.col("exit_reason") != "end")
+    wins = closed.filter(pl.col("net_pnl") > 0)
+    losses = closed.filter(pl.col("net_pnl") <= 0)
+    ended = trades.filter(pl.col("exit_reason") == "end")
     style = {"s": 10, "alpha": 0.5, "linewidths": 0}
+    # Сделки, закрытые концом данных («купил и держи»), — серым, крупнее:
+    # рынок их не закрывал, в процент выигрышных они не входят.
+    if not ended.is_empty():
+        ax.scatter(
+            ended["mae_r"],
+            ended["mfe_r"],
+            color=MUTED,
+            s=60,
+            label=f"закрыты концом данных ({ended.height})",
+            zorder=4,
+        )
     ax.scatter(
         losses["mae_r"],
         losses["mfe_r"],
@@ -245,7 +261,7 @@ def _excursions(ax, report: Report) -> None:
         labels[::-1],
         loc="upper center",
         bbox_to_anchor=(0.5, -0.11),
-        ncol=2,
+        ncol=len(handles),
         fontsize=8.5,
         frameon=False,
     )
@@ -257,6 +273,18 @@ def _excursions(ax, report: Report) -> None:
         if outside
         else "MAE и MFE сделок в R",
     )
+
+
+def _trades_text(report: Report) -> str:
+    """Сделки для заголовка: закрытые рынком и закрытые концом данных."""
+    s = report.summary
+    ended = report.trades.filter(pl.col("exit_reason") == "end").height
+    text = f"сделок {s['trades']}"
+    if ended:
+        text += f" (+{ended} закрыта концом данных)"
+    if s["expectancy_r"] is not None:
+        text += f"  ·  expectancy {format_value('expectancy_r', s['expectancy_r'])}R"
+    return text
 
 
 def save_report_chart(report: Report, path: Path, title: str) -> Path:
@@ -289,11 +317,81 @@ def save_report_chart(report: Report, path: Path, title: str) -> Path:
         f"CAGR {format_value('cagr', s['cagr'])}  ·  "
         f"Max DD {format_value('max_drawdown', s['max_drawdown'])}  ·  "
         f"Sharpe {sharpe}  ·  P(Sharpe > 0) {format_value('psr', s['psr'])}  ·  "
-        f"сделок {s['trades']}  ·  expectancy {format_value('expectancy_r', s['expectancy_r'])}R",
+        f"{_trades_text(report)}",
         fontsize=10,
         color=INK_SECONDARY,
         va="top",
     )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, facecolor=SURFACE, bbox_inches="tight")
+    return path
+
+
+def save_cost_grid_chart(
+    grid: pl.DataFrame,
+    path: Path,
+    title: str,
+    current: tuple[float, float] = (1.0, 1.0),
+) -> Path:
+    """Expectancy после издержек против проскальзывания, линия на каждый сбор.
+
+    В R на сделку, а не в рублях: рубли упираются в «дно», когда капитал
+    кончается, и линии сливаются. `grid` — `sensitivity.cost_grid`, не больше
+    трёх множителей сбора.
+    `current` — нынешнее предположение (шаги, множитель сбора), отмечено точкой.
+    """
+    if "impact" in grid.columns:
+        grid = grid.filter(pl.col("impact") == 0.0)
+    fees = grid["fee_multiplier"].unique().sort().to_list()
+    if len(fees) > len(SERIES):
+        raise ValueError(f"Не больше {len(SERIES)} множителей сбора на графике")
+    fig = Figure(figsize=(9, 5.2), dpi=110, facecolor=SURFACE)
+    ax = fig.add_subplot()
+    for color, fee in zip(SERIES, fees, strict=False):
+        line = grid.filter(pl.col("fee_multiplier") == fee).sort("slippage_ticks")
+        x = line["slippage_ticks"].to_numpy()
+        y = line["expectancy_r"].to_numpy()
+        label = f"сбор ×{fee:g}"
+        ax.plot(x, y, color=color, lw=1.8, marker="o", ms=5, label=label)
+        ax.annotate(
+            label,
+            (x[-1], y[-1]),
+            xytext=(6, 0),
+            textcoords="offset points",
+            va="center",
+            fontsize=8.5,
+            color=INK_SECONDARY,
+        )
+    now = grid.filter(
+        (pl.col("slippage_ticks") == current[0])
+        & (pl.col("fee_multiplier") == current[1])
+    )
+    if not now.is_empty():
+        ax.scatter(
+            [current[0]],
+            [now["expectancy_r"][0]],
+            s=90,
+            facecolor="none",
+            edgecolor=INK,
+            linewidths=1.2,
+            zorder=5,
+        )
+        ax.annotate(
+            "сейчас в бэктесте",
+            (current[0], now["expectancy_r"][0]),
+            xytext=(8, 10),
+            textcoords="offset points",
+            fontsize=8.5,
+            color=INK,
+        )
+    ax.axhline(0, color=BASELINE, lw=1)
+    ax.yaxis.set_major_formatter(lambda v, _: f"{v:+.2f}R" if v else "0")
+    ax.set_xlabel("проскальзывание, шагов цены на сторону", color=MUTED, fontsize=9)
+    ax.set_ylabel("expectancy после издержек, R на сделку", color=MUTED, fontsize=9)
+    legend = ax.legend(loc="upper right", fontsize=8.5, frameon=False)
+    for text in legend.get_texts():
+        text.set_color(INK_SECONDARY)
+    _style(ax, title)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, facecolor=SURFACE, bbox_inches="tight")
     return path
