@@ -2,7 +2,8 @@
 
 Протокол: сигнал считается по закрытию бара `signal_bar`, вход — по открытию
 следующего бара с проскальзыванием. Внутри бара сначала проверяется гэп
-открытия за уровнем, затем касание стопа или цели, затем выход по времени.
+открытия за уровнем, затем касание стопа или цели, затем выход по времени
+(`max_bars`) и по расписанию (`hold`).
 Если бар задел и стоп, и цель, порядок касаний берётся из минуток того же
 контракта (`RawMinutes`). Без минуток или при касании обоих уровней в одной
 минутке выход пессимистично по стопу.
@@ -12,6 +13,15 @@
 контрактами (базис) в P&L не попадает — его убирает поправка
 `price_adjustment`, а движение рынка за ночь до открытия нового контракта
 попадает, как у реальной позиции (логика ETF Trick).
+
+Выход по расписанию (`Signal.hold`): "day" — позиция живёт только внутри
+дня и закрывается по закрытию его последнего бара; "overnight" — обычные
+ночи держит, но закрывается по закрытию последнего бара перед выходными
+или праздником. Какой бар последний, говорят отметки `is_day_end` и
+`is_before_break` (`markets.add_session_marks`). Пример: шорт по золоту,
+вход в пятницу в 21:00, hold="overnight" — выход в пятницу по закрытию
+бара 23:45, гэп понедельника в 08:45 позицию уже не застанет. Стоп и цель
+внутри последнего бара срабатывают раньше, чем выход по расписанию.
 
 Уровни стопа и цели задаются в реальных ценах бара сигнала. Внутри они
 хранятся в непрерывном (adjusted) пространстве через `price_adjustment`,
@@ -61,6 +71,16 @@ REQUIRED_COLUMNS = {
 # Нужны, только если включено влияние на рынок (`ContractSpec.impact`).
 IMPACT_COLUMNS = {"volume", "bar_sigma"}
 
+# Сколько позиция может жить по расписанию (`Signal.hold`).
+HOLD_ANY = "any"  # без ограничения: ночи, выходные и праздники
+HOLD_OVERNIGHT = "overnight"  # обычные ночи; перед выходными и праздниками выход
+HOLD_DAY = "day"  # только внутри дня
+# Отметка бара, по закрытию которого позиция закрывается, и причина выхода.
+HOLD_EXITS = {
+    HOLD_OVERNIGHT: ("is_before_break", "break"),
+    HOLD_DAY: ("is_day_end", "day_end"),
+}
+
 
 @dataclass(frozen=True)
 class Signal:
@@ -71,6 +91,7 @@ class Signal:
     target: float
     contracts: int = 1
     max_bars: int | None = None
+    hold: str = HOLD_ANY
 
     def __post_init__(self) -> None:
         if self.side not in (LONG, SHORT):
@@ -81,6 +102,10 @@ class Signal:
             raise ValueError("Число контрактов должно быть >= 1")
         if self.max_bars is not None and self.max_bars < 1:
             raise ValueError("Лимит удержания должен быть >= 1 бару")
+        if self.hold != HOLD_ANY and self.hold not in HOLD_EXITS:
+            raise ValueError(
+                f"hold должен быть {HOLD_ANY}, {HOLD_OVERNIGHT} или {HOLD_DAY}"
+            )
 
 
 @dataclass(frozen=True)
@@ -287,7 +312,8 @@ def simulate_position(
 
     В барах нужны рубли за пункт `point_value` — ряд из `markets.load_market`.
     `minutes` — минутки рынка для баров, задевших и стоп, и цель. Без них
-    такой бар закрывается по стопу.
+    такой бар закрывается по стопу. Для `signal.hold` "day" и "overnight"
+    нужны отметки расписания `is_day_end` и `is_before_break`.
     """
     _validate_bars(bars)
     missing_impact = IMPACT_COLUMNS - set(bars.columns)
@@ -298,6 +324,11 @@ def simulate_position(
         )
     if minutes is not None and "contract" not in bars.columns:
         raise ValueError("Для разбора по минуткам в барах нужен столбец contract")
+    hold_column, hold_reason = HOLD_EXITS.get(signal.hold, (None, None))
+    if hold_column is not None and hold_column not in bars.columns:
+        raise ValueError(
+            f"Для выхода по расписанию в барах нужен столбец {hold_column}"
+        )
     if not 0 <= signal_bar < bars.height - 1:
         raise ValueError("Сигнал должен иметь следующий бар для входа")
 
@@ -371,6 +402,8 @@ def simulate_position(
             and bars_held >= signal.max_bars
         ):
             exit_adj, reason = close_adj, "time"
+        if exit_adj is None and hold_column is not None and row[hold_column]:
+            exit_adj, reason = close_adj, hold_reason
         if exit_adj is None and exit_at_end and i == bars.height - 1:
             exit_adj, reason = close_adj, "end"
 

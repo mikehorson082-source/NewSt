@@ -16,8 +16,10 @@ from backtest.markets import (
     add_bar_sigma,
     add_margin_rate,
     add_point_value,
+    add_session_marks,
     add_usual_volume,
     check_tick,
+    settled_bars,
     snapshot_params,
 )
 
@@ -94,6 +96,29 @@ def test_usd_bars_after_last_clearing_rejected():
     # Вечерняя сессия понедельника: следующего клиринга в данных ещё нет.
     with pytest.raises(ValueError, match="clearing_fx"):
         add_point_value(bars_at("2026-09-14T19:00"), BRENT, RATES)
+
+
+def test_unsettled_tail_is_dropped_with_warning():
+    # Последний клиринг в данных — понедельник 14.09, 19:00. Свеча 18:45
+    # кончается в 19:00 и рассчитана, вечерняя сессия — ещё нет.
+    bars = bars_at("2026-09-14T18:30", "2026-09-14T18:45", "2026-09-14T19:00")
+    with pytest.warns(UserWarning, match="brent: у 1 свечей с 14.09.2026 19:00"):
+        settled = settled_bars(bars, RATES, "brent")
+    assert settled["timestamp"].to_list() == bars["timestamp"].to_list()[:2]
+    # Оставшиеся свечи получают рубли за пункт без ошибки.
+    assert add_point_value(settled, BRENT, RATES)["point_value"].null_count() == 0
+
+
+def test_settled_bars_keep_everything_when_all_settled(recwarn):
+    bars = bars_at("2026-09-14T10:00", "2026-09-14T18:45")
+    assert settled_bars(bars, RATES, "brent").equals(bars)
+    assert not recwarn.list
+
+
+def test_unsettled_tail_longer_than_a_week_means_stale_rates():
+    bars = bars_at("2026-09-14T18:45", "2026-09-22T10:00")
+    with pytest.raises(ValueError, match="clearing_fx"):
+        settled_bars(bars, RATES, "brent")
 
 
 def test_usd_market_needs_clearing_rates():
@@ -285,3 +310,61 @@ def test_bar_sigma_window_drops_old_bars():
     assert sigma[5] == pytest.approx(
         math.sqrt(((r30 - mean) ** 2 + (r31 - mean) ** 2) / 1)
     )
+
+
+def marks(bars: pl.DataFrame) -> dict[str, tuple[bool, bool]]:
+    """Свеча → (последняя свеча дня, последняя перед перерывом)."""
+    marked = add_session_marks(bars)
+    return {
+        timestamp.strftime("%a %H:%M"): (day_end, before_break)
+        for timestamp, day_end, before_break in marked.select(
+            "timestamp", "is_day_end", "is_before_break"
+        ).iter_rows()
+    }
+
+
+def test_session_marks_ordinary_night_and_weekend_sessions():
+    # Чт 10.09 — Вт 15.09.2026, в субботу и воскресенье сессии выходных.
+    bars = bars_at(
+        "2026-09-10T23:30",
+        "2026-09-10T23:45",
+        "2026-09-11T08:45",
+        "2026-09-11T23:45",
+        "2026-09-12T09:45",
+        "2026-09-12T18:45",
+        "2026-09-13T18:45",
+        "2026-09-14T23:45",
+        "2026-09-15T08:45",
+    )
+    assert marks(bars) == {
+        "Thu 23:30": (False, False),
+        "Thu 23:45": (True, False),  # обычная ночь чт→пт
+        "Fri 08:45": (False, False),
+        "Fri 23:45": (True, True),  # впереди суббота
+        "Sat 09:45": (False, False),
+        "Sat 18:45": (True, True),  # позиция выходных закрывается в тот же день
+        "Sun 18:45": (True, True),
+        "Mon 23:45": (True, False),  # обычная ночь пн→вт
+        "Tue 08:45": (False, False),  # последняя свеча ряда: дальше неизвестно
+    }
+
+
+def test_session_marks_weekend_without_sessions_and_holiday():
+    bars = bars_at(
+        "2024-04-26T23:45",  # пятница, выходных сессий ещё нет
+        "2024-04-29T23:45",  # понедельник
+        "2024-04-30T18:45",  # вторник, укороченный день перед 1 мая
+        "2024-05-02T23:45",  # четверг
+        "2024-05-03T08:45",
+    )
+    marked = add_session_marks(bars)
+    assert marked["is_day_end"].to_list() == [True, True, True, True, False]
+    # Пт→пн и вт→чт через праздник — перерывы; пн→вт и чт→пт — обычные ночи.
+    assert marked["is_before_break"].to_list() == [True, False, True, False, False]
+
+
+def test_session_marks_sort_bars_by_time():
+    bars = bars_at("2026-09-11T08:45", "2026-09-10T23:45")
+    marked = add_session_marks(bars)
+    assert marked["timestamp"].is_sorted()
+    assert marked["is_day_end"].to_list() == [True, False]

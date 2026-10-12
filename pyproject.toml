@@ -49,7 +49,7 @@ app = [
 default-groups = ["dev", "app"]
 
 [tool.pytest.ini_options]
-testpaths = ["src", "app"]
+testpaths = ["src", "app", "strategies"]
 
 # Проект ставится в .venv в режиме editable: пакеты из src (core, data, backtest)
 # видны всем скриптам без PYTHONPATH=src.

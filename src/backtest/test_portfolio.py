@@ -304,6 +304,34 @@ def test_max_bars_column_is_optional():
     assert result.trades[0].trade.exit_reason == "target"
 
 
+def test_hold_reaches_the_simulator():
+    bars = (
+        trend_bars()
+        .with_row_index("_i")
+        .with_columns(
+            (pl.col("_i") == 2).alias("is_day_end"),
+            pl.lit(False).alias("is_before_break"),
+        )
+    )
+    signals = make_signals([signal("a", 0, 95.0, 110.0)]).with_columns(
+        pl.lit("day").alias("hold")
+    )
+    result = run_portfolio(signals, {"a": market(FREE, bars.drop("_i"))}, CAPITAL)
+    trade = result.trades[0].trade
+    assert trade.exit_reason == "day_end"
+    assert trade.exit_time == START + timedelta(minutes=30)
+    # Следующий сигнал принимается с бара выхода, как после любой сделки.
+    assert result.signals["hold"].to_list() == ["day"]
+
+
+def test_hold_column_is_optional_and_empty_means_any():
+    signals = make_signals([signal("a", 0, 95.0, 110.0)]).with_columns(
+        pl.lit(None, dtype=pl.String).alias("hold")
+    )
+    result = run_portfolio(signals, two_markets(), CAPITAL)
+    assert result.trades[0].trade.exit_reason == "target"
+
+
 def test_signal_order_in_input_does_not_matter():
     rows = [
         signal("a", 0, 95.0, 110.0),

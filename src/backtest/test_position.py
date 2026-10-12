@@ -138,6 +138,131 @@ def test_time_exit_at_close():
     assert trade.gross_pnl == pytest.approx(3.0)
 
 
+def with_marks(
+    bars: pl.DataFrame,
+    day_end: set[int] = frozenset(),
+    before_break: set[int] = frozenset(),
+) -> pl.DataFrame:
+    """Отметки расписания по номерам баров; перерыв — тоже конец дня."""
+    return (
+        bars.with_row_index("_i")
+        .with_columns(
+            pl.col("_i").is_in(day_end | before_break).alias("is_day_end"),
+            pl.col("_i").is_in(before_break).alias("is_before_break"),
+        )
+        .drop("_i")
+    )
+
+
+def calendar_bars() -> pl.DataFrame:
+    """Цена растёт между стопом 95 и целью 110: уровни не задеты."""
+    return make_bars(
+        [
+            bar(0, 99.0, 101.0, 98.0, 100.0),
+            bar(15, 101.0, 103.0, 100.0, 102.0),
+            bar(30, 102.0, 106.0, 101.0, 105.0),
+            bar(45, 106.0, 109.0, 105.0, 108.0),
+            bar(60, 108.0, 109.0, 106.0, 107.0),
+        ]
+    )
+
+
+def test_hold_day_exits_at_close_of_last_bar_of_day():
+    bars = with_marks(calendar_bars(), day_end={2})
+    trade = simulate_position(SPEC, bars, 0, long_signal(hold="day"))
+    assert trade.exit_reason == "day_end"
+    assert trade.exit_time == START + timedelta(minutes=30)
+    assert trade.bars_held == 2
+    # Вход 101 + 0.5, выход по закрытию 105 − 0.5.
+    assert trade.exit_price == pytest.approx(104.5)
+    assert trade.gross_pnl == pytest.approx(3.0)
+    # Последний бар виден целиком: high 106 против входа 101.5.
+    assert trade.mfe == pytest.approx(4.5)
+
+
+def test_hold_overnight_passes_ordinary_night_and_exits_before_break():
+    bars = with_marks(calendar_bars(), day_end={1}, before_break={3})
+    trade = simulate_position(SPEC, bars, 0, long_signal(hold="overnight"))
+    assert trade.exit_reason == "break"
+    assert trade.exit_time == START + timedelta(minutes=45)
+    assert trade.exit_price == pytest.approx(107.5)
+
+
+def test_hold_day_exits_before_break_too():
+    bars = with_marks(calendar_bars(), before_break={2})
+    trade = simulate_position(SPEC, bars, 0, long_signal(hold="day"))
+    assert trade.exit_reason == "day_end"
+    assert trade.exit_time == START + timedelta(minutes=30)
+
+
+def test_hold_any_ignores_marks():
+    bars = with_marks(calendar_bars(), day_end={1}, before_break={2})
+    trade = simulate_position(SPEC, bars, 0, long_signal())
+    assert trade.exit_reason == "end"
+    assert trade.exit_time == START + timedelta(minutes=60)
+
+
+def test_entry_on_last_bar_of_day_exits_on_the_same_bar():
+    bars = with_marks(calendar_bars(), day_end={1})
+    trade = simulate_position(SPEC, bars, 0, long_signal(hold="day"))
+    assert trade.exit_reason == "day_end"
+    assert trade.bars_held == 1
+    # Вход по открытию 101 + 0.5, выход по закрытию 102 − 0.5.
+    assert trade.gross_pnl == pytest.approx(0.0)
+
+
+def test_stop_inside_last_bar_of_day_comes_before_schedule_exit():
+    bars = with_marks(
+        make_bars(
+            [
+                bar(0, 99.0, 101.0, 98.0, 100.0),
+                bar(15, 101.0, 103.0, 100.0, 102.0),
+                bar(30, 102.0, 103.0, 94.0, 101.0),
+            ]
+        ),
+        day_end={2},
+    )
+    trade = simulate_position(SPEC, bars, 0, long_signal(hold="day"))
+    assert trade.exit_reason == "stop"
+    assert trade.exit_price == pytest.approx(94.5)
+
+
+def test_max_bars_on_the_same_bar_is_reported_as_time():
+    bars = with_marks(calendar_bars(), day_end={2})
+    trade = simulate_position(SPEC, bars, 0, long_signal(hold="day", max_bars=2))
+    assert trade.exit_reason == "time"
+
+
+def test_schedule_exit_keeps_position_out_of_the_gap():
+    # После последнего бара дня цена открывается далеко за стопом.
+    rows = [
+        bar(0, 99.0, 101.0, 98.0, 100.0),
+        bar(15, 101.0, 103.0, 100.0, 102.0),
+        bar(30, 102.0, 103.0, 101.0, 102.0),
+        bar(45, 80.0, 81.0, 79.0, 80.0),
+    ]
+    bars = with_marks(make_bars(rows), before_break={2})
+    held = simulate_position(SPEC, bars, 0, long_signal())
+    flat = simulate_position(SPEC, bars, 0, long_signal(hold="overnight"))
+    assert held.exit_reason == "stop"
+    assert held.gross_pnl == pytest.approx(79.5 - 101.5)
+    assert flat.exit_reason == "break"
+    assert flat.gross_pnl == pytest.approx(101.5 - 101.5)
+
+
+@pytest.mark.parametrize(
+    ("hold", "column"), [("day", "is_day_end"), ("overnight", "is_before_break")]
+)
+def test_hold_needs_schedule_marks(hold, column):
+    with pytest.raises(ValueError, match=column):
+        simulate_position(SPEC, calendar_bars(), 0, long_signal(hold=hold))
+
+
+def test_unknown_hold_rejected():
+    with pytest.raises(ValueError, match="hold"):
+        long_signal(hold="weekend")
+
+
 def test_short_target_mirrors_long():
     bars = make_bars(
         [

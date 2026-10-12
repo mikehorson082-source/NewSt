@@ -36,7 +36,7 @@ import polars as pl
 
 from backtest.markets import MARKETS, load_market
 from backtest.minutes import RawMinutes
-from backtest.position import ClosedTrade, Signal, simulate_position
+from backtest.position import HOLD_ANY, ClosedTrade, Signal, simulate_position
 from backtest.sizing import PositionSize, SizingRules, size_position
 from backtest.specs import ContractSpec
 
@@ -198,6 +198,8 @@ def _prepare_signals(
         raise ValueError(f"В сигналах нет столбцов: {', '.join(sorted(missing))}")
     if "max_bars" not in signals.columns:
         signals = signals.with_columns(pl.lit(None, dtype=pl.Int64).alias("max_bars"))
+    if "hold" not in signals.columns:
+        signals = signals.with_columns(pl.lit(HOLD_ANY).alias("hold"))
     unknown = set(signals["market"].unique()) - set(markets)
     if unknown:
         raise ValueError(f"Нет данных рынков: {', '.join(sorted(unknown))}")
@@ -231,7 +233,8 @@ def run_portfolio(
     """Прогоняет сигналы всех рынков через портфель с одной позицией.
 
     `signals` — таблица стратегии: market, timestamp (свеча, по закрытию
-    которой посчитан сигнал), side, stop, target и необязательный max_bars.
+    которой посчитан сигнал), side, stop, target и необязательные max_bars
+    и hold (выход по расписанию: "any", "overnight" или "day", `Signal.hold`).
     Число контрактов считает портфель. `markets` — данные рынков
     (`load_markets`); их порядок решает ничью по издержкам.
     """
@@ -287,6 +290,7 @@ def run_portfolio(
                 stop=row["stop"],
                 target=row["target"],
                 max_bars=row["max_bars"],
+                hold=row["hold"] or HOLD_ANY,
             )
             size = size_position(data.spec, data.bars, bar, signal, current, rules)
             contracts[i] = size.contracts

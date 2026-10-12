@@ -13,7 +13,10 @@
 - обычный объём свечи — медиана объёма в то же время суток за прошлые
   20 дней (`usual_volume`), для лимита ликвидности в `sizing.py`;
 - σ свечи — стандартное отклонение 15-минутной доходности NAV за прошлые
-  20 дней (`bar_sigma`), для влияния на рынок в `costs.impact_points`.
+  20 дней (`bar_sigma`), для влияния на рынок в `costs.impact_points`;
+- отметки расписания — последняя свеча дня и последняя свеча перед
+  выходными или праздником (`is_day_end`, `is_before_break`), для выхода
+  по расписанию в `position.py` (`Signal.hold`).
 
 Факты контракта сверяются со снимком биржи: если стоимость шага в снимке
 не сходится с записанной, паспорт не загружается.
@@ -21,6 +24,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -58,6 +62,10 @@ BAR_SIGMA_WINDOW = "20d"
 BAR_SIGMA_MIN_BARS = 100
 SATURDAY = 6
 TICK_TOLERANCE = 1e-6
+# Хвост ряда, который биржа ещё не рассчитала, не длиннее недели: самый
+# долгий перерыв между клирингами — Новый год, вечер 30.12 → 14:00 05.01,
+# меньше 6 дней. Длиннее — справочник курсов устарел.
+MAX_UNSETTLED_TAIL = timedelta(days=7)
 
 
 @dataclass(frozen=True)
@@ -202,6 +210,45 @@ def clearing_schedule(clearing_rates: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def settled_bars(
+    bars: pl.DataFrame, clearing_rates: pl.DataFrame, name: str = ""
+) -> pl.DataFrame:
+    """Свечи, которые биржа уже рассчитала: конец не позже последнего клиринга.
+
+    Вечернюю сессию и сессии выходных рассчитывает дневной клиринг следующего
+    торгового дня. Пока он не прошёл или его курс не скачан, рублей за пункт
+    у этих свечей нет: в ряд они не входят, об этом выдаётся предупреждение.
+    Пример: данные обновлены в субботу, ряд кончается пятничной свечой 23:45,
+    последний клиринг — пятница 19:00. 20 свечей вечерней сессии отброшены,
+    ряд кончается свечой 18:45. В понедельник после 14:00 и обновления
+    справочников они вернутся.
+
+    Хвост длиннее `MAX_UNSETTLED_TAIL` — это уже не «биржа ещё не рассчитала»,
+    а устаревший справочник: ошибка.
+    """
+    last_clearing = clearing_schedule(clearing_rates)["clearing_time"].max()
+    bar_end = pl.col("timestamp") + BAR_LENGTH
+    settled = bars.filter(bar_end <= last_clearing)
+    dropped = bars.height - settled.height
+    if dropped == 0:
+        return bars
+    tail = bars.filter(bar_end > last_clearing)["timestamp"]
+    if tail.max() + BAR_LENGTH - last_clearing > MAX_UNSETTLED_TAIL:
+        raise ValueError(
+            f"{name}: нет курса клиринга для {dropped} свечей "
+            f"({tail.min()} — {tail.max()}), последний клиринг {last_clearing}. "
+            "Обновите справочники: download_reference.py --only clearing_fx"
+        )
+    warnings.warn(
+        f"{name}: у {dropped} свечей с {tail.min():%d.%m.%Y %H:%M} ещё нет курса "
+        f"клиринга (последний в справочнике — {last_clearing:%d.%m.%Y %H:%M}), "
+        "в ряд не вошли. Появятся после следующего клиринга биржи и "
+        "download_reference.py --only clearing_fx",
+        stacklevel=2,
+    )
+    return settled
+
+
 def add_point_value(
     bars: pl.DataFrame,
     market: Market,
@@ -337,8 +384,42 @@ def add_bar_sigma(
     return ordered.with_columns(sigma["bar_sigma"])
 
 
+def add_session_marks(bars: pl.DataFrame) -> pl.DataFrame:
+    """Отметки расписания: последняя свеча дня и последняя перед перерывом.
+
+    is_day_end — следующая свеча ряда уже другого календарного дня.
+    is_before_break — последняя свеча дня, после которой не обычная ночь.
+    Обычная ночь — с буднего дня на следующий календарный день, тоже будний
+    (пн→вт … чт→пт): 7–15 часов без торгов. Всё остальное — перерыв: пятница,
+    канун праздника (30.12.2025 → 05.01.2026 — 129 часов), а также сессии
+    выходных: позицию, открытую в субботу, отметка закроет в субботу же.
+
+    Отметки — расписание биржи: оно известно заранее, поэтому это не
+    подглядывание. Исключение — день, когда вечерняя сессия сорвалась: ряд
+    «знает», что свеча 18:45 последняя, а трейдер в тот день не знал.
+    У последней свечи ряда отметок нет: что будет после неё, неизвестно.
+    """
+    day = pl.col("timestamp").dt.date()
+    next_day = day.shift(-1)
+    is_day_end = (next_day != day).fill_null(False)
+    ordinary_night = (
+        (day.dt.weekday() < SATURDAY)
+        & (next_day.dt.weekday() < SATURDAY)
+        & ((next_day - day).dt.total_days() == 1)
+    )
+    return bars.sort("timestamp").with_columns(
+        is_day_end.alias("is_day_end"),
+        (is_day_end & ~ordinary_night).alias("is_before_break"),
+    )
+
+
 def load_market(name: str) -> tuple[MarketParams, pl.DataFrame]:
-    """Паспорт рынка и его 15-минутный ряд с point_value, margin_rate, usual_volume."""
+    """Паспорт рынка и его 15-минутный ряд с point_value, margin_rate,
+    usual_volume, bar_sigma и отметками расписания.
+
+    У долларовых рынков ряд кончается последней свечой, которую биржа уже
+    рассчитала (`settled_bars`).
+    """
     if name not in MARKETS:
         raise ValueError(f"Нет паспорта рынка {name}. Есть: {', '.join(MARKETS)}")
     market = MARKETS[name]
@@ -353,7 +434,9 @@ def load_market(name: str) -> tuple[MarketParams, pl.DataFrame]:
 
     bars = pl.read_parquet(CONTINUOUS_DIR / f"{name}_15m.parquet")
     check_tick(bars, params.tick_size, name)
+    if clearing_rates is not None:
+        bars = settled_bars(bars, clearing_rates, name)
     bars = add_point_value(bars, market, clearing_rates)
     margin_rates = pl.read_parquet(REFERENCE_DIR / "margin_rates.parquet")
     bars = add_margin_rate(bars, market, margin_rates, params.margin_factor)
-    return params, add_bar_sigma(add_usual_volume(bars))
+    return params, add_session_marks(add_bar_sigma(add_usual_volume(bars)))
