@@ -124,14 +124,22 @@ Brent с шагом цены $0.01 и стоимостью пункта $10, к�
 
 Записанное руками сверяется со снимком биржи. Если, например, в паспорте Brent по ошибке записать $100 за пункт, загрузка остановится с ошибкой «не сходится». Цены ряда проверяются на сетку шага цены.
 
-**Какой курс берётся для свечи.** Тот, по которому биржа рассчитывает эту свечу на клиринге:
+**Какой курс берётся для свечи.** Тот, по которому биржа рассчитывает эту свечу на клиринге.
+
+До 23.03.2026 клирингов два:
 * свечи до 14:00 — дневной клиринг того же дня;
 * свечи 14:05–18:50 — вечерний клиринг того же дня;
 * вечерняя сессия и сессии выходных — дневной клиринг следующего торгового дня.
 
 Пример: Brent, пятница. Свеча 13:45 рассчитывается по дневному курсу пятницы, свеча 19:05 — по дневному курсу понедельника.
 
-**Свечи, которые биржа ещё не рассчитала.** Если данные обновлены в субботу, у пятничной вечерней сессии курса ещё нет — он появится в понедельник в 14:00. Такие свечи в ряд не входят (`settled_bars`): ряд Brent и золота кончается пятничной свечой 18:45, при загрузке выдаётся предупреждение. После понедельничного клиринга и обновления справочников они возвращаются. Хвост без курса длиннее недели — уже устаревший справочник, загрузка останавливается с ошибкой. Курс ЦБ для этого не годится: до середины 2024 года он расходился с биржевым в среднем на 1.4% в 2022 году и до 11.5% в отдельные дни.
+С 23.03.2026 — единая торговая сессия: дневного клиринга нет, клиринг один, в 23:50. Он переоценивает позиции по расчётной цене, которую биржа определяет в 19:00, поэтому граница по ценам осталась в 19:00:
+* свечи дня до 19:00 — курс этого дня (фиксируется в 19:00);
+* вечерняя сессия и сессии выходных — курс следующего торгового дня: движение цены после 19:00 попадает в его расчёт.
+
+Пример: Brent, пятница 09.10.2026. Свеча 10:00 рассчитывается по курсу пятницы 84.90, а не по вчерашнему 85.42, как было бы по старой схеме; свеча 19:05 — по курсу понедельника.
+
+**Свечи, которые биржа ещё не рассчитала.** Если данные обновлены в субботу, у пятничной вечерней сессии курса ещё нет — он появится в понедельник в 19:00 (до 23.03.2026 — в 14:00). Такие свечи в ряд не входят (`settled_bars`): ряд Brent и золота кончается пятничной свечой 18:45, при загрузке выдаётся предупреждение. После понедельничного курса и обновления справочников они возвращаются. Хвост без курса длиннее недели — уже устаревший справочник, загрузка останавливается с ошибкой. Курс ЦБ для этого не годится: до середины 2024 года он расходился с биржевым в среднем на 1.4% в 2022 году и до 11.5% в отдельные дни.
 
 **Два столбца рублей за пункт:**
 * `point_value` — по курсу клиринга, который рассчитывает свечу. Это прибыль сделки, как её начислит биржа.
@@ -554,7 +562,7 @@ NAV склейки (`build_continuous_futures.add_etf_nav`) — основа п�
 
 ## 10. Как тесты подтверждают корректность бэктестера
 
-В модуле написано 209 юнит-тестов ([test_position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py), [test_markets.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_markets.py), [test_minutes.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_minutes.py), [test_sizing.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sizing.py), [test_portfolio.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_portfolio.py), [test_report.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_report.py), [test_baseline.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_baseline.py), [test_sensitivity.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sensitivity.py), [test_charts.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_charts.py) и [test_costs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_costs.py)), которые проверяют каждую нестандартную ситуацию:
+В модуле написано 216 юнит-тестов ([test_position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py), [test_markets.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_markets.py), [test_minutes.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_minutes.py), [test_sizing.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sizing.py), [test_portfolio.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_portfolio.py), [test_report.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_report.py), [test_baseline.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_baseline.py), [test_sensitivity.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sensitivity.py), [test_charts.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_charts.py) и [test_costs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_costs.py)), которые проверяют каждую нестандартную ситуацию:
 
 1. **Тест на проскальзывание и комиссии** ([test_long_target_fills_by_next_open_with_costs](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)): проверяет, что при входе и выходе по цели чистая прибыль строго меньше грязной на величину двух комиссий и двух проскальзываний.
 2. **Тесты на бар-«вертолёт»**: свеча задела и цель 110, и стоп 95.

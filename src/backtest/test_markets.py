@@ -43,16 +43,16 @@ def clearing_rates(rows: list[tuple[date, str, str, float]]) -> pl.DataFrame:
     )
 
 
-# Чт 10.09, Пт 11.09 и Пн 14.09.2026; у каждого курса своё значение,
+# Чт 10.09, Пт 11.09 и Пн 15.09.2025; у каждого курса своё значение,
 # чтобы по результату было видно, какой клиринг выбран.
 RATES = clearing_rates(
     [
-        (date(2026, 9, 10), "tc", "13:45", 78.0),
-        (date(2026, 9, 10), "mc", "18:49", 79.0),
-        (date(2026, 9, 11), "tc", "13:45", 80.0),
-        (date(2026, 9, 11), "mc", "18:49", 81.0),
-        (date(2026, 9, 14), "tc", "13:45", 82.0),
-        (date(2026, 9, 14), "mc", "18:49", 83.0),
+        (date(2025, 9, 11), "tc", "13:45", 78.0),
+        (date(2025, 9, 11), "mc", "18:49", 79.0),
+        (date(2025, 9, 12), "tc", "13:45", 80.0),
+        (date(2025, 9, 12), "mc", "18:49", 81.0),
+        (date(2025, 9, 15), "tc", "13:45", 82.0),
+        (date(2025, 9, 15), "mc", "18:49", 83.0),
     ]
 )
 
@@ -62,7 +62,7 @@ def bars_at(*timestamps: str) -> pl.DataFrame:
 
 
 def test_rub_market_point_value_is_constant():
-    bars = add_point_value(bars_at("2026-09-11T10:00", "2026-09-11T19:00"), CNY)
+    bars = add_point_value(bars_at("2025-09-12T10:00", "2025-09-12T19:00"), CNY)
     assert bars["point_value"].to_list() == [1000.0, 1000.0]
     assert bars["point_value_known"].to_list() == [1000.0, 1000.0]
 
@@ -72,18 +72,18 @@ def test_rub_market_point_value_is_constant():
     [
         # Свеча 13:15–13:30: рассчитывает дневной клиринг пятницы (80),
         # а на её закрытии известен только вечерний курс четверга (79).
-        ("2026-09-11T13:15", 80.0, 79.0),
+        ("2025-09-12T13:15", 80.0, 79.0),
         # Свеча 13:45–14:00 кончается ровно на дневном клиринге.
-        ("2026-09-11T13:45", 80.0, 80.0),
+        ("2025-09-12T13:45", 80.0, 80.0),
         # Свеча «14:00» — минутки 14:05–14:14, после дневного клиринга.
-        ("2026-09-11T14:00", 81.0, 80.0),
+        ("2025-09-12T14:00", 81.0, 80.0),
         # Свеча 18:45–19:00: вечерний курс зафиксирован в 18:49 и уже известен.
-        ("2026-09-11T18:45", 81.0, 81.0),
+        ("2025-09-12T18:45", 81.0, 81.0),
         # Вечерняя сессия пятницы и субботняя сессия — дневной клиринг понедельника.
-        ("2026-09-11T19:00", 82.0, 81.0),
-        ("2026-09-12T10:00", 82.0, 81.0),
-        ("2026-09-14T10:00", 82.0, 81.0),
-        ("2026-09-14T14:00", 83.0, 82.0),
+        ("2025-09-12T19:00", 82.0, 81.0),
+        ("2025-09-13T10:00", 82.0, 81.0),
+        ("2025-09-15T10:00", 82.0, 81.0),
+        ("2025-09-15T14:00", 83.0, 82.0),
     ],
 )
 def test_usd_bar_is_settled_by_its_clearing(timestamp, settle, known):
@@ -95,14 +95,14 @@ def test_usd_bar_is_settled_by_its_clearing(timestamp, settle, known):
 def test_usd_bars_after_last_clearing_rejected():
     # Вечерняя сессия понедельника: следующего клиринга в данных ещё нет.
     with pytest.raises(ValueError, match="clearing_fx"):
-        add_point_value(bars_at("2026-09-14T19:00"), BRENT, RATES)
+        add_point_value(bars_at("2025-09-15T19:00"), BRENT, RATES)
 
 
 def test_unsettled_tail_is_dropped_with_warning():
-    # Последний клиринг в данных — понедельник 14.09, 19:00. Свеча 18:45
+    # Последний клиринг в данных — понедельник 15.09, 19:00. Свеча 18:45
     # кончается в 19:00 и рассчитана, вечерняя сессия — ещё нет.
-    bars = bars_at("2026-09-14T18:30", "2026-09-14T18:45", "2026-09-14T19:00")
-    with pytest.warns(UserWarning, match="brent: у 1 свечей с 14.09.2026 19:00"):
+    bars = bars_at("2025-09-15T18:30", "2025-09-15T18:45", "2025-09-15T19:00")
+    with pytest.warns(UserWarning, match="brent: у 1 свечей с 15.09.2025 19:00"):
         settled = settled_bars(bars, RATES, "brent")
     assert settled["timestamp"].to_list() == bars["timestamp"].to_list()[:2]
     # Оставшиеся свечи получают рубли за пункт без ошибки.
@@ -110,15 +110,68 @@ def test_unsettled_tail_is_dropped_with_warning():
 
 
 def test_settled_bars_keep_everything_when_all_settled(recwarn):
-    bars = bars_at("2026-09-14T10:00", "2026-09-14T18:45")
+    bars = bars_at("2025-09-15T10:00", "2025-09-15T18:45")
     assert settled_bars(bars, RATES, "brent").equals(bars)
     assert not recwarn.list
 
 
 def test_unsettled_tail_longer_than_a_week_means_stale_rates():
-    bars = bars_at("2026-09-14T18:45", "2026-09-22T10:00")
+    bars = bars_at("2025-09-15T18:45", "2025-09-23T10:00")
     with pytest.raises(ValueError, match="clearing_fx"):
         settled_bars(bars, RATES, "brent")
+
+
+# Те же дни недели после 23.03.2026: единая торговая сессия, дневного
+# клиринга нет. Биржа публикует tc — это вчерашний вечерний курс.
+SINGLE_SESSION_RATES = clearing_rates(
+    [
+        (date(2026, 9, 10), "tc", "14:00", 78.0),
+        (date(2026, 9, 10), "mc", "19:00", 79.0),
+        (date(2026, 9, 11), "tc", "14:00", 79.0),
+        (date(2026, 9, 11), "mc", "19:00", 81.0),
+        (date(2026, 9, 14), "tc", "14:00", 81.0),
+        (date(2026, 9, 14), "mc", "19:00", 83.0),
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "settle", "known"),
+    [
+        # Утро пятницы: клиринг пятницы считает по курсу 19:00 пятницы (81),
+        # а не по дневному (79); на закрытии свечи известен вчерашний (79).
+        ("2026-09-11T10:00", 81.0, 79.0),
+        ("2026-09-11T14:00", 81.0, 79.0),
+        # Свеча 18:45–19:00 кончается на расчётной цене дня.
+        ("2026-09-11T18:45", 81.0, 81.0),
+        # После 19:00 цена уходит в расчёт следующего торгового дня:
+        # вечер пятницы и суббота — курс понедельника (83).
+        ("2026-09-11T19:00", 83.0, 81.0),
+        ("2026-09-12T10:00", 83.0, 81.0),
+        ("2026-09-14T10:00", 83.0, 81.0),
+    ],
+)
+def test_single_session_has_one_clearing_rate_per_day(timestamp, settle, known):
+    bars = add_point_value(bars_at(timestamp), BRENT, SINGLE_SESSION_RATES)
+    assert bars["point_value"][0] == pytest.approx(settle * 10)
+    assert bars["point_value_known"][0] == pytest.approx(known * 10)
+
+
+def test_day_before_single_session_keeps_two_clearings():
+    rates = clearing_rates(
+        [
+            (date(2026, 3, 19), "mc", "18:49", 84.0),
+            (date(2026, 3, 20), "tc", "13:45", 84.0),
+            (date(2026, 3, 20), "mc", "18:49", 83.0),
+            (date(2026, 3, 23), "tc", "14:00", 83.0),
+            (date(2026, 3, 23), "mc", "19:00", 81.0),
+        ]
+    )
+    bars = add_point_value(
+        bars_at("2026-03-20T10:00", "2026-03-23T10:00"), BRENT, rates
+    )
+    # Пятница 20.03 — ещё дневной клиринг (84), понедельник 23.03 — уже нет (81).
+    assert bars["point_value"].to_list() == [840.0, 810.0]
 
 
 def test_usd_market_needs_clearing_rates():

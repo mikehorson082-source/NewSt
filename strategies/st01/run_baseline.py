@@ -4,9 +4,7 @@
 часто смотрят в разные стороны на одной и той же свече, а позиция в портфеле
 одна. Правила и параметры — в rules.py, заданы заранее.
 
-По умолчанию данные обрезаны по 31.12.2025: 2026 год — экзамен, его не
-открываем до конца шага 5. Увидев результат на 2026, мы начнём выбирать
-правила, которые на нём хороши, и честной проверки больше не будет.
+По умолчанию берётся вся история; `--before YYYY-MM-DD` обрезает данные.
 
 Печатает по каждой стратегии: что стало с сигналами, метрики за период и по
 годам, сделки по рынкам, причинам выхода и сессиям, результат при двух шагах
@@ -31,7 +29,6 @@ from backtest.sensitivity import by_session, with_costs
 
 REPORTS = Path(__file__).resolve().parent / "reports"
 CAPITAL = 1_000_000.0
-EXAM_STARTS = date(2026, 1, 1)
 STRESS_SLIPPAGE_TICKS = 2.0
 GAP_R = 1.5
 
@@ -46,9 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--before",
         type=date.fromisoformat,
-        default=EXAM_STARTS,
-        help="Данные до этой даты, YYYY-MM-DD. По умолчанию 2026-01-01: "
-        "2026 год — экзамен шага 5.",
+        help="Данные до этой даты, YYYY-MM-DD. По умолчанию вся история.",
     )
     parser.add_argument(
         "--only",
@@ -58,8 +53,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def cut(markets: dict[str, MarketData], before: date) -> dict[str, MarketData]:
-    """Те же рынки, свечи только до даты `before`."""
+def cut(markets: dict[str, MarketData], before: date | None) -> dict[str, MarketData]:
+    """Те же рынки, свечи только до даты `before`; None — вся история."""
+    if before is None:
+        return markets
     return {
         name: replace(
             data, bars=data.bars.filter(pl.col("timestamp").dt.date() < before)
