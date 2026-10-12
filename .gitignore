@@ -16,8 +16,9 @@ __pycache__/
 .Spotlight-V100
 .Trashes
 
-# Heavy Data
-data/raw/algopack/
+# Data & References
+data/
+ref/
 machine-learning-for-trading/
 hse/
 backtesting-py/
