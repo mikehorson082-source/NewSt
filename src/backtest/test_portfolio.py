@@ -332,6 +332,31 @@ def test_hold_column_is_optional_and_empty_means_any():
     assert result.trades[0].trade.exit_reason == "target"
 
 
+def test_moving_stop_and_empty_target_reach_the_simulator():
+    signals = make_signals([signal("a", 0, 95.0, 110.0)]).with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("target"),
+        pl.lit(1.0).alias("trail"),
+    )
+    result = run_portfolio(signals, two_markets(), CAPITAL)
+    trade = result.trades[0].trade
+    # Закрытие 101 на свече 15 → стоп 100, свеча 30 его задевает.
+    assert trade.exit_reason == "trail"
+    assert trade.exit_time == START + timedelta(minutes=30)
+    assert trade.exit_price == pytest.approx(100.0)
+
+
+def test_breakeven_column_reaches_the_simulator():
+    signals = make_signals([signal("a", 0, 95.0, 110.0)]).with_columns(
+        pl.lit(0.2).alias("breakeven_r")
+    )
+    result = run_portfolio(signals, two_markets(), CAPITAL)
+    # Свеча 15 дошла до 102 (> 100 + 0.2 × 5): со свечи 30 стоп на входе 100,
+    # её минимум 100 его задевает.
+    trade = result.trades[0].trade
+    assert trade.exit_reason == "breakeven"
+    assert trade.exit_price == pytest.approx(100.0)
+
+
 def test_signal_order_in_input_does_not_matter():
     rows = [
         signal("a", 0, 95.0, 110.0),

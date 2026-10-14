@@ -263,6 +263,211 @@ def test_unknown_hold_rejected():
         long_signal(hold="weekend")
 
 
+# ---------------------------------------------------------- подвижный стоп
+
+# Без издержек: цены входа и выхода равны уровням, результат — в пунктах.
+FREE = ContractSpec(
+    asset="TEST", tick_size=0.1, exchange_fee_rate=0.0, slippage_ticks=0.0
+)
+
+
+def test_breakeven_moves_stop_from_the_next_bar():
+    bars = make_bars(
+        [
+            bar(0, 99.5, 100.5, 99.5, 100.0),
+            # Касание +1R (101.0): стоп переедет на вход 100, но со следующего бара.
+            bar(15, 100.0, 101.2, 99.3, 100.5),
+            bar(30, 100.4, 100.6, 99.8, 100.2),
+            bar(45, 100.2, 100.4, 100.0, 100.3),
+        ]
+    )
+    signal = Signal(side=LONG, stop=99.0, target=103.0, breakeven_r=1.0)
+    trade = simulate_position(FREE, bars, 0, signal)
+    assert trade.exit_reason == "breakeven"
+    assert trade.exit_time == START + timedelta(minutes=30)
+    assert trade.exit_price == pytest.approx(100.0)
+    assert trade.gross_pnl == pytest.approx(0.0)
+
+
+def test_breakeven_does_not_help_inside_the_same_bar():
+    # Бар дошёл до +1.2R и упал ниже начального стопа: что было раньше,
+    # неизвестно, поэтому в этом баре стоп ещё начальный.
+    bars = make_bars(
+        [
+            bar(0, 99.5, 100.5, 99.5, 100.0),
+            bar(15, 100.0, 101.2, 98.9, 99.2),
+            bar(30, 99.2, 99.5, 99.0, 99.4),
+        ]
+    )
+    signal = Signal(side=LONG, stop=99.0, target=103.0, breakeven_r=1.0)
+    trade = simulate_position(FREE, bars, 0, signal)
+    assert trade.exit_reason == "stop"
+    assert trade.exit_price == pytest.approx(99.0)
+    assert trade.gross_pnl == pytest.approx(-1.0)
+
+
+def test_breakeven_needs_the_threshold_to_be_touched():
+    bars = make_bars(
+        [
+            bar(0, 99.5, 100.5, 99.5, 100.0),
+            bar(15, 100.0, 100.9, 99.6, 100.5),
+            bar(30, 100.4, 100.6, 99.8, 100.2),
+        ]
+    )
+    signal = Signal(side=LONG, stop=99.0, target=103.0, breakeven_r=1.0)
+    trade = simulate_position(FREE, bars, 0, signal)
+    # 100.9 < 101.0: стоп остался 99, минимум 99.8 его не задел.
+    assert trade.exit_reason == "end"
+
+
+def trailing_rows() -> list[dict]:
+    """Лонг от 100: лучшее закрытие 103, потом откат."""
+    return [
+        bar(0, 99.5, 100.5, 99.5, 100.0),
+        bar(15, 100.0, 101.3, 99.6, 101.0),  # стоп → 101 − 1.5 = 99.5
+        bar(30, 101.0, 103.4, 100.8, 103.0),  # стоп → 101.5
+        bar(45, 103.0, 103.2, 101.6, 102.0),  # лучшее закрытие то же: стоп 101.5
+        bar(60, 102.0, 102.4, 101.0, 101.2),  # задевает 101.5
+    ]
+
+
+def test_trailing_stop_follows_best_close_and_never_loosens():
+    signal = Signal(side=LONG, stop=98.5, target=None, trail=1.5)
+    trade = simulate_position(FREE, make_bars(trailing_rows()), 0, signal)
+    assert trade.exit_reason == "trail"
+    assert trade.exit_time == START + timedelta(minutes=60)
+    # Не 102 − 1.5 = 100.5: после отката стоп назад не отходит.
+    assert trade.exit_price == pytest.approx(101.5)
+    assert trade.gross_pnl == pytest.approx(1.5)
+
+
+def test_gap_through_trailing_stop_exits_at_open():
+    rows = trailing_rows()
+    rows[3] = bar(45, 100.0, 100.5, 99.5, 100.2)
+    signal = Signal(side=LONG, stop=98.5, target=None, trail=1.5)
+    trade = simulate_position(FREE, make_bars(rows[:4]), 0, signal)
+    assert trade.exit_reason == "trail"
+    assert trade.exit_price == pytest.approx(100.0)
+
+
+def test_short_trailing_stop_mirrors_long():
+    mirrored = [
+        {
+            **row,
+            "open": 200.0 - row["open"],
+            "high": 200.0 - row["low"],
+            "low": 200.0 - row["high"],
+            "close": 200.0 - row["close"],
+        }
+        for row in trailing_rows()
+    ]
+    signal = Signal(side=SHORT, stop=101.5, target=None, trail=1.5)
+    trade = simulate_position(FREE, make_bars(mirrored), 0, signal)
+    assert trade.exit_reason == "trail"
+    assert trade.exit_price == pytest.approx(98.5)
+    assert trade.gross_pnl == pytest.approx(1.5)
+
+
+def test_trailing_stop_does_not_jump_on_contract_roll():
+    # Новый контракт на 30 дороже с бара 30: реальные цены другие, а
+    # непрерывные те же — результат тот же, что без переноса.
+    rolled = [
+        {
+            **row,
+            "open": row["open"] + 30.0,
+            "high": row["high"] + 30.0,
+            "low": row["low"] + 30.0,
+            "close": row["close"] + 30.0,
+            "price_adjustment": -30.0,
+            "is_first_bar_after_roll": index == 2,
+        }
+        if index >= 2
+        else row
+        for index, row in enumerate(trailing_rows())
+    ]
+    signal = Signal(side=LONG, stop=98.5, target=None, trail=1.5)
+    plain = simulate_position(FREE, make_bars(trailing_rows()), 0, signal)
+    trade = simulate_position(FREE, make_bars(rolled), 0, signal)
+    assert trade.exit_reason == "trail"
+    assert trade.exit_time == plain.exit_time
+    assert trade.exit_price == pytest.approx(plain.exit_price + 30.0)
+    assert trade.gross_pnl == pytest.approx(plain.gross_pnl)
+
+
+def test_no_target_exits_by_stop_or_schedule():
+    rows = [
+        bar(0, 99.5, 100.5, 99.5, 100.0),
+        bar(15, 100.0, 150.0, 99.0, 140.0),
+        bar(30, 140.0, 160.0, 139.0, 150.0),
+    ]
+    signal = Signal(side=LONG, stop=95.0, target=None, hold="overnight")
+    trade = simulate_position(
+        FREE, with_marks(make_bars(rows), before_break={1}), 0, signal
+    )
+    assert trade.exit_reason == "break"
+    assert trade.exit_price == pytest.approx(140.0)
+    without_schedule = simulate_position(
+        FREE, make_bars(rows), 0, Signal(side=LONG, stop=95.0, target=None)
+    )
+    assert without_schedule.exit_reason == "end"
+
+
+def test_future_bars_do_not_change_trade_closed_by_trailing_stop():
+    rows = trailing_rows() + [bar(75, 101.0, 105.0, 100.0, 104.0)]
+    signal = Signal(side=LONG, stop=98.5, target=None, trail=1.5)
+    trade = simulate_position(FREE, make_bars(rows), 0, signal)
+    changed = rows[:5] + [bar(75, 50.0, 60.0, 40.0, 55.0)]
+    assert simulate_position(FREE, make_bars(changed), 0, signal) == trade
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"breakeven_r": 0.0},
+        {"trail": -1.0},
+        {"target": 0.0},
+    ],
+)
+def test_bad_moving_stop_settings_rejected(kwargs):
+    params = {"side": LONG, "stop": 95.0, "target": 110.0, **kwargs}
+    with pytest.raises(ValueError):
+        Signal(**params)
+
+
+def test_stop_must_be_below_close_even_without_target():
+    bars = make_bars([bar(0, 99.5, 100.5, 99.5, 100.0), bar(15, 100, 101, 99, 100)])
+    with pytest.raises(ValueError, match="лонга"):
+        simulate_position(FREE, bars, 0, Signal(side=LONG, stop=101.0, target=None))
+
+
+def test_moving_stops_charge_costs_exactly_once():
+    # Подвижный стоп считается по ценам рынка, а не исполнения: выход тот же,
+    # что на рынке без издержек, и «до издержек» равно его результату.
+    rng = random.Random(17)
+    reasons = set()
+    for _ in range(300):
+        bars = random_trade_bars(rng)
+        side = rng.choice((LONG, SHORT))
+        distance = rng.uniform(1.0, 6.0)
+        signal = Signal(
+            side=side,
+            stop=100.0 - side * distance,
+            target=rng.choice([None, 100.0 + side * rng.uniform(2.0, 12.0)]),
+            contracts=rng.randint(1, 5),
+            breakeven_r=rng.choice([None, 0.5, 1.0]),
+            trail=rng.choice([None, distance, distance / 2]),
+        )
+        trade = simulate_position(SPEC, bars, 0, signal)
+        no_costs = simulate_position(FREE, bars, 0, signal)
+        assert trade.exit_time == no_costs.exit_time
+        assert trade.exit_reason == no_costs.exit_reason
+        assert trade.pnl_before_costs == pytest.approx(no_costs.net_pnl)
+        assert trade.path[-1][1] == pytest.approx(trade.net_pnl)
+        assert trade.mae <= 0.0 <= trade.mfe
+        reasons.add(trade.exit_reason)
+    assert {"stop", "breakeven", "trail", "target", "end"} <= reasons
+
+
 def test_short_target_mirrors_long():
     bars = make_bars(
         [
@@ -812,13 +1017,14 @@ def test_minutes_after_roll_use_new_contract_and_adjustment(tmp_path):
     assert trade.roll_costs == pytest.approx(1.011)
 
 
-def test_minutes_are_read_only_for_bars_with_both_levels(tmp_path):
-    # Каталог минуток пуст: бары, задевшие один уровень, минутки не запрашивают.
+def test_minutes_are_not_read_for_bars_without_level_inside(tmp_path):
+    # Каталог минуток пуст. Бары без касания и бар, открывшийся за целью,
+    # минутки не запрашивают: выход по открытию и так однозначен.
     bars = make_bars(
         [
             bar(0, 99.0, 101.0, 98.0, 100.0),
             bar(15, 101.0, 103.0, 100.0, 102.0),
-            bar(30, 108.0, 111.0, 107.0, 110.0),
+            bar(30, 111.0, 112.0, 107.0, 110.0),
         ]
     )
     trade = simulate_position(
@@ -826,6 +1032,99 @@ def test_minutes_are_read_only_for_bars_with_both_levels(tmp_path):
     )
     assert trade.exit_reason == "target"
     assert trade.exit_resolution == "bar"
+    assert trade.exit_price == pytest.approx(110.5)
+
+
+def one_level_bars() -> pl.DataFrame:
+    """Сигнал на 100, стоп 95; бар входа задел только стоп (минимум 93)."""
+    return make_bars(
+        [
+            bar(0, 99.0, 101.0, 98.0, 100.0),
+            bar(15, 101.0, 102.0, 93.0, 94.0),
+        ]
+    )
+
+
+def test_minute_opening_beyond_stop_fills_at_its_open_in_one_level_bar(tmp_path):
+    minutes = write_minutes(
+        tmp_path,
+        "TSZ6",
+        15,
+        [
+            (101.0, 102.0, 99.0, 99.5),
+            (99.5, 99.8, 96.0, 96.2),
+            (94.0, 94.5, 93.0, 94.0),  # открылась за стопом 95
+        ],
+    )
+    trade = simulate_position(SPEC, one_level_bars(), 0, long_signal(), minutes=minutes)
+    assert trade.exit_reason == "stop"
+    assert trade.exit_resolution == "minutes"
+    # 94 − 0.5 проскальзывания, а не 95 − 0.5, как по одному бару.
+    assert trade.exit_price == pytest.approx(93.5)
+    without = simulate_position(SPEC, one_level_bars(), 0, long_signal())
+    assert without.exit_resolution == "bar"
+    assert without.exit_price == pytest.approx(94.5)
+
+
+def test_minute_touching_stop_inside_fills_at_stop(tmp_path):
+    minutes = write_minutes(
+        tmp_path,
+        "TSZ6",
+        15,
+        [
+            (101.0, 102.0, 99.0, 99.5),
+            (99.5, 99.8, 93.0, 94.0),  # прошла через 95 внутри минутки
+        ],
+    )
+    trade = simulate_position(SPEC, one_level_bars(), 0, long_signal(), minutes=minutes)
+    assert trade.exit_resolution == "minutes"
+    assert trade.exit_price == pytest.approx(94.5)
+
+
+def test_minute_gap_beyond_target_fills_at_its_open(tmp_path):
+    bars = make_bars(
+        [
+            bar(0, 99.0, 101.0, 98.0, 100.0),
+            bar(15, 101.0, 113.0, 100.0, 112.0),
+        ]
+    )
+    minutes = write_minutes(
+        tmp_path,
+        "TSZ6",
+        15,
+        [
+            (101.0, 104.0, 100.0, 104.0),
+            (111.0, 113.0, 110.5, 112.0),  # открылась за целью 110
+        ],
+    )
+    trade = simulate_position(SPEC, bars, 0, long_signal(), minutes=minutes)
+    assert trade.exit_reason == "target"
+    assert trade.exit_price == pytest.approx(110.5)
+
+
+def test_one_level_bar_with_mismatching_minutes_fills_at_level(tmp_path):
+    minutes = write_minutes(tmp_path, "TSZ6", 15, [(101.0, 101.5, 99.0, 99.0)])
+    trade = simulate_position(SPEC, one_level_bars(), 0, long_signal(), minutes=minutes)
+    assert trade.exit_resolution == "bar"
+    assert trade.exit_price == pytest.approx(94.5)
+
+
+def test_moved_stop_fill_uses_minutes_too(tmp_path):
+    rows = trailing_rows()
+    minutes = write_minutes(
+        tmp_path,
+        "TSZ6",
+        60,
+        [
+            (102.0, 102.4, 101.8, 102.0),
+            (101.2, 101.4, 101.0, 101.2),  # открылась за стопом 101.5
+        ],
+    )
+    signal = Signal(side=LONG, stop=98.5, target=None, trail=1.5)
+    trade = simulate_position(FREE, make_bars(rows), 0, signal, minutes=minutes)
+    assert trade.exit_reason == "trail"
+    assert trade.exit_resolution == "minutes"
+    assert trade.exit_price == pytest.approx(101.2)
 
 
 def test_missing_minutes_file_is_an_error(tmp_path):
@@ -859,15 +1158,16 @@ def random_minute_path(rng: random.Random) -> list[tuple[float, float, float, fl
 def test_minute_resolution_matches_full_minute_simulation(tmp_path):
     # Разбор бара по минуткам должен дать тот же выход, что и прогон
     # симулятора прямо по минутным свечам. Случайные пути, в которых
-    # 15-минутный бар задел и стоп, и цель (98 и 102 при входе на 100).
+    # 15-минутный бар задел стоп, цель или оба (98 и 102 при входе на 100).
     rng = random.Random(7)
     resolutions = set()
+    reasons = set()
     checked = 0
     while checked < 200:
         path = random_minute_path(rng)
         high = max(minute[1] for minute in path)
         low = min(minute[2] for minute in path)
-        if high < 102.0 or low > 98.0:
+        if high < 102.0 and low > 98.0:
             continue
         if rng.random() < 0.5:
             signal = Signal(side=LONG, stop=98.0, target=102.0)
@@ -890,8 +1190,10 @@ def test_minute_resolution_matches_full_minute_simulation(tmp_path):
         assert by_minutes.exit_price == pytest.approx(reference.exit_price)
         assert by_minutes.gross_pnl == pytest.approx(reference.gross_pnl)
         resolutions.add(by_minutes.exit_resolution)
+        reasons.add(by_minutes.exit_reason)
         checked += 1
     assert resolutions == {"minutes", "same_minute"}
+    assert reasons == {"stop", "target"}
 
 
 def test_path_mae_mfe_and_slippage_of_target_trade():

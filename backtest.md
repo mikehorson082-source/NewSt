@@ -227,9 +227,11 @@ roll_cost = slippage + fees
 Когда стратегия решает открыть сделку, она создает объект `Signal`:
 * `side`: направление (+1 для Long, -1 для Short).
 * `stop`: уровень стоп-лосса в реальных ценах (например, 95.0).
-* `target`: уровень тейк-профита в реальных ценах (например, 110.0).
+* `target`: уровень тейк-профита в реальных ценах (например, 110.0); `None` — без цели, выход только по стопу, времени или расписанию.
 * `contracts`: количество контрактов (по умолчанию 1).
 * `max_bars`: максимальное время удержания сделки в свечах (например, закрыть через 4 бара, если не сработал стоп или тейк).
+* `breakeven_r`: безубыток — после касания входа + `breakeven_r` × расстояние до начального стопа стоп переносится на цену входа.
+* `trail`: скользящий стоп — расстояние в пунктах от лучшего закрытия сделки.
 * `hold`: сколько сделка может жить по расписанию — `"any"` (по умолчанию: ночи, выходные, праздники), `"overnight"` (обычные ночи можно, перед выходными и праздниками выход) или `"day"` (только внутри дня).
 
 ---
@@ -308,6 +310,17 @@ minutes = RawMinutes.for_market("brent")  # data/raw/futures/brent/<контра
 trade = simulate_position(spec, bars, signal_bar, signal, minutes=minutes)
 ```
 В барах нужен столбец `contract` — он есть в `data/continuous_15m`. После ролла симулятор сам берёт минутки нового контракта и пересчитывает уровни в его цены через `price_adjustment`.
+
+#### Шаг 3б: Подвижный стоп
+Стоп может подтягиваться во время сделки: безубыток (`breakeven_r`) или скользящий от лучшего закрытия (`trail`). Главная трудность — внутри свечи неизвестно, что было раньше: новый максимум или откат к стопу. Поэтому **внутри свечи стоп не двигается**: новое значение считается по свече целиком и действует со следующей.
+
+Пример: лонг от 100, стоп 99, безубыток после +1R. Свеча дошла до 101.2, минимум 99.3. В этой свече стоп ещё 99, со следующей — 100. Если бы минимум был 98.9, выход по 99: что цена сначала дошла до 101.2, из свечи не узнать.
+
+* Стоп только подтягивается: у лонга вверх, у шорта вниз.
+* Безубыток — это открытие свечи входа без проскальзывания. Так выход не зависит от издержек, а выход «в ноль» стоит около 0.03R сборов и проскальзывания.
+* Скользящий стоп считается в непрерывных ценах, поэтому на переносе контракта не прыгает.
+* Выход по подвинутому стопу — причина `trail` (если задан `trail`) или `breakeven`. Гэп через подвинутый стоп — выход по открытию, как обычно.
+* Размер позиции и 1R — по начальному стопу.
 
 #### Шаг 4: Выход по времени, по расписанию или концу данных
 * Если стоп и тейк не были задеты, но число баров удержания достигло лимита (`bars_held >= signal.max_bars`), позиция закрывается по цене `close` текущего бара с причиной `"time"`.
@@ -562,7 +575,7 @@ NAV склейки (`build_continuous_futures.add_etf_nav`) — основа п�
 
 ## 10. Как тесты подтверждают корректность бэктестера
 
-В модуле написано 216 юнит-тестов ([test_position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py), [test_markets.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_markets.py), [test_minutes.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_minutes.py), [test_sizing.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sizing.py), [test_portfolio.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_portfolio.py), [test_report.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_report.py), [test_baseline.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_baseline.py), [test_sensitivity.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sensitivity.py), [test_charts.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_charts.py) и [test_costs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_costs.py)), которые проверяют каждую нестандартную ситуацию:
+В модуле написано 232 юнит-теста ([test_position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py), [test_markets.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_markets.py), [test_minutes.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_minutes.py), [test_sizing.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sizing.py), [test_portfolio.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_portfolio.py), [test_report.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_report.py), [test_baseline.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_baseline.py), [test_sensitivity.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sensitivity.py), [test_charts.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_charts.py) и [test_costs.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_costs.py)), которые проверяют каждую нестандартную ситуацию:
 
 1. **Тест на проскальзывание и комиссии** ([test_long_target_fills_by_next_open_with_costs](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)): проверяет, что при входе и выходе по цели чистая прибыль строго меньше грязной на величину двух комиссий и двух проскальзываний.
 2. **Тесты на бар-«вертолёт»**: свеча задела и цель 110, и стоп 95.
@@ -587,7 +600,8 @@ NAV склейки (`build_continuous_futures.add_etf_nav`) — основа п�
 13. **Тесты «купил и держи»** ([test_baseline.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_baseline.py)): на ряду с двумя переносами и меняющимися рублями за пункт симулятор совпадает с NAV, который считает **настоящая** функция склейки `add_etf_nav`, на каждой свече; стоимость переносов в б.п. равна той, что платит симулятор.
 14. **Тесты сетки издержек** ([test_sensitivity.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_sensitivity.py)): без издержек результат = результат до издержек, с ростом издержек результат только падает, при 20 шагах портфель берёт меньше контрактов (сетка пересчитывает размер, а не просто вычитает), точка безубыточности по R, границы сессий.
 15. **Тесты выхода по расписанию** ([test_position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py), [test_markets.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_markets.py)): `day` закрывает на последней свече дня, `overnight` проходит обычную ночь и закрывает перед перерывом, стоп внутри последней свечи раньше расписания, после выхода гэп позицию не задевает ([test_schedule_exit_keeps_position_out_of_the_gap](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)). Отметки: чт→пт — обычная ночь, пятница, канун праздника и сессии выходных — перерыв.
-16. **Тест на отрицательные скорректированные цены** ([test_negative_adjusted_prices_do_not_change_result](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)): результат сделки не зависит от уровня поправки, даже если скорректированные цены ниже нуля.
+16. **Тесты подвижного стопа** ([test_position.py](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)): безубыток действует со следующей свечи, а не с той же; без касания порога стоп не двигается; скользящий стоп идёт за лучшим закрытием и не отходит назад; гэп через подвинутый стоп — выход по открытию; шорт зеркально; на переносе контракта стоп не прыгает; без цели — выход по стопу или расписанию; на 300 случайных сделках выход тот же, что без издержек, и каждая издержка учтена один раз.
+17. **Тест на отрицательные скорректированные цены** ([test_negative_adjusted_prices_do_not_change_result](file:///Users/anton/Documents/app/NewSt/src/backtest/test_position.py)): результат сделки не зависит от уровня поправки, даже если скорректированные цены ниже нуля.
 
 Запустить все тесты модуля можно стандартной командой:
 ```bash

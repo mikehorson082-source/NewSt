@@ -6,7 +6,10 @@
 (`max_bars`) и по расписанию (`hold`).
 Если бар задел и стоп, и цель, порядок касаний берётся из минуток того же
 контракта (`RawMinutes`). Без минуток или при касании обоих уровней в одной
-минутке выход пессимистично по стопу.
+минутке выход пессимистично по стопу. Если бар задел один уровень, цену
+исполнения тоже уточняют минутки: минутка, открывшаяся за уровнем, исполняет
+по своему открытию. Пример: стоп 99.00, бар открылся на 99.50, а минутка
+10:07 — сразу на 98.90: выход по 98.90, а не по 99.00. Без минуток — по уровню.
 
 Если позиция живёт через перенос контракта, она переносится по открытию
 первого бара нового контракта и платит стоимость переноса. Разрыв между
@@ -22,6 +25,20 @@
 вход в пятницу в 21:00, hold="overnight" — выход в пятницу по закрытию
 бара 23:45, гэп понедельника в 08:45 позицию уже не застанет. Стоп и цель
 внутри последнего бара срабатывают раньше, чем выход по расписанию.
+
+Подвижный стоп. Цели может не быть (`target=None`): выход только по стопу,
+времени или расписанию. Стоп подтягивается двумя способами:
+- безубыток (`breakeven_r`): цена коснулась входа + `breakeven_r` × расстояние
+  до начального стопа — стоп переносится на цену входа (открытие бара входа,
+  без проскальзывания: так выход не зависит от издержек);
+- скользящий (`trail`, в пунктах): стоп = лучшее закрытие сделки − `trail`
+  для лонга, + `trail` для шорта.
+Порядок внутри бара неизвестен: новый максимум мог быть до отката или после.
+Поэтому внутри бара стоп не двигается — новое значение считается по бару
+целиком и действует со следующего бара. Стоп только подтягивается, назад не
+отходит. Пример: лонг от 100, стоп 99, безубыток после +1R. Бар: максимум
+101.2, минимум 99.3 — в нём стоп ещё 99, со следующего — 100. Выход по
+подвинутому стопу — причина `trail` (если задан `trail`) или `breakeven`.
 
 Уровни стопа и цели задаются в реальных ценах бара сигнала. Внутри они
 хранятся в непрерывном (adjusted) пространстве через `price_adjustment`,
@@ -45,6 +62,7 @@ MAE и MFE — худший и лучший незакрытый результ�
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -81,6 +99,12 @@ HOLD_EXITS = {
     HOLD_DAY: ("is_day_end", "day_end"),
 }
 
+# Выход по подвинутому стопу (`Signal.breakeven_r`, `Signal.trail`).
+BREAKEVEN = "breakeven"
+TRAIL = "trail"
+# Выходы по уровню внутри бара: что было в баре после них, неизвестно.
+LEVEL_EXITS = ("stop", "target", BREAKEVEN, TRAIL)
+
 
 @dataclass(frozen=True)
 class Signal:
@@ -88,16 +112,24 @@ class Signal:
 
     side: int
     stop: float
-    target: float
+    target: float | None  # None — без цели
     contracts: int = 1
     max_bars: int | None = None
     hold: str = HOLD_ANY
+    # Безубыток: после касания +breakeven_r × (расстояние до начального стопа).
+    breakeven_r: float | None = None
+    # Скользящий стоп: расстояние от лучшего закрытия сделки, в пунктах цены.
+    trail: float | None = None
 
     def __post_init__(self) -> None:
         if self.side not in (LONG, SHORT):
             raise ValueError("Сторона сигнала должна быть +1 или -1")
-        if self.stop <= 0 or self.target <= 0:
+        if self.stop <= 0 or (self.target is not None and self.target <= 0):
             raise ValueError("Стоп и цель должны быть > 0")
+        if self.breakeven_r is not None and not self.breakeven_r > 0:
+            raise ValueError("Порог безубытка breakeven_r должен быть > 0")
+        if self.trail is not None and not self.trail > 0:
+            raise ValueError("Расстояние скользящего стопа trail должно быть > 0")
         if self.contracts < 1:
             raise ValueError("Число контрактов должно быть >= 1")
         if self.max_bars is not None and self.max_bars < 1:
@@ -121,8 +153,8 @@ class ClosedTrade:
     exit_time: datetime
     exit_price: float
     exit_reason: str
-    # Как найден выход: "bar" — хватило 15-минутного бара; "minutes" — бар
-    # задел и стоп, и цель, порядок взят из минуток. Порядок неизвестен,
+    # Как найден выход: "bar" — хватило 15-минутного бара; "minutes" — цена
+    # или порядок касаний взяты из минуток бара. Порядок неизвестен,
     # выход по стопу: "same_minute" — оба уровня в одной минутке,
     # "no_minutes" — минутки не переданы, "minutes_mismatch" — минутки не
     # совпали с баром.
@@ -181,10 +213,19 @@ def _point_value(row: dict[str, Any]) -> float:
 
 
 def _validate_levels(signal: Signal, close_signal: float) -> None:
-    if signal.side == LONG and not signal.stop < close_signal < signal.target:
+    # Без цели проверяется только стоп: цель «бесконечно далеко».
+    target = signal.target
+    if target is None:
+        target = signal.side * math.inf
+    if signal.side == LONG and not signal.stop < close_signal < target:
         raise ValueError("Для лонга требуется stop < close сигнала < target")
-    if signal.side == SHORT and not signal.target < close_signal < signal.stop:
+    if signal.side == SHORT and not target < close_signal < signal.stop:
         raise ValueError("Для шорта требуется target < close сигнала < stop")
+
+
+def _tighter(side: int, stop: float, candidate: float) -> float:
+    """Стоп только подтягивается: у лонга вверх, у шорта вниз."""
+    return max(stop, candidate) if side == LONG else min(stop, candidate)
 
 
 def _intrabar_exit(
@@ -257,6 +298,34 @@ def _minutes_match_bar(window: pl.DataFrame, bar: dict[str, Any]) -> bool:
     )
 
 
+def _opens_beyond_level(
+    side: int, open_adj: float, stop_adj: float, target_adj: float
+) -> bool:
+    """Бар открылся за стопом или за целью: выход по открытию, минутки не нужны."""
+    if side == LONG:
+        return open_adj <= stop_adj or open_adj >= target_adj
+    return open_adj >= stop_adj or open_adj <= target_adj
+
+
+def _level_by_minutes(
+    minutes: RawMinutes,
+    bar: dict[str, Any],
+    side: int,
+    stop_adj: float,
+    target_adj: float,
+    level: tuple[float, str],
+) -> tuple[float, str, str]:
+    """Бар задел один уровень: цена исполнения — по минутке, которая его задела.
+
+    Минутка открылась за уровнем — выход по её открытию, иначе по уровню.
+    Минутки не совпали с баром — выход по уровню, как по одному бару.
+    """
+    window = minutes.bar_minutes(bar["contract"], bar["timestamp"])
+    if not _minutes_match_bar(window, bar):
+        return level[0], level[1], "bar"
+    return _walk_minutes(window, bar, side, stop_adj, target_adj)
+
+
 def _exit_by_minutes(
     minutes: RawMinutes | None,
     bar: dict[str, Any],
@@ -275,7 +344,17 @@ def _exit_by_minutes(
     window = minutes.bar_minutes(bar["contract"], bar["timestamp"])
     if not _minutes_match_bar(window, bar):
         return stop_adj, "stop", "minutes_mismatch"
+    return _walk_minutes(window, bar, side, stop_adj, target_adj)
 
+
+def _walk_minutes(
+    window: pl.DataFrame,
+    bar: dict[str, Any],
+    side: int,
+    stop_adj: float,
+    target_adj: float,
+) -> tuple[float, str, str]:
+    """Первая минутка бара, задевшая уровень, и цена выхода по ней."""
     adjustment = float(bar["price_adjustment"])
     for open_, high, low in window.select("open", "high", "low").iter_rows():
         open_adj = open_ + adjustment
@@ -336,11 +415,17 @@ def simulate_position(
     close_signal = float(signal_row["close"])
     _validate_levels(signal, close_signal)
     adjustment_signal = float(signal_row["price_adjustment"])
-    stop_adj = signal.stop + adjustment_signal
-    target_adj = signal.target + adjustment_signal
-
     side = signal.side
     quantity = signal.contracts
+    stop_adj = signal.stop + adjustment_signal
+    target_adj = (
+        side * math.inf if signal.target is None else signal.target + adjustment_signal
+    )
+    # Расстояние до начального стопа — 1R в ценах, для порога безубытка.
+    distance = side * (close_signal - signal.stop)
+    stop_moved = False
+    best_close_adj: float | None = None
+    entry_open_adj = 0.0
 
     entry_adj: float | None = None
     entry_time: datetime | None = None
@@ -372,6 +457,7 @@ def simulate_position(
                 spec, float(row["open"]), side, quantity, entry_impact
             )
             entry_adj = entry_price + adjustment
+            entry_open_adj = open_adj
             entry_time = row["timestamp"]
             commissions += commission(spec, entry_price, point_value, quantity)
             slippage += spec.slippage * point_value * quantity
@@ -396,6 +482,15 @@ def simulate_position(
             exit_adj, reason = _intrabar_exit(
                 side, open_adj, high_adj, low_adj, stop_adj, target_adj
             )
+            if (
+                exit_adj is not None
+                and reason is not None
+                and minutes is not None
+                and not _opens_beyond_level(side, open_adj, stop_adj, target_adj)
+            ):
+                exit_adj, reason, resolution = _level_by_minutes(
+                    minutes, row, side, stop_adj, target_adj, (exit_adj, reason)
+                )
         if (
             exit_adj is None
             and signal.max_bars is not None
@@ -406,10 +501,12 @@ def simulate_position(
             exit_adj, reason = close_adj, hold_reason
         if exit_adj is None and exit_at_end and i == bars.height - 1:
             exit_adj, reason = close_adj, "end"
+        if reason == "stop" and stop_moved:
+            reason = TRAIL if signal.trail is not None else BREAKEVEN
 
         # Цены бара, через которые позиция точно прошла. Выход по стопу или
         # цели внутри бара: high/low могли случиться уже после выхода.
-        if exit_adj is not None and reason in ("stop", "target"):
+        if exit_adj is not None and reason in LEVEL_EXITS:
             seen = (open_adj, exit_adj)
         else:
             seen = (low_adj, high_adj)
@@ -458,5 +555,22 @@ def simulate_position(
         path.append((row["timestamp"], gross_pnl - commissions - roll_costs))
         mark = close_adj
         prev_close = float(row["close"])
+
+        # Стоп для следующего бара — по этому бару целиком.
+        new_stop = stop_adj
+        if signal.breakeven_r is not None:
+            extreme = high_adj if side == LONG else low_adj
+            if side * (extreme - entry_open_adj) >= signal.breakeven_r * distance:
+                new_stop = _tighter(side, new_stop, entry_open_adj)
+        if signal.trail is not None:
+            best_close_adj = (
+                close_adj
+                if best_close_adj is None
+                else _tighter(side, best_close_adj, close_adj)
+            )
+            new_stop = _tighter(side, new_stop, best_close_adj - side * signal.trail)
+        if new_stop != stop_adj:
+            stop_adj = new_stop
+            stop_moved = True
 
     raise ValueError("Позиция осталась открытой к концу данных")

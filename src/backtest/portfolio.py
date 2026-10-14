@@ -200,6 +200,9 @@ def _prepare_signals(
         signals = signals.with_columns(pl.lit(None, dtype=pl.Int64).alias("max_bars"))
     if "hold" not in signals.columns:
         signals = signals.with_columns(pl.lit(HOLD_ANY).alias("hold"))
+    for column in ("breakeven_r", "trail"):
+        if column not in signals.columns:
+            signals = signals.with_columns(pl.lit(None, dtype=pl.Float64).alias(column))
     unknown = set(signals["market"].unique()) - set(markets)
     if unknown:
         raise ValueError(f"Нет данных рынков: {', '.join(sorted(unknown))}")
@@ -233,8 +236,9 @@ def run_portfolio(
     """Прогоняет сигналы всех рынков через портфель с одной позицией.
 
     `signals` — таблица стратегии: market, timestamp (свеча, по закрытию
-    которой посчитан сигнал), side, stop, target и необязательные max_bars
-    и hold (выход по расписанию: "any", "overnight" или "day", `Signal.hold`).
+    которой посчитан сигнал), side, stop, target (пустая — без цели) и
+    необязательные max_bars, hold (выход по расписанию: "any", "overnight"
+    или "day"), breakeven_r и trail (подвижный стоп) — как в `Signal`.
     Число контрактов считает портфель. `markets` — данные рынков
     (`load_markets`); их порядок решает ничью по издержкам.
     """
@@ -291,6 +295,8 @@ def run_portfolio(
                 target=row["target"],
                 max_bars=row["max_bars"],
                 hold=row["hold"] or HOLD_ANY,
+                breakeven_r=row["breakeven_r"],
+                trail=row["trail"],
             )
             size = size_position(data.spec, data.bars, bar, signal, current, rules)
             contracts[i] = size.contracts

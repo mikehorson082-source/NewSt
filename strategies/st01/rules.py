@@ -5,8 +5,8 @@
 по закрытию которой посчитан сигнал), side, stop, target, hold. Столбец market
 добавляет тот, кто собирает сигналы рынков вместе.
 
-Параметры заданы заранее и по результатам не подбираются: подбор — это шаг 5
-(walk-forward), и только на прошлом.
+Параметры заданы заранее. Варианты пробоя для подбора (plan.md, 5.2) —
+необязательные аргументы `breakout_signals`; по умолчанию — правило шага 4.
 
 Пробой канала (тренд). Канал — максимум и минимум цены за прошлые 120 свечей
 (около двух торговых дней). Свеча закрылась выше канала — лонг, ниже — шорт.
@@ -32,11 +32,20 @@
   отдаются в реальных ценах сигнальной свечи, как ждёт симулятор;
 - в расчёт входит только прошлое: канал — свечи до сигнальной, σ свечи
   (`bar_sigma`) — дни до неё, средняя — по закрытие сигнальной включительно.
+
+Варианты пробоя (plan.md, 5.2):
+- выход: без цели (`reward=None`), безубыток (`breakeven_r`), скользящий стоп
+  на `trail_days` дневных движений от лучшего закрытия;
+- вход: время свечи входа в окне `entry_hours`; без входов в день, который
+  кончается перерывом (`skip_break_days`); только по направлению долгого тренда
+  (`trend_days`): закрытие выше средней дневных закрытий за прошлые
+  `trend_days` торговых дней — только лонги, ниже — только шорты.
 """
 
 from __future__ import annotations
 
 import math
+from datetime import time
 
 import polars as pl
 
@@ -57,6 +66,8 @@ REVERSION_ENTRY_SD = 2.0  # уход от средней в разбросах
 REVERSION_MIN_STOP_SIGMAS = 1.0
 
 SIGNAL_COLUMNS = ("timestamp", "side", "stop", "target", "hold")
+# Подвижный стоп пробоя (`Signal.breakeven_r`, `Signal.trail`).
+MOVING_STOP_COLUMNS = ("breakeven_r", "trail")
 REQUIRED_COLUMNS = {
     "timestamp",
     "high",
@@ -76,19 +87,25 @@ def _ordered(bars: pl.DataFrame) -> pl.DataFrame:
 
 
 def _signals(
-    frame: pl.DataFrame, distance: pl.Expr, reward: pl.Expr, hold: str
+    frame: pl.DataFrame,
+    distance: pl.Expr,
+    reward: pl.Expr | None,
+    hold: str,
+    extra: tuple[str, ...] = (),
 ) -> pl.DataFrame:
     """Сигналы из столбца side: стоп на `distance` от закрытия, цель на `reward`.
 
-    Остаются только свечи, где сигнал можно исполнить: будни, не последняя
-    свеча дня, уровни посчитаны и больше нуля.
+    `reward=None` — без цели. Остаются только свечи, где сигнал можно
+    исполнить: будни, не последняя свеча дня, уровни посчитаны и больше нуля.
     """
     side = pl.col("side")
     close = pl.col("close")
+    target = pl.lit(None, dtype=pl.Float64) if reward is None else close + side * reward
+    valid_target = pl.lit(True) if reward is None else (reward > 0) & (target > 0)
     return (
         frame.with_columns(
             (close - side * distance).alias("stop"),
-            (close + side * reward).alias("target"),
+            target.alias("target"),
             pl.lit(hold).alias("hold"),
         )
         .filter(
@@ -96,11 +113,55 @@ def _signals(
             & (pl.col("timestamp").dt.weekday() < SATURDAY)
             & ~pl.col("is_day_end")
             & (distance > 0)
-            & (reward > 0)
             & (pl.col("stop") > 0)
-            & (pl.col("target") > 0)
+            & valid_target
         )
-        .select(SIGNAL_COLUMNS)
+        .select(*SIGNAL_COLUMNS, *extra)
+    )
+
+
+def _in_hours(moment: pl.Expr, hours: tuple[time | None, time | None]) -> pl.Expr:
+    """Время свечи в окне [начало, конец); None — без границы."""
+    start, end = hours
+    inside = pl.lit(True)
+    if start is not None:
+        inside = inside & (moment.dt.time() >= start)
+    if end is not None:
+        inside = inside & (moment.dt.time() < end)
+    return inside
+
+
+def break_days(bars: pl.DataFrame) -> pl.Series:
+    """Дни, которые кончаются перерывом: пятница, канун праздника.
+
+    Это расписание, известное заранее: отметка `is_before_break` у последней
+    свечи дня (`markets.add_session_marks`).
+    """
+    return (
+        bars.filter(pl.col("is_before_break"))
+        .select(pl.col("timestamp").dt.date().alias("date"))
+        .unique()
+        .sort("date")["date"]
+    )
+
+
+def long_trend(bars: pl.DataFrame, days: int) -> pl.DataFrame:
+    """Средняя дневных закрытий за `days` прошлых торговых дней, по дате.
+
+    Дневное закрытие — закрытие последней будничной свечи дня в непрерывных
+    ценах. В среднюю входят только завершённые дни до этой даты: закрытие
+    сегодняшнего дня в момент сигнала ещё неизвестно. Меньше `days` дней
+    истории — средней нет.
+    """
+    return (
+        bars.filter(pl.col("timestamp").dt.weekday() < SATURDAY)
+        .sort("timestamp")
+        .group_by(pl.col("timestamp").dt.date().alias("date"), maintain_order=True)
+        .agg((pl.col("close") + pl.col("price_adjustment")).last().alias("_day_close"))
+        .with_columns(
+            pl.col("_day_close").rolling_mean(days).shift(1).alias("trend_mean")
+        )
+        .select("date", "trend_mean")
     )
 
 
@@ -108,9 +169,19 @@ def breakout_signals(
     bars: pl.DataFrame,
     lookback: int = BREAKOUT_LOOKBACK,
     stop_days: float = BREAKOUT_STOP_DAYS,
-    reward: float = BREAKOUT_REWARD,
+    reward: float | None = BREAKOUT_REWARD,
+    breakeven_r: float | None = None,
+    trail_days: float | None = None,
+    entry_hours: tuple[time | None, time | None] | None = None,
+    skip_break_days: bool = False,
+    trend_days: int | None = None,
 ) -> pl.DataFrame:
-    """Пробой канала: закрытие выше максимума или ниже минимума прошлых свечей."""
+    """Пробой канала: закрытие выше максимума или ниже минимума прошлых свечей.
+
+    Кроме столбцов сигнала отдаёт `breakeven_r` и `trail` (пусто, если не
+    заданы). `trail` — в пунктах цены: `trail_days` дневных движений на
+    свече сигнала.
+    """
     adjustment = pl.col("price_adjustment")
     close_adj = pl.col("close") + adjustment
     # shift(1): сама сигнальная свеча в канал не входит.
@@ -125,9 +196,44 @@ def breakout_signals(
         .then(SHORT)
         .alias("side"),
         (stop_days * day_move).alias("_distance"),
+        pl.lit(breakeven_r, dtype=pl.Float64).alias("breakeven_r"),
+        (
+            pl.lit(None, dtype=pl.Float64)
+            if trail_days is None
+            else trail_days * day_move
+        ).alias("trail"),
+        # Время входа — открытие следующей свечи: это расписание биржи.
+        pl.col("timestamp").shift(-1).alias("_entry_time"),
     )
+    if entry_hours is not None:
+        frame = frame.filter(_in_hours(pl.col("_entry_time"), entry_hours))
+    if skip_break_days:
+        if "is_before_break" not in frame.columns:
+            raise ValueError(
+                "Для skip_break_days в барах нужен столбец is_before_break"
+            )
+        frame = frame.filter(
+            ~pl.col("timestamp").dt.date().is_in(break_days(frame).implode())
+        )
+    if trend_days is not None:
+        frame = (
+            frame.join(
+                long_trend(frame, trend_days),
+                left_on=pl.col("timestamp").dt.date(),
+                right_on="date",
+                how="left",
+            )
+            .filter(
+                ((pl.col("side") == LONG) & (close_adj > pl.col("trend_mean")))
+                | ((pl.col("side") == SHORT) & (close_adj < pl.col("trend_mean")))
+            )
+            .sort("timestamp")
+        )
     distance = pl.col("_distance")
-    return _signals(frame, distance, reward * distance, HOLD_OVERNIGHT)
+    reward_distance = None if reward is None else reward * distance
+    return _signals(
+        frame, distance, reward_distance, HOLD_OVERNIGHT, MOVING_STOP_COLUMNS
+    )
 
 
 def reversion_signals(

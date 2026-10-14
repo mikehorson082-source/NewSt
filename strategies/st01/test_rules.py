@@ -5,12 +5,12 @@
 
 import math
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 
 import numpy as np
 import polars as pl
 import pytest
-from rules import BARS_PER_DAY, breakout_signals, reversion_signals
+from rules import BARS_PER_DAY, breakout_signals, long_trend, reversion_signals
 
 from backtest.markets import add_bar_sigma, add_session_marks, add_usual_volume
 from backtest.portfolio import MarketData, run_portfolio
@@ -124,6 +124,100 @@ def test_missing_columns_rejected():
         breakout_signals(bars)
 
 
+# ------------------------------------------------------- варианты пробоя
+
+
+def test_breakout_without_target_carries_trailing_distance():
+    bars = make_bars([100.0, 100.0, 100.0, 100.0, 101.0])
+    signal = at(breakout_signals(bars, lookback=4, reward=None, trail_days=0.5), 4)
+    assert signal["target"] is None
+    assert signal["breakeven_r"] is None
+    assert signal["trail"] == pytest.approx(0.5 * 101.0 * DAY_MOVE)
+    # Начальный стоп тот же, что у правила шага 4.
+    assert signal["stop"] == pytest.approx(101.0 * (1 - DAY_MOVE))
+
+
+def test_breakout_carries_breakeven_threshold():
+    bars = make_bars([100.0, 100.0, 100.0, 100.0, 101.0])
+    signal = at(breakout_signals(bars, lookback=4, breakeven_r=1.0), 4)
+    assert signal["breakeven_r"] == 1.0
+    assert signal["trail"] is None
+    assert signal["target"] == pytest.approx(101.0 * (1 + 3 * DAY_MOVE))
+
+
+def bars_at_times(closes: list[float], times: list[str], **columns) -> pl.DataFrame:
+    """Свечи по закрытиям с заданными метками времени «YYYY-MM-DDTHH:MM»."""
+    return make_bars(closes, **columns).with_columns(
+        pl.Series("timestamp", [datetime.fromisoformat(t) for t in times])
+    )
+
+
+def test_entry_hours_look_at_the_entry_bar():
+    # Пробой на свече 18:45: вход — на свече 19:00, уже вечер.
+    times = [f"2026-09-09T{t}" for t in ("18:00", "18:15", "18:30", "18:45", "19:00")]
+    bars = bars_at_times([100.0, 100.0, 100.0, 101.0, 101.0], times)
+    main = breakout_signals(bars, lookback=3, entry_hours=(time(10), time(19)))
+    assert main.is_empty()
+    no_morning = breakout_signals(bars, lookback=3, entry_hours=(time(10), None))
+    assert no_morning["timestamp"].to_list() == [datetime(2026, 9, 9, 18, 45)]
+
+
+def test_skip_break_days_drops_the_whole_day():
+    # Чт 10.09 — обычная ночь; пт 11.09 кончается перерывом.
+    times = [
+        "2026-09-10T10:00",
+        "2026-09-10T10:15",
+        "2026-09-10T10:30",
+        "2026-09-10T10:45",
+        "2026-09-10T23:45",
+        "2026-09-11T10:00",
+        "2026-09-11T10:15",
+        "2026-09-11T23:45",
+    ]
+    closes = [100.0, 100.0, 100.0, 101.0, 101.0, 101.0, 102.0, 102.0]
+    marks = {
+        "is_day_end": [False, False, False, False, True, False, False, True],
+        "is_before_break": [False] * 7 + [True],
+    }
+    bars = bars_at_times(closes, times, **marks)
+    every = breakout_signals(bars, lookback=3)
+    assert every["timestamp"].dt.day().to_list() == [10, 11]
+    skipped = breakout_signals(bars, lookback=3, skip_break_days=True)
+    assert skipped["timestamp"].dt.day().to_list() == [10]
+
+
+def trend_bars(previous_close: float) -> pl.DataFrame:
+    """Два прошлых дня закрылись на `previous_close`, сегодня пробой вверх на 101."""
+    times = [
+        "2026-09-07T10:00",
+        "2026-09-07T10:15",
+        "2026-09-08T10:00",
+        "2026-09-08T10:15",
+        "2026-09-09T10:00",
+        "2026-09-09T10:15",
+        "2026-09-09T10:30",
+        "2026-09-09T10:45",
+    ]
+    p = previous_close
+    return bars_at_times([p, p, p, p, 100.0, 100.0, 100.0, 101.0], times)
+
+
+def test_long_trend_uses_only_finished_days():
+    trend = long_trend(trend_bars(90.0), days=2)
+    means = dict(trend.iter_rows())
+    assert means[datetime(2026, 9, 9).date()] == pytest.approx(90.0)
+    # 08.09: в прошлом один день — средней за два ещё нет.
+    assert means[datetime(2026, 9, 8).date()] is None
+
+
+@pytest.mark.parametrize(("previous_close", "kept"), [(90.0, True), (110.0, False)])
+def test_trend_filter_keeps_only_breakouts_with_the_long_trend(previous_close, kept):
+    signals = breakout_signals(trend_bars(previous_close), lookback=3, trend_days=2)
+    # Сигнал последней свечи: лонг на 101 при средней 90 или 110.
+    last = signals.filter(pl.col("timestamp") == datetime(2026, 9, 9, 10, 45))
+    assert last.height == (1 if kept else 0)
+
+
 # ------------------------------------------------------------ возврат к средней
 
 
@@ -207,16 +301,28 @@ def random_bars(rng: random.Random, n: int = 400) -> pl.DataFrame:
 
 
 @pytest.mark.parametrize(
-    "rule",
+    ("rule", "n", "cut"),
     [
-        lambda bars: breakout_signals(bars, lookback=20),
-        lambda bars: reversion_signals(bars, lookback=20),
+        (lambda bars: breakout_signals(bars, lookback=20), 400, 250),
+        # Долгий тренд на 2 дня: нужно несколько дней истории.
+        (
+            lambda bars: breakout_signals(
+                bars,
+                lookback=20,
+                reward=None,
+                trail_days=1.0,
+                entry_hours=(time(10), time(19)),
+                trend_days=2,
+            ),
+            2000,
+            1500,
+        ),
+        (lambda bars: reversion_signals(bars, lookback=20), 400, 250),
     ],
 )
-def test_future_bars_do_not_change_past_signals(rule):
+def test_future_bars_do_not_change_past_signals(rule, n, cut):
     rng = random.Random(3)
-    bars = random_bars(rng)
-    cut = 250
+    bars = random_bars(rng, n)
     moment = bars["timestamp"][cut]
     # Будущее после свечи cut заменено другим: сигналы до неё те же.
     changed = bars.with_row_index("_i").with_columns(
@@ -313,3 +419,38 @@ def test_random_walk_gives_no_edge(rule, tolerance):
     r_multiple = pl.concat(results)
     assert r_multiple.len() > 2000
     assert abs(r_multiple.mean()) < tolerance
+
+
+def breakeven_variant(signals: pl.DataFrame, bars: pl.DataFrame) -> pl.DataFrame:
+    """Вариант б: стоп в безубыток после +1R, цель прежняя."""
+    return signals.with_columns(pl.lit(1.0).alias("breakeven_r"))
+
+
+def trailing_variant(signals: pl.DataFrame, bars: pl.DataFrame) -> pl.DataFrame:
+    """Вариант в: скользящий стоп на расстоянии начального, без цели."""
+    return (
+        signals.join(bars.select("timestamp", "close"), on="timestamp")
+        .with_columns(
+            (pl.col("close") - pl.col("stop")).abs().alias("trail"),
+            pl.lit(None, dtype=pl.Float64).alias("target"),
+        )
+        .drop("close")
+    )
+
+
+@pytest.mark.parametrize("variant", [breakeven_variant, trailing_variant])
+def test_random_walk_gives_no_edge_with_moving_stops(variant):
+    # Подвижный стоп тоже не должен зарабатывать на случайных ценах: стоп
+    # двигается только по прошлым свечам, а действует со следующей.
+    results = []
+    for seed in range(6):
+        market = {"walk": random_walk_market(seed)}
+        bars = market["walk"].bars
+        signals = variant(breakout_signals(bars), bars).with_columns(
+            pl.lit("walk").alias("market")
+        )
+        trades = run_portfolio(signals, market, 1_000_000.0).trade_log()
+        results.append(trades.filter(pl.col("exit_reason") != "end")["r_multiple"])
+    r_multiple = pl.concat(results)
+    assert r_multiple.len() > 2000
+    assert abs(r_multiple.mean()) < 0.1
