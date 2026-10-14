@@ -11,7 +11,8 @@
 1. `--stage exits` — выход а, б, в при прежнем входе. Выход выбирает
    пользователь, с записью причины.
 2. `--stage entries --exit fixed|breakeven|trail` — фильтры входа г, д, е
-   поверх выбранного выхода (fixed — а, breakeven — б, trail — в).
+   поверх выбранного выхода (fixed — а, breakeven — б, trail — в) со стопом
+   `CHOSEN_STOP_DAYS` (0.75 дня — выбор пользователя 14.10.2026).
    - г: вход только в основную сессию; соседние — без утра, без вечера.
    - д: диагностика — сделки, открытые в день, который кончается перерывом,
      против остальных; плюс прогон с правилом для сведения. Правило нужно,
@@ -28,7 +29,7 @@
 Запуск:
   uv run python strategies/st01/tune_breakout.py --stage stops
   uv run python strategies/st01/tune_breakout.py --stage exits
-  uv run python strategies/st01/tune_breakout.py --stage entries --exit trail
+  uv run python strategies/st01/tune_breakout.py --stage entries --exit fixed
 """
 
 from __future__ import annotations
@@ -70,6 +71,8 @@ EXITS: dict[str, dict[str, Any]] = {
     "trail": {"reward": None, "trail_days": 1.0},
 }
 EXIT_LETTERS = {"fixed": "а", "breakeven": "б", "trail": "в"}
+# Стоп для этапа входов: выбран пользователем 14.10.2026 по этапу stops.
+CHOSEN_STOP_DAYS = 0.75
 
 MAIN_SESSION = (time(10), time(19))
 # Долгий тренд: решение — по золоту, mix и brent — для сведения, на cnyrub
@@ -141,11 +144,17 @@ def stop_variants() -> list[Variant]:
     return variants
 
 
+def chosen_exit(exit_key: str) -> tuple[str, dict[str, Any]]:
+    """Подпись и параметры выбранного выхода со выбранным стопом."""
+    label = f"{EXIT_LETTERS[exit_key]} · стоп {CHOSEN_STOP_DAYS:g}"
+    return label, {**EXITS[exit_key], "stop_days": CHOSEN_STOP_DAYS}
+
+
 def entry_variants(exit_key: str) -> list[Variant]:
     """Выход без фильтра, г и его соседние, д — поверх выбранного выхода."""
-    base = EXITS[exit_key]
+    label, base = chosen_exit(exit_key)
     return [
-        Variant(f"{EXIT_LETTERS[exit_key]} без фильтра", "ref", True, base),
+        Variant(f"{label} без фильтра", "ref", True, base),
         Variant("г · 10:00–19:00", "г", True, {**base, "entry_hours": MAIN_SESSION}),
         Variant("г · без утра", "г", False, {**base, "entry_hours": (time(10), None)}),
         Variant(
@@ -158,8 +167,8 @@ def entry_variants(exit_key: str) -> list[Variant]:
 
 
 def trend_variants(exit_key: str) -> list[Variant]:
-    base = EXITS[exit_key]
-    return [Variant(f"{EXIT_LETTERS[exit_key]} без фильтра", "ref", True, base)] + [
+    label, base = chosen_exit(exit_key)
+    return [Variant(f"{label} без фильтра", "ref", True, base)] + [
         Variant(
             f"е · {days} дней", "е", days == TREND_DAYS[0], {**base, "trend_days": days}
         )

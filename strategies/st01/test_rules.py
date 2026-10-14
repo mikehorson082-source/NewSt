@@ -10,7 +10,13 @@ from datetime import datetime, time, timedelta
 import numpy as np
 import polars as pl
 import pytest
-from rules import BARS_PER_DAY, breakout_signals, long_trend, reversion_signals
+from rules import (
+    BARS_PER_DAY,
+    breakout_signals,
+    frozen_breakout_signals,
+    long_trend,
+    reversion_signals,
+)
 
 from backtest.markets import add_bar_sigma, add_session_marks, add_usual_volume
 from backtest.portfolio import MarketData, run_portfolio
@@ -216,6 +222,25 @@ def test_trend_filter_keeps_only_breakouts_with_the_long_trend(previous_close, k
     # Сигнал последней свечи: лонг на 101 при средней 90 или 110.
     last = signals.filter(pl.col("timestamp") == datetime(2026, 9, 9, 10, 45))
     assert last.height == (1 if kept else 0)
+
+
+def test_frozen_rules_skip_morning_entries_only_on_rouble_markets():
+    # 130 свечей до 09:45; пробой на свече 09:30, вход в 09:45 — утро.
+    last = datetime(2026, 9, 9, 9, 45)
+    times = [(last - timedelta(minutes=15 * (129 - i))).isoformat() for i in range(130)]
+    bars = bars_at_times([100.0] * 128 + [101.0, 101.0], times)
+    frozen = {
+        name: frozen_breakout_signals(name, bars)
+        for name in ("cnyrub", "si", "gold", "brent")
+    }
+    assert frozen["cnyrub"].is_empty()
+    assert frozen["si"].is_empty()
+    for name in ("gold", "brent"):
+        signal = frozen[name].row(0, named=True)
+        assert signal["timestamp"] == datetime(2026, 9, 9, 9, 30)
+        # Стоп 0.75 дня, цель 3 стопа.
+        assert signal["stop"] == pytest.approx(101.0 * (1 - 0.75 * DAY_MOVE))
+        assert signal["target"] == pytest.approx(101.0 * (1 + 3 * 0.75 * DAY_MOVE))
 
 
 # ------------------------------------------------------------ возврат к средней
