@@ -10,8 +10,10 @@
   uv run python strategies/st01/run_final.py
   → strategies/st01/reports/final_<рынок>.png
 Экзамен 5.4 (рынки, которых стратегия не видела; нужны паспорта в markets.py):
-  uv run python strategies/st01/run_final.py --exam si euro silver ...
+  uv run python strategies/st01/run_final.py --exam si euro --before 2026-01-01
   → strategies/st01/reports/exam_<рынок>.png
+`--before` обрезает данные: сигналы, сделки, кривая, «купил и держи» и
+бутстрап — только до этой даты. Так 2026 год остаётся нетронутым.
 Экзамен запускается один раз, без правок после него. Файлы прошлых запусков
 не затираются: новый получает суффикс _2, _3…
 """
@@ -20,11 +22,12 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+from datetime import date
 
 import polars as pl
 from check_breakout import bootstrap_row, daily_correlation, trades_by
 from rules import frozen_breakout_signals
-from run_baseline import CAPITAL, metrics_table
+from run_baseline import CAPITAL, cut, metrics_table
 from tune_breakout import REPORTS, free_path
 
 from backtest.baseline import buy_and_hold_result
@@ -101,6 +104,11 @@ def parse_args() -> argparse.Namespace:
         metavar="РЫНОК",
         help="Экзамен на рынках, которых стратегия не видела (exam_<рынок>.png).",
     )
+    parser.add_argument(
+        "--before",
+        type=date.fromisoformat,
+        help="Данные только до этой даты, YYYY-MM-DD. По умолчанию вся история.",
+    )
     return parser.parse_args()
 
 
@@ -114,10 +122,10 @@ def main() -> None:
 
     names = args.exam or list(TUNING_MARKETS)
     prefix = "exam" if args.exam else "final"
-    rows = [
-        market_report(name, data, prefix) for name, data in load_markets(names).items()
-    ]
-    print(f"\n{'=' * 78}\nСводка ({prefix}):")
+    markets = cut(load_markets(names), args.before)
+    period = "вся история" if args.before is None else f"до {args.before:%d.%m.%Y}"
+    rows = [market_report(name, data, prefix) for name, data in markets.items()]
+    print(f"\n{'=' * 78}\nСводка ({prefix}, {period}):")
     print(pl.DataFrame(rows))
 
 
