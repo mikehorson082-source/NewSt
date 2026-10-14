@@ -1,8 +1,8 @@
 {
   "sections": {
     "futures": [
-      "futures/si",
       "futures/cnyrub",
+      "futures/si",
       "futures/euro",
       "futures/eurusd",
       "futures/perpetual",
