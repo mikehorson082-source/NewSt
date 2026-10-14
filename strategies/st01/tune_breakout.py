@@ -6,6 +6,8 @@
 устойчивости: центральные значения заданы заранее и остаются.
 
 Запуски:
+0. `--stage channels` — выбор канала по замороженным правилам 5.3: канал
+   120, 180, 240 и 360 свечей при 1 и 2 шагах проскальзывания.
 0. `--stage stops` — выбор стопа: «а» со стопом 0.25, 0.5, 0.75 и 1 день,
    каждый при 1 и 2 шагах проскальзывания.
 1. `--stage exits` — выход а, б, в при прежнем входе. Выход выбирает
@@ -43,7 +45,7 @@ from typing import Any
 
 import polars as pl
 from matplotlib.figure import Figure
-from rules import break_days, breakout_signals, long_trend
+from rules import break_days, breakout_signals, frozen_breakout_signals, long_trend
 from run_baseline import CAPITAL
 
 from backtest.charts import (
@@ -106,6 +108,7 @@ class Variant:
     central: bool
     params: dict[str, Any] = field(default_factory=dict)
     slippage_ticks: float | None = None  # None — как в паспорте рынка (1 шаг)
+    frozen: bool = False  # замороженные правила 5.3 вместо `breakout_signals`
 
 
 def exit_variants() -> list[Variant]:
@@ -150,6 +153,27 @@ def chosen_exit(exit_key: str) -> tuple[str, dict[str, Any]]:
     return label, {**EXITS[exit_key], "stop_days": CHOSEN_STOP_DAYS}
 
 
+CHANNELS = (120, 180, 240, 360)  # было 120; выбран 240 (15.10.2026)
+
+
+def channel_variants() -> list[Variant]:
+    """Замороженные правила с каналом 120–360 при 1 и 2 шагах проскальзывания."""
+    variants = []
+    for ticks, group in ((1.0, "1 шаг"), (2.0, "2 шага")):
+        for lookback in CHANNELS:
+            variants.append(
+                Variant(
+                    f"канал {lookback} · {group}",
+                    group,
+                    lookback in (120, 240),
+                    {"lookback": lookback},
+                    ticks,
+                    frozen=True,
+                )
+            )
+    return variants
+
+
 def entry_variants(exit_key: str) -> list[Variant]:
     """Выход без фильтра, г и его соседние, д — поверх выбранного выхода."""
     label, base = chosen_exit(exit_key)
@@ -184,9 +208,11 @@ def run(
         data = replace(
             data, spec=replace(data.spec, slippage_ticks=variant.slippage_ticks)
         )
-    signals = breakout_signals(data.bars, **variant.params).with_columns(
-        pl.lit(name).alias("market")
-    )
+    if variant.frozen:
+        signals = frozen_breakout_signals(name, data.bars, **variant.params)
+    else:
+        signals = breakout_signals(data.bars, **variant.params)
+    signals = signals.with_columns(pl.lit(name).alias("market"))
     bars = data.bars
     if start is not None:
         signals = signals.filter(pl.col("timestamp").dt.date() >= start)
@@ -324,6 +350,24 @@ def stage_stops(markets: dict[str, MarketData]) -> None:
         print(f"График: {path}")
 
 
+def stage_channels(markets: dict[str, MarketData]) -> None:
+    variants = channel_variants()
+    results = {name: run_all(name, data, variants) for name, data in markets.items()}
+    for name, reports in results.items():
+        print(f"\n{name}:")
+        print(metrics_table(reports))
+    print("\nSharpe: вариант × рынок (погрешность одного прогона около ±0.47).")
+    print(matrix(results, "sharpe", 2))
+    print("\nExpectancy в R: вариант × рынок.")
+    print(matrix(results, "expectancy_r", 3))
+    print("\nСделок: вариант × рынок.")
+    print(matrix(results, "trades", 0))
+    for name, reports in results.items():
+        title = f"{name}: замороженные правила, канал 120–360, 1 и 2 шага"
+        path = save_chart(name, "channels", [(title, reports, variants)])
+        print(f"График: {path}")
+
+
 def stage_exits(markets: dict[str, MarketData]) -> None:
     variants = exit_variants()
     results = {}
@@ -445,7 +489,9 @@ def stage_entries(markets: dict[str, MarketData], exit_key: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Подбор пробоя канала (plan.md, 5.2).")
-    parser.add_argument("--stage", choices=("stops", "exits", "entries"), required=True)
+    parser.add_argument(
+        "--stage", choices=("channels", "stops", "exits", "entries"), required=True
+    )
     parser.add_argument(
         "--exit",
         choices=list(EXITS),
@@ -468,6 +514,8 @@ def main() -> None:
     markets = load_markets(MARKETS)
     if args.stage == "stops":
         stage_stops(markets)
+    elif args.stage == "channels":
+        stage_channels(markets)
     elif args.stage == "exits":
         stage_exits(markets)
     else:

@@ -59,8 +59,10 @@ BREAKOUT_LOOKBACK = 120  # свечей в канале, около двух т�
 BREAKOUT_STOP_DAYS = 1.0  # стоп в обычных дневных движениях
 BREAKOUT_REWARD = 3.0  # цель в расстояниях до стопа
 
-# Замороженные правила пробоя (plan.md, 5.3, 14.10.2026): стоп 0.75 дня,
-# на рублёвых рынках вход не раньше 10:00 — утренние входы им вредят.
+# Замороженные правила пробоя (plan.md, 5.3): канал 240 свечей (около 4
+# торговых дней, выбран 15.10.2026), стоп 0.75 дня, на рублёвых рынках вход
+# не раньше 10:00 — утренние входы им вредят.
+FROZEN_LOOKBACK = 240
 FROZEN_STOP_DAYS = 0.75
 ROUBLE_MARKETS = frozenset({"cnyrub", "mix", "si", "euro"})
 NO_MORNING = (time(10), None)
@@ -242,14 +244,19 @@ def breakout_signals(
     )
 
 
-def frozen_breakout_signals(market: str, bars: pl.DataFrame) -> pl.DataFrame:
-    """Пробой по замороженным правилам 5.3: канал 120, стоп 0.75 дня, цель 3R.
+def frozen_breakout_signals(
+    market: str, bars: pl.DataFrame, lookback: int = FROZEN_LOOKBACK
+) -> pl.DataFrame:
+    """Пробой по замороженным правилам 5.3: канал 240, стоп 0.75 дня, цель 3R.
 
     Рублёвые рынки (`ROUBLE_MARKETS`) — без утренних входов: свеча входа не
-    раньше 10:00. Остальные — во все сессии.
+    раньше 10:00. Остальные — во все сессии. `lookback` — только для выбора
+    канала (plan.md, 5.2).
     """
     entry_hours = NO_MORNING if market in ROUBLE_MARKETS else None
-    return breakout_signals(bars, stop_days=FROZEN_STOP_DAYS, entry_hours=entry_hours)
+    return breakout_signals(
+        bars, lookback=lookback, stop_days=FROZEN_STOP_DAYS, entry_hours=entry_hours
+    )
 
 
 def reversion_signals(

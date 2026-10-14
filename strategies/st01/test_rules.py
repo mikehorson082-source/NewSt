@@ -225,10 +225,10 @@ def test_trend_filter_keeps_only_breakouts_with_the_long_trend(previous_close, k
 
 
 def test_frozen_rules_skip_morning_entries_only_on_rouble_markets():
-    # 130 свечей до 09:45; пробой на свече 09:30, вход в 09:45 — утро.
+    # 250 свечей до 09:45 (канал — 240); пробой на свече 09:30, вход в 09:45 — утро.
     last = datetime(2026, 9, 9, 9, 45)
-    times = [(last - timedelta(minutes=15 * (129 - i))).isoformat() for i in range(130)]
-    bars = bars_at_times([100.0] * 128 + [101.0, 101.0], times)
+    times = [(last - timedelta(minutes=15 * (249 - i))).isoformat() for i in range(250)]
+    bars = bars_at_times([100.0] * 248 + [101.0, 101.0], times)
     frozen = {
         name: frozen_breakout_signals(name, bars)
         for name in ("cnyrub", "si", "gold", "brent")
@@ -238,9 +238,22 @@ def test_frozen_rules_skip_morning_entries_only_on_rouble_markets():
     for name in ("gold", "brent"):
         signal = frozen[name].row(0, named=True)
         assert signal["timestamp"] == datetime(2026, 9, 9, 9, 30)
+        assert frozen[name].height == 1
         # Стоп 0.75 дня, цель 3 стопа.
         assert signal["stop"] == pytest.approx(101.0 * (1 - 0.75 * DAY_MOVE))
         assert signal["target"] == pytest.approx(101.0 * (1 + 3 * 0.75 * DAY_MOVE))
+
+
+def test_frozen_rules_use_channel_of_240_bars():
+    # Всплеск до 102 за 150 свечей до пробоя: канал 120 его уже не видит,
+    # канал 240 — видит, и закрытие на 101 пробоем не считается.
+    last = datetime(2026, 9, 9, 15, 0)
+    times = [(last - timedelta(minutes=15 * (249 - i))).isoformat() for i in range(250)]
+    closes = [100.0] * 248 + [101.0, 101.0]
+    closes[99] = 102.0
+    bars = bars_at_times(closes, times)
+    assert frozen_breakout_signals("gold", bars).is_empty()
+    assert not breakout_signals(bars, lookback=120).is_empty()
 
 
 # ------------------------------------------------------------ возврат к средней
