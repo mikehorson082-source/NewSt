@@ -40,6 +40,11 @@
   кончается перерывом (`skip_break_days`); только по направлению долгого тренда
   (`trend_days`): закрытие выше средней дневных закрытий за прошлые
   `trend_days` торговых дней — только лонги, ниже — только шорты.
+
+Проверки роли волатильности (plan.md, 5.3.1):
+- стоп `stop_pct` — неподвижная доля цены вместо дневных движений. Сигналы те
+  же, что у основного правила, меняется только стоп;
+- `volatility_rank` — где σ свечи стоит среди значений рынка за прошлый год.
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ from __future__ import annotations
 import math
 from datetime import time
 
+import numpy as np
 import polars as pl
 
 from backtest.position import HOLD_DAY, HOLD_OVERNIGHT, LONG, SHORT
@@ -183,12 +189,17 @@ def breakout_signals(
     entry_hours: tuple[time | None, time | None] | None = None,
     skip_break_days: bool = False,
     trend_days: int | None = None,
+    stop_pct: float | None = None,
 ) -> pl.DataFrame:
     """Пробой канала: закрытие выше максимума или ниже минимума прошлых свечей.
 
     Кроме столбцов сигнала отдаёт `breakeven_r` и `trail` (пусто, если не
     заданы). `trail` — в пунктах цены: `trail_days` дневных движений на
     свече сигнала.
+
+    `stop_pct` — стоп на этой доле цены закрытия вместо `stop_days` дневных
+    движений (проверка 5.3.1). Сигналы остаются те же: свечи, где σ ещё
+    неизвестна, пропускаются, как и у стопа по дневным движениям.
     """
     adjustment = pl.col("price_adjustment")
     close_adj = pl.col("close") + adjustment
@@ -196,6 +207,11 @@ def breakout_signals(
     upper = (pl.col("high") + adjustment).shift(1).rolling_max(lookback)
     lower = (pl.col("low") + adjustment).shift(1).rolling_min(lookback)
     day_move = pl.col("bar_sigma") * math.sqrt(BARS_PER_DAY) * pl.col("close")
+    stop_distance = (
+        stop_days * day_move
+        if stop_pct is None
+        else pl.when(pl.col("bar_sigma").is_not_null()).then(stop_pct * pl.col("close"))
+    )
 
     frame = _ordered(bars).with_columns(
         pl.when(close_adj > upper)
@@ -203,7 +219,7 @@ def breakout_signals(
         .when(close_adj < lower)
         .then(SHORT)
         .alias("side"),
-        (stop_days * day_move).alias("_distance"),
+        stop_distance.alias("_distance"),
         pl.lit(breakeven_r, dtype=pl.Float64).alias("breakeven_r"),
         (
             pl.lit(None, dtype=pl.Float64)
@@ -245,18 +261,70 @@ def breakout_signals(
 
 
 def frozen_breakout_signals(
-    market: str, bars: pl.DataFrame, lookback: int = FROZEN_LOOKBACK
+    market: str,
+    bars: pl.DataFrame,
+    lookback: int = FROZEN_LOOKBACK,
+    stop_pct: float | None = None,
 ) -> pl.DataFrame:
     """Пробой по замороженным правилам 5.3: канал 240, стоп 0.75 дня, цель 3R.
 
     Рублёвые рынки (`ROUBLE_MARKETS`) — без утренних входов: свеча входа не
     раньше 10:00. Остальные — во все сессии. `lookback` — только для выбора
-    канала (plan.md, 5.2).
+    канала (plan.md, 5.2), `stop_pct` — только для проверки 5.3.1.
     """
     entry_hours = NO_MORNING if market in ROUBLE_MARKETS else None
     return breakout_signals(
-        bars, lookback=lookback, stop_days=FROZEN_STOP_DAYS, entry_hours=entry_hours
+        bars,
+        lookback=lookback,
+        stop_days=FROZEN_STOP_DAYS,
+        entry_hours=entry_hours,
+        stop_pct=stop_pct,
     )
+
+
+VOLATILITY_RANK_DAYS = 365
+
+
+def volatility_rank(
+    bars: pl.DataFrame, days: int = VOLATILITY_RANK_DAYS
+) -> pl.DataFrame:
+    """Место σ каждой свечи среди значений рынка за прошлые `days` дней.
+
+    Значение дня — `bar_sigma` первой будничной свечи дня: она известна до
+    начала дня. `vol_rank` свечи — доля таких значений за дни
+    [дата − `days`, дата), которые меньше её σ: 0 — тише всего за год,
+    1 — бурнее всего. Сегодняшний день в сравнение не входит. Пока у ряда
+    нет `days` дней истории σ, места нет (null).
+
+    Пример: за прошлый год 250 дневных значений, 100 из них меньше σ свечи
+    сигнала — vol_rank = 0.4, середина «обычно».
+    """
+    ordered = _ordered(bars)
+    daily = (
+        ordered.filter(
+            (pl.col("timestamp").dt.weekday() < SATURDAY)
+            & pl.col("bar_sigma").is_not_null()
+        )
+        .group_by(pl.col("timestamp").dt.date().alias("date"), maintain_order=True)
+        .agg(pl.col("bar_sigma").first())
+    )
+    ranks = np.full(ordered.height, np.nan)
+    if daily.height:
+        day_dates = daily["date"].to_numpy()
+        day_values = daily["bar_sigma"].to_numpy()
+        first = day_dates[0]
+        window = np.timedelta64(days, "D")
+        bar_dates = ordered["timestamp"].dt.date().to_numpy()
+        bar_sigmas = ordered["bar_sigma"].fill_null(np.nan).to_numpy()
+        for day in np.unique(bar_dates):
+            if day - first < window:
+                continue
+            past = np.sort(day_values[(day_dates >= day - window) & (day_dates < day)])
+            rows = np.flatnonzero(bar_dates == day)
+            sigmas = bar_sigmas[rows]
+            known = ~np.isnan(sigmas)
+            ranks[rows[known]] = np.searchsorted(past, sigmas[known]) / len(past)
+    return ordered.with_columns(pl.Series("vol_rank", ranks).fill_nan(None))
 
 
 def reversion_signals(

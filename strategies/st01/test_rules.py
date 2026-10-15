@@ -16,6 +16,7 @@ from rules import (
     frozen_breakout_signals,
     long_trend,
     reversion_signals,
+    volatility_rank,
 )
 
 from backtest.markets import add_bar_sigma, add_session_marks, add_usual_volume
@@ -254,6 +255,97 @@ def test_frozen_rules_use_channel_of_240_bars():
     bars = bars_at_times(closes, times)
     assert frozen_breakout_signals("gold", bars).is_empty()
     assert not breakout_signals(bars, lookback=120).is_empty()
+
+
+# ------------------------------------------------ роль волатильности (5.3.1)
+
+
+def test_fixed_pct_stop_changes_only_the_stop():
+    bars = make_bars([100.0, 100.0, 100.0, 100.0, 101.0])
+    main = breakout_signals(bars, lookback=4)
+    fixed = breakout_signals(bars, lookback=4, stop_pct=0.02)
+    assert fixed["timestamp"].to_list() == main["timestamp"].to_list()
+    signal = at(fixed, 4)
+    assert signal["stop"] == pytest.approx(101.0 * 0.98)
+    assert signal["target"] == pytest.approx(101.0 + 3 * 101.0 * 0.02)
+
+
+def test_fixed_pct_stop_skips_bars_without_sigma_like_main_rule():
+    bars = make_bars(
+        [100.0, 100.0, 100.0, 100.0, 101.0],
+        bar_sigma=pl.Series([None] * 5, dtype=pl.Float64),
+    )
+    assert breakout_signals(bars, lookback=4, stop_pct=0.02).is_empty()
+
+
+def test_frozen_rules_pass_fixed_pct_stop():
+    last = datetime(2026, 9, 9, 15, 0)
+    times = [(last - timedelta(minutes=15 * (249 - i))).isoformat() for i in range(250)]
+    bars = bars_at_times([100.0] * 248 + [101.0, 101.0], times)
+    signal = frozen_breakout_signals("gold", bars, stop_pct=0.01).row(0, named=True)
+    assert signal["stop"] == pytest.approx(101.0 * 0.99)
+
+
+def rank_bars(days: int) -> pl.DataFrame:
+    """Две свечи в будний день: 10:00 — σ по кругу 1…10 (×0.001), 10:15 — 0.0055."""
+    first = datetime(2025, 1, 6)
+    timestamps, sigmas = [], []
+    for k in range(days):
+        day = first + timedelta(days=k)
+        if day.weekday() >= 5:
+            continue
+        timestamps += [day.replace(hour=10), day.replace(hour=10, minute=15)]
+        sigmas += [(k % 10 + 1) * 0.001, 0.0055]
+    return make_bars([100.0] * len(timestamps)).with_columns(
+        pl.Series("timestamp", timestamps), pl.Series("bar_sigma", sigmas)
+    )
+
+
+def test_volatility_rank_is_share_of_past_year_days_below():
+    bars = rank_bars(500)
+    ranked = volatility_rank(bars)
+    moment = datetime(2026, 3, 2, 10, 15)
+    # Сверка «вручную»: σ первых свечей дней за [дата − 365, дата).
+    day = moment.date()
+    past = bars.filter(
+        (pl.col("timestamp").dt.hour() == 10)
+        & (pl.col("timestamp").dt.minute() == 0)
+        & (pl.col("timestamp").dt.date() >= day - timedelta(days=365))
+        & (pl.col("timestamp").dt.date() < day)
+    )["bar_sigma"]
+    expected = (past < 0.0055).sum() / past.len()
+    rank = ranked.filter(pl.col("timestamp") == moment)["vol_rank"].item()
+    assert rank == pytest.approx(expected)
+    assert 0.4 < rank < 0.6
+
+
+def test_volatility_rank_does_not_count_the_day_itself():
+    bars = rank_bars(500).with_columns(
+        pl.when(pl.col("timestamp") == datetime(2026, 3, 2, 10))
+        .then(1.0)
+        .otherwise(pl.col("bar_sigma"))
+        .alias("bar_sigma")
+    )
+    ranked = volatility_rank(bars)
+    # Бурнее всего за год: если бы сам день входил в сравнение, было бы < 1.
+    rank = ranked.filter(pl.col("timestamp") == datetime(2026, 3, 2, 10))["vol_rank"]
+    assert rank.item() == 1.0
+
+
+def test_volatility_rank_needs_a_year_of_history():
+    ranked = volatility_rank(rank_bars(500))
+    first_year = ranked.filter(pl.col("timestamp") < datetime(2026, 1, 6))
+    assert first_year["vol_rank"].null_count() == first_year.height
+    later = ranked.filter(pl.col("timestamp") >= datetime(2026, 1, 6))
+    assert later["vol_rank"].null_count() == 0
+
+
+def test_volatility_rank_future_does_not_change_past():
+    full = volatility_rank(rank_bars(500))
+    cut = volatility_rank(rank_bars(430))
+    joined = cut.join(full, on="timestamp", suffix="_full")
+    assert joined.height == cut.height
+    assert joined["vol_rank"].to_list() == joined["vol_rank_full"].to_list()
 
 
 # ------------------------------------------------------------ возврат к средней
