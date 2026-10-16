@@ -10,7 +10,9 @@ import polars as pl
 import pytest
 
 from backtest.markets import (
+    EXAM_MARKETS,
     MARKETS,
+    PASSPORTS,
     Market,
     MarketParams,
     add_bar_sigma,
@@ -19,6 +21,7 @@ from backtest.markets import (
     add_session_marks,
     add_usual_volume,
     check_tick,
+    load_market,
     settled_bars,
     snapshot_params,
 )
@@ -274,6 +277,29 @@ def test_check_tick_accepts_grid_and_rejects_off_grid_price():
     check_tick(bars, 0.01, "brent")
     with pytest.raises(ValueError, match="вне шага"):
         check_tick(bars.with_columns(pl.lit(80.005).alias("close")), 0.01, "brent")
+
+
+def test_exam_markets_kept_apart_from_study_markets():
+    # Прогоны «по всем рынкам» идут по MARKETS — рынки экзамена туда не попадают.
+    assert not set(MARKETS) & set(EXAM_MARKETS)
+    assert PASSPORTS == MARKETS | EXAM_MARKETS
+
+
+def test_copper_point_value_matches_snapshot():
+    # Медь: 10 кг, $0.01 за пункт; при курсе 83 шаг цены 1 стоит 0.83 ₽.
+    snapshot = pl.DataFrame(
+        [
+            snapshot_row(date(2026, 9, 15), "CEZ6", 1000, 1.28, 0.83, "COPPER")
+            | {"min_step": 1.0}
+        ]
+    )
+    params = snapshot_params(EXAM_MARKETS["copper"], snapshot, RATES)
+    assert params.tick_size == pytest.approx(1.0)
+
+
+def test_load_market_rejects_unknown_name():
+    with pytest.raises(ValueError, match="Нет паспорта"):
+        load_market("cocoa")
 
 
 def test_market_rejects_unknown_currency():

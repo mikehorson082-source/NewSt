@@ -106,6 +106,22 @@ MARKETS = {
     "gold": Market("gold", "GOLD", "USD", 1.0, COMMODITY_FEE),
 }
 
+# Рынки экзамена (plan.md, 5.4): стратегия их не видела. Отдельно от
+# `MARKETS`, чтобы прогоны «по всем рынкам» их не трогали.
+# Si, Eu: 1000 долларов / евро, цена в ₽ за 1000 — 1 ₽ за пункт.
+# Серебро: 10 тройских унций, цена в $ — $10 за пункт.
+# Платина, палладий: 1 тройская унция, цена в $ — $1 за пункт.
+# Медь: 10 кг, цена в $ за тонну — $0.01 за пункт.
+EXAM_MARKETS = {
+    "si": Market("si", "Si", "RUB", 1.0, CURRENCY_FEE),
+    "euro": Market("euro", "Eu", "RUB", 1.0, CURRENCY_FEE),
+    "silver": Market("silver", "SILV", "USD", 10.0, COMMODITY_FEE),
+    "platinum": Market("platinum", "PLT", "USD", 1.0, COMMODITY_FEE),
+    "palladium": Market("palladium", "PLD", "USD", 1.0, COMMODITY_FEE),
+    "copper": Market("copper", "COPPER", "USD", 0.01, COMMODITY_FEE),
+}
+PASSPORTS = MARKETS | EXAM_MARKETS
+
 
 @dataclass(frozen=True)
 class MarketParams:
@@ -435,9 +451,9 @@ def load_market(name: str) -> tuple[MarketParams, pl.DataFrame]:
     У долларовых рынков ряд кончается последней свечой, которую биржа уже
     рассчитала (`settled_bars`).
     """
-    if name not in MARKETS:
-        raise ValueError(f"Нет паспорта рынка {name}. Есть: {', '.join(MARKETS)}")
-    market = MARKETS[name]
+    if name not in PASSPORTS:
+        raise ValueError(f"Нет паспорта рынка {name}. Есть: {', '.join(PASSPORTS)}")
+    market = PASSPORTS[name]
 
     clearing_rates = None
     if market.quote_currency == "USD":
