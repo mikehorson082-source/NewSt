@@ -60,13 +60,11 @@ def buy_and_hold(
 ) -> ClosedTrade:
     """Лонг с закрытия первой свечи до конца ряда, без стопа и цели.
 
-    Стоп и цель вынесены так далеко, что не срабатывают: выход — концом
-    данных. Если всё же сработали, это ошибка, а не результат.
+    Выход — концом данных; любой другой выход — ошибка, а не результат.
+    Стопа нет совсем, а не «стоп у нуля»: у газа аддитивная поправка уводит
+    adjusted-цены ниже нуля (−2.3 к октябрю 2025), и такой стоп срабатывал.
     """
-    close = float(bars["close"][0])
-    signal = Signal(
-        side=LONG, stop=close * 1e-9, target=close * 1e9, contracts=contracts
-    )
+    signal = Signal(side=LONG, stop=None, target=None, contracts=contracts)
     trade = simulate_position(spec, bars, 0, signal, minutes=minutes)
     if trade.exit_reason != "end":
         raise AssertionError(f"«Купил и держи» закрылся по {trade.exit_reason}")

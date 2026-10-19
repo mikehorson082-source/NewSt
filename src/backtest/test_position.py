@@ -426,6 +426,8 @@ def test_future_bars_do_not_change_trade_closed_by_trailing_stop():
         {"breakeven_r": 0.0},
         {"trail": -1.0},
         {"target": 0.0},
+        # Безубыток считается от стопа: без стопа его нет.
+        {"stop": None, "breakeven_r": 1.0},
     ],
 )
 def test_bad_moving_stop_settings_rejected(kwargs):

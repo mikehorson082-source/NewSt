@@ -1,4 +1,5 @@
-"""Портфель st01: на всех рынках одновременно открыта максимум одна позиция.
+"""Портфель st01: `run_portfolio` — одна позиция на все рынки (шаги 3–5.4),
+`run_multi_portfolio` — по позиции на каждом рынке (plan.md, 5.5).
 
 Портфель сам цены не двигает: размер считает `size_position`, сделку
 проводит `simulate_position`. Он решает, какой сигнал исполнить, и пишет
@@ -23,12 +24,23 @@
 
 Новый вход не пересекается с прошлым выходом: сигнал считается по закрытию
 свечи выхода, а вход — по открытию следующей.
+
+Портфель с несколькими позициями (`run_multi_portfolio`) ничего не выбирает:
+- на каждом рынке — не больше одной позиции, рынки торгуются независимо;
+- риск сделки — своя доля капитала у каждого рынка (`MultiRules.risk_fractions`);
+- сумма ГО открытых позиций и новой — не больше предела. Не хватает — новая
+  позиция уменьшается до остатка; одновременные сигналы уменьшаются в одной
+  и той же доле. Пример: свободно 30% капитала, три новые позиции хотят по
+  15% — каждая уменьшается до двух третей, вместе 30%.
+- размер — от капитала на момент сигнала: стартовый + сделки, закрытые к
+  закрытию сигнальной свечи. ГО открытой позиции — на её входе.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass, replace
+import math
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 
@@ -37,7 +49,7 @@ import polars as pl
 from backtest.markets import MARKETS, load_market
 from backtest.minutes import RawMinutes
 from backtest.position import HOLD_ANY, ClosedTrade, Signal, simulate_position
-from backtest.sizing import PositionSize, SizingRules, size_position
+from backtest.sizing import FLOOR_TOLERANCE, PositionSize, SizingRules, size_position
 from backtest.specs import ContractSpec
 
 TAKEN = "taken"  # исполнен
@@ -46,6 +58,8 @@ LOST_TIE = "lost_tie"  # на той же свече исполнен сигна
 ZERO_SIZE = "zero_size"  # 0 контрактов, причина в столбце limit
 NO_NEXT_BAR = "no_next_bar"  # сигнал на последней свече ряда: входить не на чем
 NO_CAPITAL = "no_capital"  # капитал кончился, торговля остановлена
+# Лимит размера в портфеле с несколькими позициями: не хватило ГО на все позиции.
+PORTFOLIO_MARGIN = "portfolio_margin"
 
 REQUIRED_SIGNAL_COLUMNS = {"market", "timestamp", "side", "stop", "target"}
 
@@ -112,9 +126,9 @@ class PortfolioResult:
 
     @property
     def final_capital(self) -> float:
-        if not self.trades:
-            return self.initial_capital
-        return self.trades[-1].capital_after
+        # Сумма всех сделок: при нескольких позициях последняя по номеру
+        # сделка не обязательно закрылась последней.
+        return self.initial_capital + sum(item.trade.net_pnl for item in self.trades)
 
     def trade_log(self) -> pl.DataFrame:
         """Сделки одной таблицей: по строке на сделку."""
@@ -158,6 +172,36 @@ class PortfolioResult:
                 }
             )
         return pl.DataFrame(rows, infer_schema_length=None)
+
+
+@dataclass(frozen=True)
+class MultiRules:
+    """Правила портфеля с несколькими позициями (plan.md, 5.5).
+
+    `risk_fractions` — доля капитала риска на сделку по рынку: рублёвые пары
+    — группа с риском 2%, по 0.67% на пару; газ — 1%. `max_margin_fraction`
+    — предел суммы ГО всех открытых позиций.
+    """
+
+    risk_fractions: Mapping[str, float] = field(default_factory=dict)
+    max_margin_fraction: float = 0.5
+    max_volume_share: float | None = 0.1
+
+    def __post_init__(self) -> None:
+        for name, fraction in self.risk_fractions.items():
+            if not 0.0 < fraction < 1.0:
+                raise ValueError(f"{name}: доля риска должна быть в (0, 1)")
+        if not 0.0 < self.max_margin_fraction <= 1.0:
+            raise ValueError("Доля ГО должна быть в (0, 1]")
+
+    def sizing(self, market: str) -> SizingRules:
+        if market not in self.risk_fractions:
+            raise ValueError(f"{market}: не задана доля риска")
+        return SizingRules(
+            risk_fraction=self.risk_fractions[market],
+            max_margin_fraction=self.max_margin_fraction,
+            max_volume_share=self.max_volume_share,
+        )
 
 
 @dataclass
@@ -220,6 +264,29 @@ def _prepare_signals(
     )
 
 
+def _by_timestamp(log: pl.DataFrame) -> list[list[tuple[int, dict[str, Any]]]]:
+    """Сигналы, сгруппированные по свече: (номер в журнале, строка)."""
+    groups: list[list[tuple[int, dict[str, Any]]]] = []
+    for i, row in enumerate(log.iter_rows(named=True)):
+        if groups and groups[-1][0][1]["timestamp"] == row["timestamp"]:
+            groups[-1].append((i, row))
+        else:
+            groups.append([(i, row)])
+    return groups
+
+
+def _signal(row: dict[str, Any]) -> Signal:
+    return Signal(
+        side=row["side"],
+        stop=row["stop"],
+        target=row["target"],
+        max_bars=row["max_bars"],
+        hold=row["hold"] or HOLD_ANY,
+        breakeven_r=row["breakeven_r"],
+        trail=row["trail"],
+    )
+
+
 def _volume(bars: pl.DataFrame, bar: int) -> int | None:
     if "volume" not in bars.columns:
         return None
@@ -259,15 +326,7 @@ def run_portfolio(
     current = capital
     free_from: datetime | None = None  # свеча, с которой принимаются сигналы
 
-    rows = log.iter_rows(named=True)
-    groups: list[list[tuple[int, dict[str, Any]]]] = []
-    for i, row in enumerate(rows):
-        if groups and groups[-1][0][1]["timestamp"] == row["timestamp"]:
-            groups[-1].append((i, row))
-        else:
-            groups.append([(i, row)])
-
-    for group in groups:
+    for group in _by_timestamp(log):
         timestamp = group[0][1]["timestamp"]
         if current <= 0:
             for i, _ in group:
@@ -289,15 +348,7 @@ def run_portfolio(
             if bar == data.bars.height - 1:
                 status[i] = NO_NEXT_BAR
                 continue
-            signal = Signal(
-                side=row["side"],
-                stop=row["stop"],
-                target=row["target"],
-                max_bars=row["max_bars"],
-                hold=row["hold"] or HOLD_ANY,
-                breakeven_r=row["breakeven_r"],
-                trail=row["trail"],
-            )
+            signal = _signal(row)
             size = size_position(data.spec, data.bars, bar, signal, current, rules)
             contracts[i] = size.contracts
             limits[i] = size.limit
@@ -340,6 +391,116 @@ def run_portfolio(
         )
         current += trade.net_pnl
         free_from = trade.exit_time
+
+    log = log.with_columns(
+        pl.Series("status", status, dtype=pl.String),
+        pl.Series("contracts", contracts, dtype=pl.Int64),
+        pl.Series("limit", limits, dtype=pl.String),
+        pl.Series("cost_share", cost_shares, dtype=pl.Float64),
+        pl.Series("trade_id", trade_ids, dtype=pl.Int64),
+    )
+    return PortfolioResult(trades=trades, signals=log, initial_capital=capital)
+
+
+def run_multi_portfolio(
+    signals: pl.DataFrame,
+    markets: dict[str, MarketData],
+    capital: float,
+    rules: MultiRules,
+) -> PortfolioResult:
+    """Сигналы всех рынков через портфель с позицией на каждом рынке (5.5).
+
+    `signals` — как у `run_portfolio`. Статусы в журнале: `taken`, `busy`
+    (на этом рынке открыта позиция, trade_id — её номер), `zero_size`
+    (0 контрактов, причина в limit; `portfolio_margin` — не хватило ГО
+    портфеля), `no_next_bar`, `no_capital`.
+    """
+    if not capital > 0:
+        raise ValueError("Стартовый капитал должен быть > 0")
+    log = _prepare_signals(signals, markets)
+    indexes = {name: _bar_index(name, data.bars) for name, data in markets.items()}
+
+    n = log.height
+    status: list[str | None] = [None] * n
+    contracts: list[int | None] = [None] * n
+    limits: list[str | None] = [None] * n
+    cost_shares: list[float | None] = [None] * n
+    trade_ids: list[int | None] = [None] * n
+
+    trades: list[PortfolioTrade] = []
+    open_trades: dict[str, int] = {}  # рынок → номер открытой сделки
+    realized = capital  # стартовый + закрытые сделки
+
+    for group in _by_timestamp(log):
+        timestamp = group[0][1]["timestamp"]
+        # Сделки, закрытые внутри сигнальной свечи или по её закрытию.
+        for name, trade_id in list(open_trades.items()):
+            if trades[trade_id].trade.exit_time <= timestamp:
+                realized += trades[trade_id].trade.net_pnl
+                del open_trades[name]
+        if realized <= 0:
+            for i, _ in group:
+                status[i] = NO_CAPITAL
+            continue
+
+        candidates: list[_Candidate] = []
+        for i, row in group:
+            name = row["market"]
+            if name in open_trades:
+                status[i] = BUSY
+                trade_ids[i] = open_trades[name]
+                continue
+            data = markets[name]
+            bar = indexes[name].get(timestamp)
+            if bar is None:
+                raise ValueError(f"{name}: нет свечи сигнала {timestamp}")
+            if bar == data.bars.height - 1:
+                status[i] = NO_NEXT_BAR
+                continue
+            signal = _signal(row)
+            size = size_position(
+                data.spec, data.bars, bar, signal, realized, rules.sizing(name)
+            )
+            candidates.append(_Candidate(i, name, bar, signal, size))
+
+        # ГО: открытые позиции — по ГО на их входе; новые уменьшаются в одной доле.
+        free = rules.max_margin_fraction * realized - sum(
+            trades[trade_id].size.margin for trade_id in open_trades.values()
+        )
+        need = sum(c.size.margin for c in candidates if not c.size.skipped)
+        if need > free:
+            share = max(free, 0.0) / need
+            for c in candidates:
+                reduced = math.floor(c.size.contracts * share + FLOOR_TOLERANCE)
+                if reduced < c.size.contracts:
+                    c.size = replace(c.size, contracts=reduced, limit=PORTFOLIO_MARGIN)
+
+        for c in candidates:
+            contracts[c.row] = c.size.contracts
+            limits[c.row] = c.size.limit
+            cost_shares[c.row] = c.size.cost_share
+            if c.size.skipped:
+                status[c.row] = ZERO_SIZE
+                continue
+            data = markets[c.market]
+            trade = simulate_position(
+                data.spec,
+                data.bars,
+                c.bar,
+                replace(c.signal, contracts=c.size.contracts),
+                minutes=data.minutes,
+            )
+            status[c.row] = TAKEN
+            trade_ids[c.row] = len(trades)
+            open_trades[c.market] = len(trades)
+            trades.append(
+                PortfolioTrade(
+                    trade=trade,
+                    size=c.size,
+                    capital_before=realized,
+                    entry_volume=_volume(data.bars, c.bar + 1),
+                )
+            )
 
     log = log.with_columns(
         pl.Series("status", status, dtype=pl.String),

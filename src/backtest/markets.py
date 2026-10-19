@@ -57,6 +57,7 @@ SINGLE_SESSION_START = date(2026, 3, 23)
 CURRENCY_FEE = 0.0000462
 INDEX_FEE = 0.0000660
 COMMODITY_FEE = 0.0001320
+STOCK_FEE = 0.0001980
 
 # Допуск сверки стоимости шага со снимком биржи.
 POINT_VALUE_TOLERANCE = 0.005
@@ -120,7 +121,27 @@ EXAM_MARKETS = {
     "palladium": Market("palladium", "PLD", "USD", 1.0, COMMODITY_FEE),
     "copper": Market("copper", "COPPER", "USD", 0.01, COMMODITY_FEE),
 }
-PASSPORTS = MARKETS | EXAM_MARKETS
+
+# Остальные рынки (plan.md, 5.4б): стратегия их тоже не видела.
+# RTS: цена в пунктах индекса, $0.02 за пункт.
+# Акции (SBRF, GAZR, LKOH, YDEX): цена в ₽ за лот — 1 ₽ за пункт.
+# SPYF: цена в $, $1 за пункт. NASD: $0.01 за пункт.
+# ED (EUR/USD): 1000 евро, цена в $ за евро — $1000 за пункт.
+# NG: 100 MMBtu, цена в $ — $100 за пункт.
+# COCOA: в снимке ГО шаг 0.1 стоит ровно 1 ₽ — 10 ₽ за пункт.
+SCREEN_MARKETS = {
+    "rts": Market("rts", "RTS", "USD", 0.02, INDEX_FEE),
+    "sber": Market("sber", "SBRF", "RUB", 1.0, STOCK_FEE),
+    "gazp": Market("gazp", "GAZR", "RUB", 1.0, STOCK_FEE),
+    "lkoh": Market("lkoh", "LKOH", "RUB", 1.0, STOCK_FEE),
+    "yandex": Market("yandex", "YDEX", "RUB", 1.0, STOCK_FEE),
+    "spy": Market("spy", "SPYF", "USD", 1.0, INDEX_FEE),
+    "nasdaq": Market("nasdaq", "NASD", "USD", 0.01, INDEX_FEE),
+    "eurusd": Market("eurusd", "ED", "USD", 1000.0, CURRENCY_FEE),
+    "ng": Market("ng", "NG", "USD", 100.0, COMMODITY_FEE),
+    "cocoa": Market("cocoa", "COCOA", "RUB", 10.0, COMMODITY_FEE),
+}
+PASSPORTS = MARKETS | EXAM_MARKETS | SCREEN_MARKETS
 
 
 @dataclass(frozen=True)

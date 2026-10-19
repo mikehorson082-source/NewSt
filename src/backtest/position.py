@@ -111,7 +111,10 @@ class Signal:
     """Намерение открыть позицию по закрытию текущего бара."""
 
     side: int
-    stop: float
+    # None — без стопа: только «купил и держи» (`baseline.py`). У газа
+    # аддитивная поправка уводит adjusted-цены ниже нуля, и даже стоп у нуля
+    # срабатывал бы.
+    stop: float | None
     target: float | None  # None — без цели
     contracts: int = 1
     max_bars: int | None = None
@@ -124,10 +127,14 @@ class Signal:
     def __post_init__(self) -> None:
         if self.side not in (LONG, SHORT):
             raise ValueError("Сторона сигнала должна быть +1 или -1")
-        if self.stop <= 0 or (self.target is not None and self.target <= 0):
+        if (self.stop is not None and self.stop <= 0) or (
+            self.target is not None and self.target <= 0
+        ):
             raise ValueError("Стоп и цель должны быть > 0")
         if self.breakeven_r is not None and not self.breakeven_r > 0:
             raise ValueError("Порог безубытка breakeven_r должен быть > 0")
+        if self.breakeven_r is not None and self.stop is None:
+            raise ValueError("Безубыток считается от стопа: без стопа его нет")
         if self.trail is not None and not self.trail > 0:
             raise ValueError("Расстояние скользящего стопа trail должно быть > 0")
         if self.contracts < 1:
@@ -213,13 +220,14 @@ def _point_value(row: dict[str, Any]) -> float:
 
 
 def _validate_levels(signal: Signal, close_signal: float) -> None:
-    # Без цели проверяется только стоп: цель «бесконечно далеко».
+    # Без цели или без стопа уровень «бесконечно далеко».
     target = signal.target
     if target is None:
         target = signal.side * math.inf
-    if signal.side == LONG and not signal.stop < close_signal < target:
+    stop = -signal.side * math.inf if signal.stop is None else signal.stop
+    if signal.side == LONG and not stop < close_signal < target:
         raise ValueError("Для лонга требуется stop < close сигнала < target")
-    if signal.side == SHORT and not target < close_signal < signal.stop:
+    if signal.side == SHORT and not target < close_signal < stop:
         raise ValueError("Для шорта требуется target < close сигнала < stop")
 
 
@@ -417,12 +425,14 @@ def simulate_position(
     adjustment_signal = float(signal_row["price_adjustment"])
     side = signal.side
     quantity = signal.contracts
-    stop_adj = signal.stop + adjustment_signal
+    stop_adj = (
+        -side * math.inf if signal.stop is None else signal.stop + adjustment_signal
+    )
     target_adj = (
         side * math.inf if signal.target is None else signal.target + adjustment_signal
     )
     # Расстояние до начального стопа — 1R в ценах, для порога безубытка.
-    distance = side * (close_signal - signal.stop)
+    distance = None if signal.stop is None else side * (close_signal - signal.stop)
     stop_moved = False
     best_close_adj: float | None = None
     entry_open_adj = 0.0

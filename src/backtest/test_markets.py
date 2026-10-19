@@ -13,6 +13,7 @@ from backtest.markets import (
     EXAM_MARKETS,
     MARKETS,
     PASSPORTS,
+    SCREEN_MARKETS,
     Market,
     MarketParams,
     add_bar_sigma,
@@ -280,9 +281,12 @@ def test_check_tick_accepts_grid_and_rejects_off_grid_price():
 
 
 def test_exam_markets_kept_apart_from_study_markets():
-    # Прогоны «по всем рынкам» идут по MARKETS — рынки экзамена туда не попадают.
+    # Прогоны «по всем рынкам» идут по MARKETS — рынки экзамена (5.4 и 5.4б)
+    # туда не попадают.
     assert not set(MARKETS) & set(EXAM_MARKETS)
-    assert PASSPORTS == MARKETS | EXAM_MARKETS
+    assert not set(MARKETS) & set(SCREEN_MARKETS)
+    assert not set(EXAM_MARKETS) & set(SCREEN_MARKETS)
+    assert PASSPORTS == MARKETS | EXAM_MARKETS | SCREEN_MARKETS
 
 
 def test_copper_point_value_matches_snapshot():
@@ -299,7 +303,7 @@ def test_copper_point_value_matches_snapshot():
 
 def test_load_market_rejects_unknown_name():
     with pytest.raises(ValueError, match="Нет паспорта"):
-        load_market("cocoa")
+        load_market("btc")
 
 
 def test_market_rejects_unknown_currency():

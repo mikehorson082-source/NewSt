@@ -158,6 +158,8 @@ def size_position(
     close = float(row["close"])
     point_value = _positive(row, "point_value_known")
     margin_rate = _positive(row, "margin_rate")
+    if signal.stop is None:
+        raise ValueError("Размер считается от риска до стопа: нужен стоп")
     distance = signal.side * (close - signal.stop)
     if distance <= 0:
         raise ValueError("Стоп должен быть с убыточной стороны от закрытия сигнала")

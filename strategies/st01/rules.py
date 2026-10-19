@@ -70,7 +70,10 @@ BREAKOUT_REWARD = 3.0  # цель в расстояниях до стопа
 # не раньше 10:00 — утренние входы им вредят.
 FROZEN_LOOKBACK = 240
 FROZEN_STOP_DAYS = 0.75
-ROUBLE_MARKETS = frozenset({"cnyrub", "mix", "si", "euro"})
+# Российские акции и RTS (5.4б) — как MIX, задано до запуска 19.10.2026.
+ROUBLE_MARKETS = frozenset(
+    {"cnyrub", "mix", "si", "euro", "rts", "sber", "gazp", "lkoh", "yandex"}
+)
 NO_MORNING = (time(10), None)
 
 REVERSION_LOOKBACK = 60  # свечей в средней, около торгового дня

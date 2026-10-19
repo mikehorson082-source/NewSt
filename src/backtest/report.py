@@ -82,7 +82,7 @@ PERCENT = {
 
 @dataclass(frozen=True)
 class Report:
-    # timestamp, equity, in_position — на закрытии каждой свечи расписания.
+    # timestamp, equity, in_position, positions — на закрытии каждой свечи расписания.
     curve: pl.DataFrame
     # date, equity, return — капитал на конец дня и доходность дня.
     daily: pl.DataFrame
@@ -105,21 +105,26 @@ def equity_curve(result: PortfolioResult, timeline: pl.Series) -> pl.DataFrame:
     """Капитал на закрытии каждой свечи расписания.
 
     Метка свечи — её начало, как в рядах; капитал — на её закрытии. Свечи
-    других рынков внутри сделки берут последнюю оценку сделки.
+    других рынков внутри сделки берут последнюю оценку сделки. Капитал —
+    стартовый плюс приращения путей всех сделок: так кривая верна и при
+    нескольких открытых позициях (plan.md, 5.5). `positions` — сколько
+    позиций открыто на свече.
     """
     frame = pl.DataFrame({"timestamp": timeline}).sort("timestamp")
-    points = [
-        (timestamp, item.capital_before + value)
-        for item in result.trades
-        for timestamp, value in item.trade.path
-    ]
-    if not points:
+    steps = []
+    for item in result.trades:
+        previous = 0.0
+        for timestamp, value in item.trade.path:
+            steps.append((timestamp, value - previous))
+            previous = value
+    if not steps:
         return frame.with_columns(
             pl.lit(result.initial_capital).alias("equity"),
             pl.lit(False).alias("in_position"),
+            pl.lit(0, dtype=pl.Int64).alias("positions"),
         )
     marks = pl.DataFrame(
-        points, schema=["timestamp", "equity"], orient="row"
+        steps, schema=["timestamp", "step"], orient="row"
     ).with_columns(pl.col("timestamp").cast(frame["timestamp"].dtype))
     missing = marks.join(frame, on="timestamp", how="anti")
     if not missing.is_empty():
@@ -127,25 +132,34 @@ def equity_curve(result: PortfolioResult, timeline: pl.Series) -> pl.DataFrame:
             f"{missing.height} свечей сделок нет в расписании "
             f"(первая {missing['timestamp'][0]})"
         )
-    spans = pl.DataFrame(
-        {
-            "timestamp": [item.trade.entry_time for item in result.trades],
-            "_exit": [item.trade.exit_time for item in result.trades],
-        }
-    ).with_columns(
-        pl.col("timestamp").cast(frame["timestamp"].dtype),
-        pl.col("_exit").cast(frame["timestamp"].dtype),
+    marks = (
+        marks.group_by("timestamp")
+        .agg(pl.col("step").sum())
+        .sort("timestamp")
+        .select(
+            "timestamp",
+            (result.initial_capital + pl.col("step").cum_sum()).alias("equity"),
+        )
+    )
+    # Сделка открыта на свечах от входа до выхода включительно.
+    times = frame["timestamp"].to_numpy()
+    entries = np.sort(
+        np.array([item.trade.entry_time for item in result.trades], dtype=times.dtype)
+    )
+    exits = np.sort(
+        np.array([item.trade.exit_time for item in result.trades], dtype=times.dtype)
+    )
+    positions = np.searchsorted(entries, times, side="right") - np.searchsorted(
+        exits, times, side="left"
     )
     return (
         frame.join_asof(marks, on="timestamp", strategy="backward")
-        .join_asof(spans, on="timestamp", strategy="backward")
         .with_columns(
             pl.col("equity").fill_null(result.initial_capital),
-            (
-                pl.col("_exit").is_not_null() & (pl.col("timestamp") <= pl.col("_exit"))
-            ).alias("in_position"),
+            pl.Series("positions", positions, dtype=pl.Int64),
         )
-        .drop("_exit")
+        .with_columns((pl.col("positions") > 0).alias("in_position"))
+        .select("timestamp", "equity", "in_position", "positions")
     )
 
 

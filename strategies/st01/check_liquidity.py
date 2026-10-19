@@ -1,4 +1,4 @@
-"""Ликвидность рынков экзамена до экзамена (plan.md, 5.4).
+"""Ликвидность рынков экзамена до экзамена (plan.md, 5.4 и 5.4б).
 
 Результатов стратегии здесь нет: ни сделок, ни прибыли. Только объёмы и
 размер позиции по сигналам замороженных правил 5.3.
@@ -20,6 +20,7 @@
 
 Ничего не записывает.
 Запуск: uv run python strategies/st01/check_liquidity.py [--before 2026-01-01]
+Остальные рынки (5.4б, `markets.SCREEN_MARKETS`): добавить `--screen`.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ import polars as pl
 from rules import frozen_breakout_signals
 from run_baseline import CAPITAL, cut
 
-from backtest.markets import EXAM_MARKETS, MARKETS
+from backtest.markets import EXAM_MARKETS, MARKETS, SCREEN_MARKETS
 from backtest.portfolio import MarketData, load_markets
 from backtest.position import HOLD_ANY, Signal
 from backtest.sizing import VOLUME, size_position
@@ -88,7 +89,7 @@ def daily_turnover(data: MarketData) -> float:
     )
 
 
-def market_row(name: str, data: MarketData) -> dict[str, object]:
+def market_row(name: str, data: MarketData, candidates: dict) -> dict[str, object]:
     sizes = signal_sizes(name, data)
     by_volume = sizes.filter(pl.col("limit") == VOLUME)
     no_volume = by_volume.filter(pl.col("contracts") == 0).height
@@ -96,7 +97,7 @@ def market_row(name: str, data: MarketData) -> dict[str, object]:
         (pl.col("contracts") > 0) & (pl.col("contracts") < pl.col("without_volume"))
     ).height
     share = no_volume / sizes.height if sizes.height else None
-    exam = name in EXAM_MARKETS
+    exam = name in candidates
     if not exam:
         verdict = "рынок подбора"
     elif share is None:
@@ -129,6 +130,11 @@ def parse_args() -> argparse.Namespace:
         default=EXAM_BEFORE,
         help="Данные только до этой даты, YYYY-MM-DD (по умолчанию 2026-01-01).",
     )
+    parser.add_argument(
+        "--screen",
+        action="store_true",
+        help="Остальные рынки (plan.md, 5.4б) вместо рынков экзамена 5.4.",
+    )
     return parser.parse_args()
 
 
@@ -140,9 +146,10 @@ def main() -> None:
     pl.Config.set_tbl_hide_column_data_types(True)
     pl.Config.set_tbl_hide_dataframe_shape(True)
 
-    names = [*EXAM_MARKETS, *MARKETS]
+    candidates = SCREEN_MARKETS if args.screen else EXAM_MARKETS
+    names = [*candidates, *MARKETS]
     markets = cut(load_markets(names), args.before)
-    rows = [market_row(name, data) for name, data in markets.items()]
+    rows = [market_row(name, data, candidates) for name, data in markets.items()]
     print(
         f"\nЛиквидность до {args.before:%d.%m.%Y}. На экзамен — без объёма "
         f"не больше {MAX_NO_VOLUME_SHARE:.0%} сигналов."

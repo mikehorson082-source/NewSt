@@ -12,6 +12,12 @@
 Экзамен 5.4 (рынки, которых стратегия не видела; нужны паспорта в markets.py):
   uv run python strategies/st01/run_final.py --exam si euro --before 2026-01-01
   → strategies/st01/reports/exam_<рынок>.png
+Остальные рынки (5.4б, паспорта в markets.SCREEN_MARKETS; `--before` обязателен):
+  uv run python strategies/st01/run_final.py --screen rts sber --before 2026-01-01
+  → strategies/st01/reports/screen_<рынок>.png
+  Рынок прошёл: expectancy после издержек > 0 и в бутстрапе не больше 0.5%
+  историй ≤ 0 (строгий порог: рынков много). Отдельно — сколько прошло
+  обычный порог 5%.
 `--before` обрезает данные: сигналы, сделки, кривая, «купил и держи» и
 бутстрап — только до этой даты. Так 2026 год остаётся нетронутым.
 Экзамен запускается один раз, без правок после него. Файлы прошлых запусков
@@ -25,7 +31,7 @@ from dataclasses import replace
 from datetime import date
 
 import polars as pl
-from check_breakout import bootstrap_row, daily_correlation, trades_by
+from check_breakout import bootstrap_expectancy, daily_correlation, trades_by
 from rules import frozen_breakout_signals
 from run_baseline import CAPITAL, cut, metrics_table
 from tune_breakout import REPORTS, free_path
@@ -37,6 +43,10 @@ from backtest.report import Report, build_report, format_value, market_timeline
 
 TUNING_MARKETS = ("cnyrub", "mix", "brent", "gold")
 STRESS_SLIPPAGE_TICKS = 2.0
+# Порог бутстрапа (доля историй ≤ 0): обычный — для одного рынка, строгий —
+# для 5.4б, где рынков 10: 5% ÷ 10 (plan.md, 5.4б).
+USUAL_THRESHOLD = 0.05
+STRICT_THRESHOLD = 0.005
 
 
 def solo(name: str, data: MarketData) -> Report:
@@ -47,7 +57,13 @@ def solo(name: str, data: MarketData) -> Report:
     return build_report(result, market_timeline([data.bars]))
 
 
-def market_report(name: str, data: MarketData, prefix: str) -> dict[str, object]:
+def passed(summary: dict, not_positive: float, threshold: float) -> bool:
+    return (summary["expectancy_r"] or 0) > 0 and not_positive <= threshold
+
+
+def market_report(
+    name: str, data: MarketData, prefix: str, screen: bool = False
+) -> dict[str, object]:
     report = solo(name, data)
     stressed = solo(
         name,
@@ -57,7 +73,7 @@ def market_report(name: str, data: MarketData, prefix: str) -> dict[str, object]
         buy_and_hold_result(data.spec, data.bars, CAPITAL),
         market_timeline([data.bars]),
     )
-    boot = bootstrap_row(name, report.trades)
+    boot = bootstrap_expectancy(report.trades)
     s = report.summary
 
     print(f"\n{'=' * 78}\n{name}\n{'=' * 78}")
@@ -83,7 +99,7 @@ def market_report(name: str, data: MarketData, prefix: str) -> dict[str, object]
     path = save_report_chart(report, free_path(REPORTS / f"{prefix}_{name}.png"), title)
     print(f"График: {path}")
 
-    return {
+    row = {
         "рынок": name,
         "сделок": s["trades"],
         "expectancy, R": format_value("expectancy_r", s["expectancy_r"]),
@@ -91,9 +107,15 @@ def market_report(name: str, data: MarketData, prefix: str) -> dict[str, object]
         "Sharpe": format_value("sharpe", s["sharpe"]),
         "±": format_value("sharpe_se", s["sharpe_se"]),
         "Max DD": format_value("max_drawdown", s["max_drawdown"]),
-        "бутстрап: историй ≤ 0, %": boot["доля историй ≤ 0, %"],
+        "бутстрап: историй ≤ 0, %": round(boot["not_positive"] * 100, 2),
         "Sharpe «держать»": format_value("sharpe", holding.summary["sharpe"]),
     }
+    if screen:
+        for label, threshold in (("5%", USUAL_THRESHOLD), ("0.5%", STRICT_THRESHOLD)):
+            row[f"порог {label}"] = (
+                "прошёл" if passed(s, boot["not_positive"], threshold) else "нет"
+            )
+    return row
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,11 +127,22 @@ def parse_args() -> argparse.Namespace:
         help="Экзамен на рынках, которых стратегия не видела (exam_<рынок>.png).",
     )
     parser.add_argument(
+        "--screen",
+        nargs="+",
+        metavar="РЫНОК",
+        help="Остальные рынки, plan.md 5.4б (screen_<рынок>.png), нужен --before.",
+    )
+    parser.add_argument(
         "--before",
         type=date.fromisoformat,
         help="Данные только до этой даты, YYYY-MM-DD. По умолчанию вся история.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.exam and args.screen:
+        parser.error("--exam и --screen — разные проверки, запускайте по отдельности")
+    if args.screen and args.before is None:
+        parser.error("--screen только с --before: 2026 год этих рынков закрыт")
+    return args
 
 
 def main() -> None:
@@ -120,13 +153,24 @@ def main() -> None:
     pl.Config.set_tbl_hide_column_data_types(True)
     pl.Config.set_tbl_hide_dataframe_shape(True)
 
-    names = args.exam or list(TUNING_MARKETS)
-    prefix = "exam" if args.exam else "final"
+    names = args.screen or args.exam or list(TUNING_MARKETS)
+    prefix = "screen" if args.screen else "exam" if args.exam else "final"
+    screen = bool(args.screen)
     markets = cut(load_markets(names), args.before)
     period = "вся история" if args.before is None else f"до {args.before:%d.%m.%Y}"
-    rows = [market_report(name, data, prefix) for name, data in markets.items()]
+    rows = [market_report(name, data, prefix, screen) for name, data in markets.items()]
     print(f"\n{'=' * 78}\nСводка ({prefix}, {period}):")
     print(pl.DataFrame(rows))
+    if screen:
+        strict = [r["рынок"] for r in rows if r["порог 0.5%"] == "прошёл"]
+        usual = sum(r["порог 5%"] == "прошёл" for r in rows)
+        print(
+            f"\nСтрогий порог {STRICT_THRESHOLD:.1%}: прошли "
+            f"{', '.join(strict) if strict else 'ни один рынок'}."
+            f"\nОбычный порог {USUAL_THRESHOLD:.0%}: прошли {usual} из {len(rows)}. "
+            f"Если пробой нигде не работает, случайно ждём около "
+            f"{len(rows) * USUAL_THRESHOLD:.1f}."
+        )
 
 
 if __name__ == "__main__":

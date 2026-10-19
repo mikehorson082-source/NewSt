@@ -129,3 +129,34 @@ def test_buy_and_hold_result_fills_capital_and_feeds_report():
     assert s["net_pnl"] == pytest.approx(item.trade.net_pnl)
     # В позиции все свечи, кроме сигнальной.
     assert s["exposure"] == pytest.approx((bars.height - 1) / bars.height)
+
+
+def test_buy_and_hold_survives_adjusted_prices_below_zero():
+    # Как у газа: цена падает, новый контракт дороже старого. Поправка уводит
+    # adjusted-цены ниже нуля, реальные остаются выше. Стоп «у нуля» сработал
+    # бы здесь, стопа нет — выход концом данных.
+    rows = []
+    for k in range(20):
+        real = 10.0 - 0.2 * k if k < 10 else 17.2 - 1.5 * (k - 10)
+        adjustment = 0.0 if k < 10 else -9.0
+        rows.append(
+            {
+                "timestamp": START + timedelta(minutes=15 * k),
+                "contract": "A" if k < 10 else "B",
+                "open": real,
+                "high": real + 0.1,
+                "low": real - 0.1,
+                "close": real,
+                "close_adjusted": real + adjustment,
+                "price_adjustment": adjustment,
+                "is_first_bar_after_roll": k == 10,
+                "point_value": 1.0,
+            }
+        )
+    bars = pl.DataFrame(rows)
+    assert (bars["close"] + bars["price_adjustment"]).min() < 0 < bars["low"].min()
+    trade = buy_and_hold(free_spec(SPEC), bars, contracts=2)
+    assert trade.exit_reason == "end"
+    # Вход по открытию второй свечи (9.8), выход по последнему adjusted
+    # закрытию (3.7 − 9 = −5.3): (−5.3 − 9.8) × 2 контракта.
+    assert trade.net_pnl == pytest.approx((-5.3 - 9.8) * 2)
