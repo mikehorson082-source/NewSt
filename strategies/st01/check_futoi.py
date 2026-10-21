@@ -70,6 +70,7 @@ FUTOI_DIR = PROJECT_ROOT / "data" / "raw" / "futoi" / "5min"
 FUTOI_TICKERS = {"cnyrub": "CR", "si": "Si", "euro": "Eu", "gold": "GD"}
 PUBLISH_DELAY = timedelta(minutes=1)  # запись 10:10 выложена в 10:10:09
 STALE_AFTER = timedelta(days=4)  # дольше выходных; после конца FUTOI — пусто
+DAY = timedelta(days=1)
 WEEK = timedelta(days=7)
 YEAR = timedelta(days=365)
 FREE_LAG = timedelta(days=14)  # бесплатный тариф: 10 торговых дней
@@ -89,13 +90,19 @@ FEATURES = {**CENTRAL, **LAGGED}
 
 
 def retail_share(futoi: pl.DataFrame) -> pl.DataFrame:
-    """Доля физлиц в процентах и момент, когда она известна: `known_at`, `share`.
+    """Доля физлиц в процентах и момент, когда она известна.
 
-    Все открытые контракты — сумма лонгов физлиц и юрлиц (она же — сумма
-    шортов). Доля > 0 — физлица в целом в лонге.
+    `known_at`; `share` — нетто-позиция физлиц ÷ все открытые контракты (сумма
+    лонгов физлиц и юрлиц, она же — сумма шортов), > 0 — физлица в целом в
+    лонге; `people` — доля физлиц-участников в лонге, %. Пример: в лонге
+    юаня 15 798 человек, в шорте 6 851 — 70%.
     """
+    people = pl.col("pos_long_num") + pl.col("pos_short_num")
     fiz = futoi.filter(pl.col("clgroup") == "FIZ").select(
-        "timestamp", "pos", pl.col("pos_long").alias("fiz_long")
+        "timestamp",
+        "pos",
+        pl.col("pos_long").alias("fiz_long"),
+        pl.when(people > 0).then(100 * pl.col("pos_long_num") / people).alias("people"),
     )
     yur = futoi.filter(pl.col("clgroup") == "YUR").select(
         "timestamp", pl.col("pos_long").alias("yur_long")
@@ -107,6 +114,7 @@ def retail_share(futoi: pl.DataFrame) -> pl.DataFrame:
         .select(
             (pl.col("timestamp") + PUBLISH_DELAY).alias("known_at"),
             (100 * pl.col("pos") / open_interest).alias("share"),
+            pl.col("people").fill_null(np.nan),
         )
         .sort("known_at")
     )
@@ -145,16 +153,22 @@ def year_rank(
     return ranks
 
 
-def with_retail(trades: pl.DataFrame, shares: pl.DataFrame) -> pl.DataFrame:
-    """Сделки одного рынка с признаками `FEATURES` по направлению сделки.
+def with_retail(
+    trades: pl.DataFrame, shares: pl.DataFrame, time_column: str = "signal_time"
+) -> pl.DataFrame:
+    """Сделки одного рынка с признаками FUTOI по направлению сделки.
 
-    Признак считается на закрытии сигнальной свечи (`signal_time` — её начало),
+    Признак считается на закрытии сигнальной свечи (`time_column` — её начало),
     со сдвигом — на 14 дней раньше. У шорта изменение берётся с минусом, а
     уровень — как 1 − место: рост доли физлиц для шорта — движение против него.
+    Кроме `FEATURES` — для check_futoi_expert.py: `fiz_day` — изменение доли
+    за сутки, п.п.; `fiz_people` — доля физлиц-участников на стороне сделки, %
+    (у шорта — 100 − доля в лонге).
     """
     known_at = shares["known_at"].to_numpy()
     values = shares["share"].to_numpy()
-    closes = (pl.col("signal_time").cast(pl.Datetime("us")) + BAR_LENGTH).alias("t")
+    people = shares["people"].to_numpy()
+    closes = (pl.col(time_column).cast(pl.Datetime("us")) + BAR_LENGTH).alias("t")
     times = trades.select(closes)["t"].to_numpy()
     side = trades["side"].to_numpy()
     columns = {}
@@ -162,9 +176,13 @@ def with_retail(trades: pl.DataFrame, shares: pl.DataFrame) -> pl.DataFrame:
         moment = times - np.timedelta64(lag)
         now = share_at(known_at, values, moment)
         week_ago = share_at(known_at, values, moment - np.timedelta64(WEEK))
+        day_ago = share_at(known_at, values, moment - np.timedelta64(DAY))
         rank = year_rank(known_at, values, moment, now)
+        in_long = share_at(known_at, people, moment)
         columns[f"fiz_week{suffix}"] = side * (now - week_ago)
         columns[f"fiz_level{suffix}"] = np.where(side > 0, rank, 1 - rank)
+        columns[f"fiz_day{suffix}"] = side * (now - day_ago)
+        columns[f"fiz_people{suffix}"] = np.where(side > 0, in_long, 100 - in_long)
     return trades.with_columns(
         [pl.Series(name, values).fill_nan(None) for name, values in columns.items()]
     )

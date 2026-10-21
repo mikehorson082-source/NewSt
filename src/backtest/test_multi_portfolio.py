@@ -184,6 +184,30 @@ def test_trading_stops_when_realized_capital_is_gone():
     assert status_of(result, "b", 45)["status"] == NO_CAPITAL
 
 
+def test_risk_scale_multiplies_market_risk():
+    # Доля a — 1%, стоп в 5 пунктах: 2 000 контрактов; с risk_scale 1.5 — 3 000,
+    # с 0.5 — 1 000. Без столбца — множитель 1.
+    for scale, contracts in ((1.5, 3_000), (0.5, 1_000)):
+        signals = make_signals([signal("a", 0, 95.0, 110.0)]).with_columns(
+            pl.lit(scale).alias("risk_scale")
+        )
+        result = run_multi_portfolio(
+            signals, {"a": market(FREE, trend_bars())}, CAPITAL, rules(a=0.01)
+        )
+        assert result.trades[0].size.contracts == contracts
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0, None])
+def test_bad_risk_scale_rejected(scale):
+    signals = make_signals([signal("a", 0, 95.0, 110.0)]).with_columns(
+        pl.lit(scale, dtype=pl.Float64).alias("risk_scale")
+    )
+    with pytest.raises(ValueError, match="risk_scale"):
+        run_multi_portfolio(
+            signals, {"a": market(FREE, trend_bars())}, CAPITAL, rules(a=0.01)
+        )
+
+
 def test_every_market_needs_its_risk():
     signals = make_signals([signal("a", 0, 95.0, 110.0)])
     with pytest.raises(ValueError, match="доля риска"):

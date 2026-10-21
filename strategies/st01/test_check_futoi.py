@@ -16,21 +16,44 @@ START = datetime(2023, 1, 1, 12, 0)
 
 
 def futoi_rows(
-    time: datetime, fiz_pos: int, fiz_long: int, yur_long: int
+    time: datetime,
+    fiz_pos: int,
+    fiz_long: int,
+    yur_long: int,
+    people: tuple[int, int] = (1, 1),
 ) -> list[dict]:
-    """Две строки FUTOI на момент: физлица и зеркальные юрлица."""
+    """Две строки FUTOI на момент: физлица и зеркальные юрлица.
+
+    `people` — сколько физлиц в лонге и в шорте.
+    """
+    long_num, short_num = people
     return [
-        {"timestamp": time, "clgroup": "FIZ", "pos": fiz_pos, "pos_long": fiz_long},
-        {"timestamp": time, "clgroup": "YUR", "pos": -fiz_pos, "pos_long": yur_long},
+        {
+            "timestamp": time,
+            "clgroup": "FIZ",
+            "pos": fiz_pos,
+            "pos_long": fiz_long,
+            "pos_long_num": long_num,
+            "pos_short_num": short_num,
+        },
+        {
+            "timestamp": time,
+            "clgroup": "YUR",
+            "pos": -fiz_pos,
+            "pos_long": yur_long,
+            "pos_long_num": 1,
+            "pos_short_num": 1,
+        },
     ]
 
 
-def daily_shares(values: list[float]) -> pl.DataFrame:
-    """Доли, известные раз в день с `START`."""
+def daily_shares(values: list[float], people: float = 50.0) -> pl.DataFrame:
+    """Доли, известные раз в день с `START`; доля людей в лонге — `people`."""
     return pl.DataFrame(
         {
             "known_at": [START + timedelta(days=i) for i in range(len(values))],
             "share": [float(v) for v in values],
+            "people": people,
         }
     )
 
@@ -42,10 +65,14 @@ def trades_at(signal_time: datetime) -> pl.DataFrame:
 
 def test_retail_share_example_from_docstring():
     # Физлица 5.31 млн лонгов, нетто 4.47 млн; юрлица 5.77 млн лонгов: всего 11.08 млн.
-    futoi = pl.DataFrame(futoi_rows(START, 4_470_996, 5_309_936, 5_769_074))
+    # В лонге 15 798 физлиц, в шорте 6 851: доля людей в лонге 70%.
+    futoi = pl.DataFrame(
+        futoi_rows(START, 4_470_996, 5_309_936, 5_769_074, people=(15_798, 6_851))
+    )
     shares = retail_share(futoi)
     assert shares["known_at"].to_list() == [START + timedelta(minutes=1)]
     assert shares["share"][0] == pytest.approx(40.36, abs=0.01)
+    assert shares["people"][0] == pytest.approx(69.75, abs=0.01)
 
 
 def test_share_at_takes_last_known_and_drops_stale():
@@ -121,3 +148,21 @@ def test_no_futoi_after_its_end():
     trades = with_retail(trades_at(START + timedelta(days=404)), shares)
     assert trades["fiz_week"].null_count() == 2
     assert trades["fiz_level"].null_count() == 2
+
+
+def test_day_flow_and_people_follow_trade_side():
+    # Доля растёт на 1 п.п. в день: за сутки +1. Людей в лонге 70%:
+    # для лонга на его стороне 70%, для шорта — 30%.
+    shares = daily_shares(list(range(400)), people=70.0)
+    trades = with_retail(trades_at(START + timedelta(days=399, hours=1)), shares)
+    assert trades["fiz_day"].to_list() == pytest.approx([1.0, -1.0])
+    assert trades["fiz_people"].to_list() == pytest.approx([70.0, 30.0])
+
+
+def test_time_column_can_be_named_otherwise():
+    shares = daily_shares(list(range(400)))
+    signals = trades_at(START + timedelta(days=399, hours=1)).rename(
+        {"signal_time": "timestamp"}
+    )
+    trades = with_retail(signals, shares, time_column="timestamp")
+    assert trades["fiz_week"].to_list() == pytest.approx([7.0, -7.0])

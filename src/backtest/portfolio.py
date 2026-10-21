@@ -28,6 +28,8 @@
 Портфель с несколькими позициями (`run_multi_portfolio`) ничего не выбирает:
 - на каждом рынке — не больше одной позиции, рынки торгуются независимо;
 - риск сделки — своя доля капитала у каждого рынка (`MultiRules.risk_fractions`);
+  необязательный столбец сигнала `risk_scale` умножает эту долю. Пример: доля
+  рынка 0.67%, у сигнала `risk_scale` 1.5 — риск сделки 1%;
 - сумма ГО открытых позиций и новой — не больше предела. Не хватает — новая
   позиция уменьшается до остатка; одновременные сигналы уменьшаются в одной
   и той же доле. Пример: свободно 30% капитала, три новые позиции хотят по
@@ -194,11 +196,11 @@ class MultiRules:
         if not 0.0 < self.max_margin_fraction <= 1.0:
             raise ValueError("Доля ГО должна быть в (0, 1]")
 
-    def sizing(self, market: str) -> SizingRules:
+    def sizing(self, market: str, risk_scale: float = 1.0) -> SizingRules:
         if market not in self.risk_fractions:
             raise ValueError(f"{market}: не задана доля риска")
         return SizingRules(
-            risk_fraction=self.risk_fractions[market],
+            risk_fraction=self.risk_fractions[market] * risk_scale,
             max_margin_fraction=self.max_margin_fraction,
             max_volume_share=self.max_volume_share,
         )
@@ -247,6 +249,10 @@ def _prepare_signals(
     for column in ("breakeven_r", "trail"):
         if column not in signals.columns:
             signals = signals.with_columns(pl.lit(None, dtype=pl.Float64).alias(column))
+    if "risk_scale" not in signals.columns:
+        signals = signals.with_columns(pl.lit(1.0).alias("risk_scale"))
+    if not (signals["risk_scale"] > 0).fill_null(False).all():
+        raise ValueError("risk_scale должен быть > 0 у каждого сигнала")
     unknown = set(signals["market"].unique()) - set(markets)
     if unknown:
         raise ValueError(f"Нет данных рынков: {', '.join(sorted(unknown))}")
@@ -459,7 +465,12 @@ def run_multi_portfolio(
                 continue
             signal = _signal(row)
             size = size_position(
-                data.spec, data.bars, bar, signal, realized, rules.sizing(name)
+                data.spec,
+                data.bars,
+                bar,
+                signal,
+                realized,
+                rules.sizing(name, row["risk_scale"]),
             )
             candidates.append(_Candidate(i, name, bar, signal, size))
 

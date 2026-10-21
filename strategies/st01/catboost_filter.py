@@ -128,30 +128,40 @@ class Fit:
 Fitter = Callable[[pl.DataFrame, pl.DataFrame, np.ndarray], Fit]
 
 
-def _features(rows: pl.DataFrame):
+def _features(rows: pl.DataFrame, features: tuple[str, ...] = FEATURES):
     """Признаки для моделей: pandas, категории — целые числа."""
     return rows.select(
         *(
             pl.col(name).cast(pl.Int64) if name in CATEGORICAL else pl.col(name)
-            for name in FEATURES
+            for name in features
         )
     ).to_pandas()
 
 
-def fit_catboost(train: pl.DataFrame, test: pl.DataFrame, target: np.ndarray) -> Fit:
+def fit_catboost(
+    train: pl.DataFrame,
+    test: pl.DataFrame,
+    target: np.ndarray,
+    features: tuple[str, ...] = FEATURES,
+) -> Fit:
     from catboost import CatBoostRegressor, Pool  # группа зависимостей ml
 
     categorical = list(CATEGORICAL)
-    train_pool = Pool(_features(train), target, cat_features=categorical)
-    test_pool = Pool(_features(test), cat_features=categorical)
+    train_pool = Pool(_features(train, features), target, cat_features=categorical)
+    test_pool = Pool(_features(test, features), cat_features=categorical)
     model = CatBoostRegressor(**CATBOOST_PARAMS)
     model.fit(train_pool)
     shap = model.get_feature_importance(test_pool, type="ShapValues")
-    importance = dict(zip(FEATURES, np.abs(shap[:, :-1]).mean(axis=0), strict=True))
+    importance = dict(zip(features, np.abs(shap[:, :-1]).mean(axis=0), strict=True))
     return Fit(model.predict(train_pool), model.predict(test_pool), importance)
 
 
-def fit_linear(train: pl.DataFrame, test: pl.DataFrame, target: np.ndarray) -> Fit:
+def fit_linear(
+    train: pl.DataFrame,
+    test: pl.DataFrame,
+    target: np.ndarray,
+    features: tuple[str, ...] = FEATURES,
+) -> Fit:
     """Гребневая регрессия: стандартизация по обучению, пропуски — медианой."""
     from sklearn.compose import ColumnTransformer
     from sklearn.impute import SimpleImputer
@@ -159,7 +169,7 @@ def fit_linear(train: pl.DataFrame, test: pl.DataFrame, target: np.ndarray) -> F
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-    numeric = [name for name in FEATURES if name not in CATEGORICAL]
+    numeric = [name for name in features if name not in CATEGORICAL]
     prepare = ColumnTransformer(
         [
             (
@@ -175,11 +185,13 @@ def fit_linear(train: pl.DataFrame, test: pl.DataFrame, target: np.ndarray) -> F
         ]
     )
     model = make_pipeline(prepare, Ridge(alpha=RIDGE_ALPHA))
-    x_train = _features(train)
+    x_train = _features(train, features)
     model.fit(x_train, target)
     coefficients = model[-1].coef_[: len(numeric)]
     importance = dict(zip(numeric, coefficients, strict=True))
-    return Fit(model.predict(x_train), model.predict(_features(test)), importance)
+    return Fit(
+        model.predict(x_train), model.predict(_features(test, features)), importance
+    )
 
 
 FITTERS: dict[str, Fitter] = {"catboost": fit_catboost, "linear": fit_linear}
