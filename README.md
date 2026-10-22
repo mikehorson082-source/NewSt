@@ -1,4 +1,1 @@
-npx repomix \
-  --include "src/**,strategies/st01/**,app/api/**,*.md,pyproject.toml" \
-  --ignore "data/**,**/*.parquet,**/*.png,**/*.csv,**/*.lock" \
-  -o full_context.txt && open -R full_context.txt
+npx repomix --include "src/**,strategies/st01/**,*.md,pyproject.toml" --ignore "data/**,app/**,**/*.parquet,**/*.png,**/*.csv,**/*.lock" -o full_context.txt
